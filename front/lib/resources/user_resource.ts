@@ -9,6 +9,7 @@ import {
 } from "@app/lib/resources/storage/models/user";
 import type { ReadonlyAttributesType } from "@app/lib/resources/storage/types";
 import { searchUsers } from "@app/lib/user_search/search";
+import { cacheWithRedis, invalidateCacheWithRedis } from "@app/lib/utils/cache";
 import logger from "@app/logger/logger";
 import { statsDClient } from "@app/logger/statsDClient";
 import { launchIndexUserSearchWorkflow } from "@app/temporal/es_indexation/client";
@@ -38,6 +39,8 @@ export interface SearchMembersPaginationParams {
 const USER_METADATA_COMMA_SEPARATOR = ",";
 const USER_METADATA_COMMA_REPLACEMENT = "DUST_COMMA";
 const TOOLS_VALIDATION_WILDCARD = "*";
+
+const USER_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 // Attributes are marked as read-only to reflect the stateless nature of our Resource.
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
@@ -134,17 +137,99 @@ export class UserResource extends BaseResource<UserModel> {
     return user ? new UserResource(UserModel, user.get()) : null;
   }
 
-  static async fetchByWorkOSUserId(
-    workOSUserId: string,
-    transaction?: Transaction
-  ): Promise<UserResource | null> {
+  private static readonly userByWorkOSIdCacheKeyResolver = (
+    workOSUserId: string
+  ) => `user:workos:${workOSUserId}`;
+
+  private static async _fetchByWorkOSUserIdUncached(
+    workOSUserId: string
+  ): Promise<
+    | (UserType & {
+        providerId: string | null;
+        workOSUserId: string | null;
+        isDustSuperUser: boolean;
+        updatedAt: number;
+      })
+    | null
+  > {
     const user = await UserModel.findOne({
       where: {
         workOSUserId,
       },
-      transaction,
     });
-    return user ? new UserResource(UserModel, user.get()) : null;
+    if (!user) {
+      return null;
+    }
+    const userResource = new UserResource(UserModel, user.get());
+    return {
+      ...userResource.toJSON(),
+      providerId: user.providerId,
+      workOSUserId: user.workOSUserId,
+      isDustSuperUser: user.isDustSuperUser,
+      updatedAt: user.updatedAt.getTime(),
+    };
+  }
+
+  private static fetchByWorkOSUserIdCached = cacheWithRedis(
+    UserResource._fetchByWorkOSUserIdUncached,
+    UserResource.userByWorkOSIdCacheKeyResolver,
+    { ttlMs: USER_CACHE_TTL_MS }
+  );
+
+  private static invalidateUserByWorkOSIdCache = invalidateCacheWithRedis(
+    UserResource._fetchByWorkOSUserIdUncached,
+    UserResource.userByWorkOSIdCacheKeyResolver
+  );
+
+  private static fromCachedData(
+    data: UserType & {
+      providerId: string | null;
+      workOSUserId: string | null;
+      isDustSuperUser: boolean;
+      updatedAt: number;
+    }
+  ): UserResource {
+    const blob: Attributes<UserModel> = {
+      id: data.id,
+      sId: data.sId,
+      provider: data.provider,
+      providerId: data.providerId,
+      username: data.username,
+      email: data.email,
+      name: data.fullName,
+      firstName: data.firstName,
+      lastName: data.lastName,
+      imageUrl: data.image,
+      createdAt: new Date(data.createdAt),
+      updatedAt: new Date(data.updatedAt),
+      isDustSuperUser: data.isDustSuperUser,
+      workOSUserId: data.workOSUserId,
+      lastLoginAt: data.lastLoginAt ? new Date(data.lastLoginAt) : null,
+    };
+    return new UserResource(UserModel, blob);
+  }
+
+  static async fetchByWorkOSUserId(
+    workOSUserId: string,
+    transaction?: Transaction
+  ): Promise<UserResource | null> {
+    // Bypass cache when transaction is provided for transactional consistency
+    if (transaction) {
+      const user = await UserModel.findOne({
+        where: {
+          workOSUserId,
+        },
+        transaction,
+      });
+      return user ? new UserResource(UserModel, user.get()) : null;
+    }
+
+    const cached = await this.fetchByWorkOSUserIdCached(workOSUserId);
+    if (!cached) {
+      return null;
+    }
+
+    return this.fromCachedData(cached);
   }
 
   static async fetchByEmail(email: string): Promise<UserResource | null> {
@@ -312,9 +397,15 @@ export class UserResource extends BaseResource<UserModel> {
   }
 
   async updateImage(imageUrl: string | null) {
-    return this.update({
+    const result = await this.update({
       imageUrl,
     });
+
+    if (this.workOSUserId) {
+      await UserResource.invalidateUserByWorkOSIdCache(this.workOSUserId);
+    }
+
+    return result;
   }
 
   async updateInfo(
@@ -324,6 +415,8 @@ export class UserResource extends BaseResource<UserModel> {
     email: string,
     workOSUserId: string | null
   ) {
+    const oldWorkOSUserId = this.workOSUserId;
+
     firstName = escape(firstName);
     if (lastName) {
       lastName = escape(lastName);
@@ -337,7 +430,13 @@ export class UserResource extends BaseResource<UserModel> {
       workOSUserId,
     });
 
-    // Update user search index across all workspaces.
+    if (oldWorkOSUserId) {
+      await UserResource.invalidateUserByWorkOSIdCache(oldWorkOSUserId);
+    }
+    if (workOSUserId && workOSUserId !== oldWorkOSUserId) {
+      await UserResource.invalidateUserByWorkOSIdCache(workOSUserId);
+    }
+
     const workflowResult = await launchIndexUserSearchWorkflow({
       userId: this.sId,
     });
@@ -356,9 +455,20 @@ export class UserResource extends BaseResource<UserModel> {
   }
 
   async setWorkOSUserId(workOSUserId: string | null) {
-    return this.update({
+    const oldWorkOSUserId = this.workOSUserId;
+
+    const result = await this.update({
       workOSUserId,
     });
+
+    if (oldWorkOSUserId) {
+      await UserResource.invalidateUserByWorkOSIdCache(oldWorkOSUserId);
+    }
+    if (workOSUserId && workOSUserId !== oldWorkOSUserId) {
+      await UserResource.invalidateUserByWorkOSIdCache(workOSUserId);
+    }
+
+    return result;
   }
 
   async delete(
