@@ -370,23 +370,14 @@ export class MembershipResource extends BaseResource<MembershipModel> {
     user: UserResource;
     workspace: LightWorkspaceType;
     transaction?: Transaction;
-  }): Promise<Attributes<MembershipModel>["role"] | "none"> {
-    const membership = await this.model.findOne({
-      attributes: ["role"],
-      where: {
-        userId: user.id,
-        workspaceId: workspace.id,
-        startAt: {
-          [Op.lte]: new Date(),
-        },
-        endAt: {
-          [Op.or]: [{ [Op.eq]: null }, { [Op.gte]: new Date() }],
-        },
-      },
-      transaction,
-    });
-
-    return membership?.role ?? "none";
+  }): Promise<MembershipRoleType | "none"> {
+    if (transaction) {
+      return this._getActiveRoleForUserInWorkspaceUncached(
+        user.id,
+        workspace.id
+      );
+    }
+    return this.getActiveRoleForUserInWorkspaceCached(user.id, workspace.id);
   }
 
   static async getActiveMembershipOfUserInWorkspace({
@@ -398,29 +389,49 @@ export class MembershipResource extends BaseResource<MembershipModel> {
     workspace: LightWorkspaceType;
     transaction?: Transaction;
   }): Promise<MembershipResource | null> {
-    const { memberships, total } = await this.getActiveMemberships({
-      users: [user],
-      workspace,
-      transaction,
-    });
-    if (total === 0) {
+    if (transaction) {
+      const { memberships, total } = await this.getActiveMemberships({
+        users: [user],
+        workspace,
+        transaction,
+      });
+      if (total === 0) {
+        return null;
+      }
+      if (total > 1) {
+        logger.error(
+          {
+            panic: true,
+            userId: user.id,
+            workspaceId: workspace.id,
+            memberships,
+          },
+          "Unreachable: Found multiple active memberships for user in workspace."
+        );
+        throw new Error(
+          `Unreachable: Found multiple active memberships for user ${user.id} in workspace ${workspace.id}`
+        );
+      }
+      return memberships[0];
+    }
+    const cached = await this.getActiveMembershipOfUserInWorkspaceCached(
+      user.id,
+      workspace.id
+    );
+    if (!cached) {
       return null;
     }
-    if (total > 1) {
-      logger.error(
-        {
-          panic: true,
-          userId: user.id,
-          workspaceId: workspace.id,
-          memberships,
-        },
-        "Unreachable: Found multiple active memberships for user in workspace."
-      );
-      throw new Error(
-        `Unreachable: Found multiple active memberships for user ${user.id} in workspace ${workspace.id}`
-      );
-    }
-    return memberships[0];
+    return new MembershipResource(MembershipModel, {
+      id: cached.id,
+      role: cached.role,
+      startAt: new Date(cached.startAt),
+      endAt: cached.endAt ? new Date(cached.endAt) : null,
+      origin: cached.origin,
+      workspaceId: cached.workspaceId,
+      userId: cached.userId,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
   }
 
   static async getMembersCountForWorkspace({
@@ -497,11 +508,10 @@ export class MembershipResource extends BaseResource<MembershipModel> {
     });
   }
 
-  // Seat counting with caching - used to track active seats in a workspace
   private static readonly seatsCacheKeyResolver = (workspaceId: string) =>
     `count-active-seats-in-workspace:${workspaceId}`;
 
-  static async countActiveSeatsInWorkspace(
+  private static async _countActiveSeatsInWorkspaceUncached(
     workspaceId: string
   ): Promise<number> {
     const workspace = await WorkspaceResource.fetchById(workspaceId);
@@ -515,16 +525,177 @@ export class MembershipResource extends BaseResource<MembershipModel> {
     });
   }
 
-  static countActiveSeatsInWorkspaceCached = cacheWithRedis(
-    MembershipResource.countActiveSeatsInWorkspace,
+  private static countActiveSeatsInWorkspaceCached = cacheWithRedis(
+    MembershipResource._countActiveSeatsInWorkspaceUncached,
     MembershipResource.seatsCacheKeyResolver,
-    { ttlMs: 60 * 10 * 1000 } // 10 minutes
+    { ttlMs: 10 * 60 * 1000 } // 10 minutes
   );
 
-  static invalidateActiveSeatsCache = invalidateCacheWithRedis(
-    MembershipResource.countActiveSeatsInWorkspace,
+  private static invalidateActiveSeatsCache = invalidateCacheWithRedis(
+    MembershipResource._countActiveSeatsInWorkspaceUncached,
     MembershipResource.seatsCacheKeyResolver
   );
+
+  static async countActiveSeatsInWorkspace(
+    workspaceId: string
+  ): Promise<number> {
+    return this.countActiveSeatsInWorkspaceCached(workspaceId);
+  }
+
+  private static readonly membershipsByUserCacheKeyResolver = (
+    userId: ModelId
+  ) => `memberships:user:${userId}`;
+
+  private static readonly roleCacheKeyResolver = (
+    userId: ModelId,
+    workspaceId: ModelId
+  ) => `role:user:${userId}:workspace:${workspaceId}`;
+
+  private static readonly membershipCacheKeyResolver = (
+    userId: ModelId,
+    workspaceId: ModelId
+  ) => `membership:user:${userId}:workspace:${workspaceId}`;
+
+  private static async _getActiveRoleForUserInWorkspaceUncached(
+    userId: ModelId,
+    workspaceId: ModelId
+  ): Promise<MembershipRoleType | "none"> {
+    const membership = await MembershipModel.findOne({
+      attributes: ["role"],
+      where: {
+        userId,
+        workspaceId,
+        startAt: {
+          [Op.lte]: new Date(),
+        },
+        endAt: {
+          [Op.or]: [{ [Op.eq]: null }, { [Op.gte]: new Date() }],
+        },
+      },
+    });
+    return membership?.role ?? "none";
+  }
+
+  private static getActiveRoleForUserInWorkspaceCached = cacheWithRedis(
+    MembershipResource._getActiveRoleForUserInWorkspaceUncached,
+    (userId: ModelId, workspaceId: ModelId) =>
+      MembershipResource.roleCacheKeyResolver(userId, workspaceId),
+    { ttlMs: 30 * 60 * 1000 }
+  );
+
+  private static invalidateRoleCache = invalidateCacheWithRedis(
+    MembershipResource._getActiveRoleForUserInWorkspaceUncached,
+    (userId: ModelId, workspaceId: ModelId) =>
+      MembershipResource.roleCacheKeyResolver(userId, workspaceId)
+  );
+
+  private static async _getActiveMembershipOfUserInWorkspaceUncached(
+    userId: ModelId,
+    workspaceId: ModelId
+  ): Promise<{
+    id: number;
+    role: MembershipRoleType;
+    startAt: number;
+    endAt: number | null;
+    origin: MembershipOriginType;
+    workspaceId: number;
+    userId: number;
+  } | null> {
+    const membership = await MembershipModel.findOne({
+      where: {
+        userId,
+        workspaceId,
+        startAt: { [Op.lte]: new Date() },
+        endAt: { [Op.or]: [{ [Op.eq]: null }, { [Op.gte]: new Date() }] },
+      },
+    });
+    if (!membership) {
+      return null;
+    }
+    return {
+      id: membership.id,
+      role: membership.role,
+      startAt: membership.startAt.getTime(),
+      endAt: membership.endAt?.getTime() ?? null,
+      origin: membership.origin,
+      workspaceId: membership.workspaceId,
+      userId: membership.userId,
+    };
+  }
+
+  private static getActiveMembershipOfUserInWorkspaceCached = cacheWithRedis(
+    MembershipResource._getActiveMembershipOfUserInWorkspaceUncached,
+    (userId: ModelId, workspaceId: ModelId) =>
+      MembershipResource.membershipCacheKeyResolver(userId, workspaceId),
+    { ttlMs: 30 * 60 * 1000 }
+  );
+
+  private static invalidateMembershipCache = invalidateCacheWithRedis(
+    MembershipResource._getActiveMembershipOfUserInWorkspaceUncached,
+    (userId: ModelId, workspaceId: ModelId) =>
+      MembershipResource.membershipCacheKeyResolver(userId, workspaceId)
+  );
+
+  private static async _getActiveMembershipsForUserUncached(
+    userId: ModelId
+  ): Promise<
+    Array<{
+      id: number;
+      workspaceId: number;
+      role: MembershipRoleType;
+      startAt: number;
+      endAt: number | null;
+      origin: MembershipOriginType;
+    }>
+  > {
+    const now = new Date();
+    const memberships = await this.model.findAll({
+      where: {
+        userId,
+        startAt: {
+          [Op.lte]: now,
+        },
+        endAt: {
+          [Op.or]: [{ [Op.eq]: null }, { [Op.gte]: now }],
+        },
+      },
+      // WORKSPACE_ISOLATION_BYPASS: fetching by userId for auth context
+      dangerouslyBypassWorkspaceIsolationSecurity: true,
+    });
+
+    return memberships.map((m) => ({
+      id: m.id,
+      workspaceId: m.workspaceId,
+      role: m.role,
+      startAt: m.startAt.getTime(),
+      endAt: m.endAt?.getTime() ?? null,
+      origin: m.origin,
+    }));
+  }
+
+  private static getActiveMembershipsForUserCached = cacheWithRedis(
+    MembershipResource._getActiveMembershipsForUserUncached,
+    MembershipResource.membershipsByUserCacheKeyResolver,
+    { ttlMs: 5 * 60 * 1000 } // 5 minutes
+  );
+
+  private static invalidateMembershipsForUserCache = invalidateCacheWithRedis(
+    MembershipResource._getActiveMembershipsForUserUncached,
+    MembershipResource.membershipsByUserCacheKeyResolver
+  );
+
+  static async getActiveMembershipsForUser(userId: ModelId): Promise<
+    Array<{
+      id: number;
+      workspaceId: number;
+      role: MembershipRoleType;
+      startAt: number;
+      endAt: number | null;
+      origin: MembershipOriginType;
+    }>
+  > {
+    return this.getActiveMembershipsForUserCached(userId);
+  }
 
   static async deleteAllForWorkspace(auth: Authenticator) {
     const workspace = auth.getNonNullableWorkspace();
@@ -629,6 +800,13 @@ export class MembershipResource extends BaseResource<MembershipModel> {
     // Invalidate the active seats cache for this workspace.
     await MembershipResource.invalidateActiveSeatsCache(workspace.sId);
 
+    // Invalidate the memberships cache for this user.
+    await MembershipResource.invalidateMembershipsForUserCache(user.id);
+
+    // Invalidate role and membership caches for this user/workspace pair.
+    await MembershipResource.invalidateRoleCache(user.id, workspace.id);
+    await MembershipResource.invalidateMembershipCache(user.id, workspace.id);
+
     return new MembershipResource(MembershipModel, newMembership.get());
   }
 
@@ -724,6 +902,13 @@ export class MembershipResource extends BaseResource<MembershipModel> {
 
     // Invalidate the active seats cache for this workspace.
     await MembershipResource.invalidateActiveSeatsCache(workspace.sId);
+
+    // Invalidate the memberships cache for this user.
+    await MembershipResource.invalidateMembershipsForUserCache(user.id);
+
+    // Invalidate role and membership caches for this user/workspace pair.
+    await MembershipResource.invalidateRoleCache(user.id, workspace.id);
+    await MembershipResource.invalidateMembershipCache(user.id, workspace.id);
 
     return new Ok({
       role: membership.role,
@@ -821,6 +1006,13 @@ export class MembershipResource extends BaseResource<MembershipModel> {
         workspace,
         newRole,
       });
+
+      // Invalidate the memberships cache for this user.
+      await MembershipResource.invalidateMembershipsForUserCache(user.id);
+
+      // Invalidate role and membership caches for this user/workspace pair.
+      await MembershipResource.invalidateRoleCache(user.id, workspace.id);
+      await MembershipResource.invalidateMembershipCache(user.id, workspace.id);
     } else {
       // If the last membership was terminated, we create a new membership with the new role.
       // Preserve the origin from the previous membership.
