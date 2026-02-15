@@ -14,6 +14,7 @@ import type { ReadonlyAttributesType } from "@app/lib/resources/storage/types";
 import { getResourceIdFromSId, makeSId } from "@app/lib/resources/string_ids";
 import type { ResourceFindOptions } from "@app/lib/resources/types";
 import { UserResource } from "@app/lib/resources/user_resource";
+import { cacheWithRedis } from "@app/lib/utils/cache";
 import logger from "@app/logger/logger";
 import type {
   AgentConfigurationType,
@@ -57,6 +58,7 @@ export const BUILDER_GROUP_NAME = "dust-builders";
  * ┃                                                                         ┃
  * ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
  */
+const GROUP_IDS_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 // Attributes are marked as read-only to reflect the stateless nature of our Resource.
 // This design will be moved up to BaseResource once we transition away from Sequelize.
@@ -72,6 +74,75 @@ export class GroupResource extends BaseResource<GroupModel> {
   constructor(model: ModelStatic<GroupModel>, blob: Attributes<GroupModel>) {
     super(GroupModel, blob);
   }
+
+  private static readonly groupIdsCacheKeyResolver = (
+    userId: ModelId,
+    workspaceId: ModelId,
+    groupKinds: string[]
+  ) =>
+    `groups:user:${userId}:workspace:${workspaceId}:kinds:${groupKinds.sort().join(",")}`;
+
+  private static async _listUserGroupModelIdsInWorkspaceUncached(
+    userId: ModelId,
+    workspaceId: ModelId,
+    groupKinds: string[]
+  ): Promise<ModelId[]> {
+    let globalGroup: GroupModel | null = null;
+
+    if (groupKinds.includes("global")) {
+      globalGroup = await GroupModel.findOne({
+        attributes: ["id"],
+        where: {
+          workspaceId,
+          kind: "global",
+        },
+      });
+
+      if (!globalGroup) {
+        throw new Error("Global group not found.");
+      }
+    }
+
+    // eslint-disable-next-line dust/no-raw-sql -- We are using a raw query to optimize memory usage as people may have a lot of groups.
+    const userGroupModelIds = await frontSequelize.query<{ id: ModelId }>(
+      `
+      SELECT id FROM groups
+      WHERE "workspaceId" = :workspaceId
+      AND kind IN (:kind)
+      AND id IN (
+        SELECT "groupId" FROM group_memberships
+        WHERE "userId" = :userId
+        AND "workspaceId" = :workspaceId
+        AND "startAt" <= :now
+        AND ("endAt" IS NULL OR "endAt" > :now)
+        AND status = 'active'
+      )
+    `,
+      {
+        replacements: {
+          workspaceId,
+          kind: groupKinds.filter((k) => k !== "global"),
+          userId,
+          now: new Date(),
+        },
+        type: QueryTypes.SELECT,
+        raw: true,
+      }
+    );
+
+    const groups = [
+      ...(globalGroup ? [globalGroup] : []),
+      ...userGroupModelIds,
+    ];
+
+    return groups.map((group) => group.id);
+  }
+
+  private static listUserGroupModelIdsInWorkspaceCached = cacheWithRedis(
+    GroupResource._listUserGroupModelIdsInWorkspaceUncached,
+    GroupResource.groupIdsCacheKeyResolver,
+    { ttlMs: GROUP_IDS_CACHE_TTL_MS }
+  );
 
   static async makeNew(
     blob: CreationAttributes<GroupModel>,
@@ -838,59 +909,67 @@ export class GroupResource extends BaseResource<GroupModel> {
       return [];
     }
 
-    // If yes, we can fetch the groups the user is a member of.
-    // First the global group which has no db entries and is always present.
-    let globalGroup: GroupModel | null = null;
+    // Bypass cache when transaction is provided for transactional consistency.
+    if (transaction) {
+      // Replicate the uncached logic with transaction support.
+      let globalGroup: GroupModel | null = null;
 
-    if (groupKinds.includes("global")) {
-      globalGroup = await this.model.findOne({
-        attributes: ["id"],
-        where: {
-          workspaceId: workspace.id,
-          kind: "global",
-        },
-        transaction,
-      });
+      if (groupKinds.includes("global")) {
+        globalGroup = await this.model.findOne({
+          attributes: ["id"],
+          where: {
+            workspaceId: workspace.id,
+            kind: "global",
+          },
+          transaction,
+        });
 
-      if (!globalGroup) {
-        throw new Error("Global group not found.");
+        if (!globalGroup) {
+          throw new Error("Global group not found.");
+        }
       }
+
+      // eslint-disable-next-line dust/no-raw-sql -- We are using a raw query to optimize memory usage as people may have a lot of groups.
+      const userGroupModelIds = await frontSequelize.query<{ id: ModelId }>(
+        `
+        SELECT id FROM groups
+        WHERE "workspaceId" = :workspaceId
+        AND kind IN (:kind)
+        AND id IN (
+          SELECT "groupId" FROM group_memberships
+          WHERE "userId" = :userId
+          AND "workspaceId" = :workspaceId
+          AND "startAt" <= :now
+          AND ("endAt" IS NULL OR "endAt" > :now)
+          AND status = 'active'
+        )
+      `,
+        {
+          replacements: {
+            workspaceId: workspace.id,
+            kind: groupKinds.filter((k) => k !== "global"),
+            userId: user.id,
+            now: new Date(),
+          },
+          type: QueryTypes.SELECT,
+          transaction,
+          raw: true,
+        }
+      );
+
+      const groups = [
+        ...(globalGroup ? [globalGroup] : []),
+        ...userGroupModelIds,
+      ];
+
+      return groups.map((group) => group.id);
     }
 
-    // eslint-disable-next-line dust/no-raw-sql -- We are using a raw query to optimize memory usage as people may have a lot of groups.
-    const userGroupModelIds = await frontSequelize.query<{ id: ModelId }>(
-      `
-      SELECT id FROM groups
-      WHERE "workspaceId" = :workspaceId
-      AND kind IN (:kind)
-      AND id IN (
-        SELECT "groupId" FROM group_memberships
-        WHERE "userId" = :userId
-        AND "workspaceId" = :workspaceId
-        AND "startAt" <= :now
-        AND ("endAt" IS NULL OR "endAt" > :now)
-        AND status = 'active'
-      )
-    `,
-      {
-        replacements: {
-          workspaceId: workspace.id,
-          kind: groupKinds.filter((k) => k !== "global") as GroupKind[],
-          userId: user.id,
-          now: new Date(),
-        },
-        type: QueryTypes.SELECT,
-        transaction,
-        raw: true,
-      }
+    return this.listUserGroupModelIdsInWorkspaceCached(
+      user.id,
+      workspace.id,
+      groupKinds as string[]
     );
-
-    const groups = [
-      ...(globalGroup ? [globalGroup] : []),
-      ...userGroupModelIds,
-    ];
-
-    return groups.map((group) => group.id);
   }
 
   // Warning, this function can be very memory hungry if there are a lot of groups (such as a workspace with a lot of agents and editors groups).
