@@ -425,12 +425,32 @@ const router = createBrowserRouter(
         { path: "builder/skills/new", element: <CreateSkillPage /> },
         { path: "builder/skills/:sId", element: <EditSkillPage /> },
 
-        // Onboarding
-        { path: "welcome", element: <WelcomePage /> },
-        { path: "subscribe", element: <SubscribePage /> },
-        { path: "trial", element: <TrialPage /> },
-        { path: "trial-ended", element: <TrialEndedPage /> },
-        { path: "verify", element: <VerifyPage /> },
+        // Onboarding (paywall-whitelisted: accessible even when canUseProduct is false)
+        {
+          path: "welcome",
+          element: <WelcomePage />,
+          handle: { paywallWhitelisted: true },
+        },
+        {
+          path: "subscribe",
+          element: <SubscribePage />,
+          handle: { paywallWhitelisted: true },
+        },
+        {
+          path: "trial",
+          element: <TrialPage />,
+          handle: { paywallWhitelisted: true },
+        },
+        {
+          path: "trial-ended",
+          element: <TrialEndedPage />,
+          handle: { paywallWhitelisted: true },
+        },
+        {
+          path: "verify",
+          element: <VerifyPage />,
+          handle: { paywallWhitelisted: true },
+        },
       ],
     },
     {
