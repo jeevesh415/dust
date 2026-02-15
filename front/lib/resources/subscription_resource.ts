@@ -38,6 +38,8 @@ import { WorkspaceModel } from "@app/lib/resources/storage/models/workspace";
 import type { ReadonlyAttributesType } from "@app/lib/resources/storage/types";
 import type { ModelStaticWorkspaceAware } from "@app/lib/resources/storage/wrappers/workspace_models";
 import { generateRandomModelSId } from "@app/lib/resources/string_ids";
+import { WorkspaceResource } from "@app/lib/resources/workspace_resource";
+import { cacheWithRedis, invalidateCacheWithRedis } from "@app/lib/utils/cache";
 import { withTransaction } from "@app/lib/utils/sql_utils";
 import {
   getWorkspaceFirstAdmin,
@@ -67,6 +69,8 @@ import type Stripe from "stripe";
 
 const DEFAULT_PLAN_WHEN_NO_SUBSCRIPTION: PlanAttributes = FREE_NO_PLAN_DATA;
 const FREE_NO_PLAN_SUBSCRIPTION_ID = -1;
+
+const SUBSCRIPTION_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 // Attributes are marked as read-only to reflect the stateless nature of our Resource.
 // This design will be moved up to BaseResource once we transition away from Sequelize.
@@ -105,15 +109,82 @@ export class SubscriptionResource extends BaseResource<SubscriptionModel> {
     );
   }
 
+  private static readonly subscriptionCacheKeyResolver = (
+    workspace: LightWorkspaceType
+  ) => `subscription:active:workspaceId:${workspace.id}`;
+
+  private static async _fetchActiveByWorkspaceUncached(
+    workspace: LightWorkspaceType
+  ): Promise<(SubscriptionType & { id: number; planId: number }) | null> {
+    const res = await SubscriptionResource.fetchActiveByWorkspaces([workspace]);
+    const subscription = res[workspace.sId];
+    if (!subscription) {
+      return null;
+    }
+    return {
+      ...subscription.toJSON(),
+      id: subscription.id,
+      planId: subscription.planId,
+    };
+  }
+
+  private static invalidateSubscriptionCache = invalidateCacheWithRedis(
+    SubscriptionResource._fetchActiveByWorkspaceUncached,
+    SubscriptionResource.subscriptionCacheKeyResolver
+  );
+
+  private static fromCachedData(
+    workspace: LightWorkspaceType,
+    data: SubscriptionType & { id: number; planId: number }
+  ): SubscriptionResource {
+    const now = new Date();
+    const blob: Attributes<SubscriptionModel> = {
+      id: data.id,
+      sId: data.sId ?? generateRandomModelSId(),
+      status: data.status ?? "active",
+      workspaceId: workspace.id,
+      createdAt: now,
+      updatedAt: now,
+      startDate: data.startDate ? new Date(data.startDate) : now,
+      endDate: data.endDate ? new Date(data.endDate) : null,
+      trialing: data.trialing,
+      paymentFailingSince: data.paymentFailingSince
+        ? new Date(data.paymentFailingSince)
+        : null,
+      planId: data.planId,
+      stripeSubscriptionId: data.stripeSubscriptionId,
+      requestCancelAt: data.requestCancelAt
+        ? new Date(data.requestCancelAt)
+        : null,
+    };
+    return new SubscriptionResource(SubscriptionModel, blob, data.plan);
+  }
+
+  private static fetchActiveByWorkspaceCached = cacheWithRedis(
+    SubscriptionResource._fetchActiveByWorkspaceUncached,
+    SubscriptionResource.subscriptionCacheKeyResolver,
+    { ttlMs: SUBSCRIPTION_CACHE_TTL_MS }
+  );
+
   static async fetchActiveByWorkspace(
     workspace: LightWorkspaceType,
     transaction?: Transaction
   ): Promise<SubscriptionResource | null> {
-    const res = await SubscriptionResource.fetchActiveByWorkspaces(
-      [workspace],
-      transaction
-    );
-    return res[workspace.sId] ?? null;
+    // Bypass cache when transaction is provided for transactional consistency
+    if (transaction) {
+      const res = await SubscriptionResource.fetchActiveByWorkspaces(
+        [workspace],
+        transaction
+      );
+      return res[workspace.sId] ?? null;
+    }
+
+    const cached = await this.fetchActiveByWorkspaceCached(workspace);
+    if (!cached) {
+      return null;
+    }
+
+    return this.fromCachedData(workspace, cached);
   }
 
   static async fetchLastByWorkspace(
@@ -339,6 +410,9 @@ export class SubscriptionResource extends BaseResource<SubscriptionModel> {
       disableSCIM: true,
     });
 
+    // Invalidate the subscription cache for this workspace
+    await SubscriptionResource.invalidateSubscriptionCache(workspace);
+
     return new SubscriptionResource(
       SubscriptionModel,
       this.createFreeNoPlanSubscription(workspace),
@@ -445,6 +519,9 @@ export class SubscriptionResource extends BaseResource<SubscriptionModel> {
       });
     }
 
+    // Invalidate the subscription cache for this workspace
+    await SubscriptionResource.invalidateSubscriptionCache(workspace);
+
     return new SubscriptionResource(
       SubscriptionModel,
       newSubscription.get(),
@@ -503,6 +580,8 @@ export class SubscriptionResource extends BaseResource<SubscriptionModel> {
             where: { sId: activeSubscription.sId },
           }
         );
+        // Invalidate the subscription cache
+        await SubscriptionResource.invalidateSubscriptionCache(owner);
         return;
       }
       throw new Error(
@@ -547,6 +626,8 @@ export class SubscriptionResource extends BaseResource<SubscriptionModel> {
           },
         }
       );
+      // Invalidate the subscription cache
+      await SubscriptionResource.invalidateSubscriptionCache(owner);
       return;
     }
 
@@ -604,6 +685,9 @@ export class SubscriptionResource extends BaseResource<SubscriptionModel> {
         },
       }
     );
+
+    // Invalidate the subscription cache
+    await SubscriptionResource.invalidateSubscriptionCache(owner);
 
     return new Ok(undefined);
   }
@@ -890,6 +974,15 @@ export class SubscriptionResource extends BaseResource<SubscriptionModel> {
     return newPlan;
   }
 
+  private async invalidateCache(): Promise<void> {
+    const workspace = await WorkspaceResource.fetchByModelId(this.workspaceId);
+    if (workspace) {
+      await SubscriptionResource.invalidateSubscriptionCache(
+        renderLightWorkspaceType({ workspace })
+      );
+    }
+  }
+
   async markAsEnded(
     endedStatus: "ended" | "ended_backend_only",
     transaction?: Transaction
@@ -903,6 +996,7 @@ export class SubscriptionResource extends BaseResource<SubscriptionModel> {
       },
       transaction
     );
+    await this.invalidateCache();
   }
 
   // Payment status.
@@ -914,6 +1008,7 @@ export class SubscriptionResource extends BaseResource<SubscriptionModel> {
       },
       transaction
     );
+    await this.invalidateCache();
   }
 
   async setPaymentFailingStatus(
@@ -926,6 +1021,7 @@ export class SubscriptionResource extends BaseResource<SubscriptionModel> {
       },
       transaction
     );
+    await this.invalidateCache();
   }
 
   async markAsCanceled(
@@ -941,6 +1037,7 @@ export class SubscriptionResource extends BaseResource<SubscriptionModel> {
       },
       transaction
     );
+    await this.invalidateCache();
   }
 
   async markAsActive(
@@ -948,6 +1045,7 @@ export class SubscriptionResource extends BaseResource<SubscriptionModel> {
     transaction?: Transaction
   ): Promise<void> {
     await this.update({ status: "active", trialing }, transaction);
+    await this.invalidateCache();
   }
 
   /**
