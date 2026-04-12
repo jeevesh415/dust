@@ -39,10 +39,10 @@ export interface GlobalAgentFeedbackItem {
   userName: string | null;
   userEmail: string | null;
   isConversationShared: boolean;
-  workspaceSId: string;
+  workspaceId: string;
   workspaceName: string;
-  conversationSId: string | null;
-  messageSId: string | null;
+  conversationId: string | null;
+  messageId: string | null;
 }
 
 export interface GetGlobalAgentFeedbacksResponseBody {
@@ -146,7 +146,7 @@ async function handler(
     attributes: ["sId", "agentMessageId"],
     where: { agentMessageId: agentMessageIds },
   });
-  const messageSIdByAgentMessageId = new Map(
+  const messageIdByAgentMessageId = new Map(
     messages.map((m) => [m.agentMessageId, m.sId])
   );
 
@@ -161,10 +161,10 @@ async function handler(
       userName: row.user?.name ?? null,
       userEmail: row.user?.email ?? null,
       isConversationShared: row.isConversationShared,
-      workspaceSId: workspace?.sId ?? "unknown",
+      workspaceId: workspace?.sId ?? "unknown",
       workspaceName: workspace?.name ?? "Unknown",
-      conversationSId: conversationById.get(row.conversationId) ?? null,
-      messageSId: messageSIdByAgentMessageId.get(row.agentMessageId) ?? null,
+      conversationId: conversationById.get(row.conversationId) ?? null,
+      messageId: messageIdByAgentMessageId.get(row.agentMessageId) ?? null,
     };
   });
 

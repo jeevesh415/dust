@@ -1,8 +1,13 @@
 import { isMessageUnread } from "@app/components/assistant/conversation/utils";
-import type {
-  AgentMessageType,
-  ConversationType,
-  UserMessageType,
+import {
+  type AgentMessageType,
+  type CompactionMessageType,
+  type ConversationType,
+  isLightConversationType,
+  type LightAgentMessageType,
+  type LightConversationType,
+  type UserMessageType,
+  type UserMessageTypeWithContentFragments,
 } from "@app/types/assistant/conversation";
 import type { ContentFragmentType } from "@app/types/content_fragment";
 
@@ -10,7 +15,13 @@ import type { ContentFragmentType } from "@app/types/content_fragment";
  * Formats a single message for display.
  */
 function formatMessage(
-  msg: UserMessageType | AgentMessageType | ContentFragmentType,
+  msg:
+    | UserMessageType
+    | AgentMessageType
+    | ContentFragmentType
+    | LightAgentMessageType
+    | CompactionMessageType
+    | UserMessageTypeWithContentFragments,
   lastReadMs: number | null
 ) {
   const dateStr = new Date(msg.created).toISOString();
@@ -24,13 +35,18 @@ function formatMessage(
   }
 
   if (msg.type === "agent_message") {
-    const agentName = msg.configuration?.name ?? "Assistant";
+    const agentName = msg.configuration?.name ?? "Agent";
     const content = msg.content ?? "";
-    return `>> Assistant (${agentName}) [${dateStr}]${unreadFormatted}:\n${msg.visibility === "deleted" ? "Deleted message" : content}\n`;
+    return `>> Agent (${agentName}) [${dateStr}]${unreadFormatted}:\n${msg.visibility === "deleted" ? "Deleted message" : content}\n`;
   }
 
   if (msg.type === "content_fragment") {
     return `>> Content Fragment [${dateStr}]${unreadFormatted}:\nID: ${msg.contentFragmentId}\nContent-Type: ${msg.contentType}\nTitle: ${msg.title}\nVersion: ${msg.version}\nSource URL: ${msg.sourceUrl}\n`;
+  }
+
+  if (msg.type === "compaction_message") {
+    const content = msg.content ?? "";
+    return `>> Compaction [${dateStr}]:\n ${content}\n`;
   }
 
   return "";
@@ -41,25 +57,34 @@ function formatMessage(
  * This creates a simple text representation with all messages.
  */
 export function formatConversationForDisplay(
-  conversation: ConversationType,
+  conversation: ConversationType | LightConversationType,
   workspaceId: string
 ) {
   // Convert conversation content to formatted messages
   const messages: string[] = [];
 
-  for (const versions of conversation.content) {
-    // Only take the last version of each rank
-    const msg = versions[versions.length - 1];
-    if (!msg) {
-      continue;
+  // TODO(compaction): stop at compaction boundary
+  if (isLightConversationType(conversation)) {
+    for (const msg of conversation.content) {
+      const formattedMessage = formatMessage(msg, conversation.lastReadMs);
+      if (formattedMessage) {
+        messages.push(formattedMessage);
+      }
     }
+  } else {
+    for (const versions of conversation.content) {
+      // Only take the last version of each rank
+      const msg = versions[versions.length - 1];
+      if (!msg) {
+        continue;
+      }
 
-    const formattedMessage = formatMessage(msg, conversation.lastReadMs);
-    if (formattedMessage) {
-      messages.push(formattedMessage);
+      const formattedMessage = formatMessage(msg, conversation.lastReadMs);
+      if (formattedMessage) {
+        messages.push(formattedMessage);
+      }
     }
   }
-
   // Format timestamps
   const createdDate = new Date(conversation.created).toISOString();
   const updatedDate = new Date(conversation.updated).toISOString();
@@ -82,7 +107,7 @@ export function formatConversationForDisplay(
  * Formats multiple conversations for display.
  */
 export function formatConversationsForDisplay(
-  conversations: ConversationType[],
+  conversations: (ConversationType | LightConversationType)[],
   workspaceId: string
 ) {
   return conversations.map((conv) =>

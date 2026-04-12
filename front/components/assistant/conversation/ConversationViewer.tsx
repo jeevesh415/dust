@@ -1,7 +1,11 @@
 import { ConversationViewerEmptyState } from "@app/components/assistant/ConversationViewerEmptyState";
 import { AgentInputBar } from "@app/components/assistant/conversation/AgentInputBar";
+import { ConversationBranchApprovalModal } from "@app/components/assistant/conversation/ConversationBranchApprovalModal";
 import { ConversationErrorDisplay } from "@app/components/assistant/conversation/ConversationError";
-import { InputBarContext } from "@app/components/assistant/conversation/input_bar/InputBarContext";
+import {
+  parseDataAsMessageIdAndActionId,
+  useConversationSidePanelContext,
+} from "@app/components/assistant/conversation/ConversationSidePanelContext";
 import {
   createPlaceholderAgentMessage,
   createPlaceholderUserMessage,
@@ -13,7 +17,9 @@ import type {
 } from "@app/components/assistant/conversation/types";
 import {
   areSameRankAndBranch,
+  convertLightMessageTypeToVirtuosoMessages,
   getPredicateForRankAndBranch,
+  isAgentMessageWithStreaming,
   isUserMessage,
   makeInitialMessageStreamState,
 } from "@app/components/assistant/conversation/types";
@@ -34,17 +40,12 @@ import { getLightAgentMessageFromAgentMessage } from "@app/lib/api/assistant/cit
 import type { AgentMessageFeedbackType } from "@app/lib/api/assistant/feedback";
 import type { ConversationEvents } from "@app/lib/api/assistant/streaming/types";
 import { getUpdatedParticipantsFromEvent } from "@app/lib/client/conversation/event_handlers";
-import { clientFetch } from "@app/lib/egress/client";
 import type { DustError } from "@app/lib/error";
 import { AgentMessageCompletedEvent } from "@app/lib/notifications/events";
 import { useSpaceInfo } from "@app/lib/swr/spaces";
 import logger from "@app/logger/logger";
-import type {
-  ConversationWithoutContentType,
-  LightMessageType,
-} from "@app/types/assistant/conversation";
 import {
-  isUserMessageType,
+  type ConversationWithoutContentType,
   isUserMessageTypeWithContentFragments,
 } from "@app/types/assistant/conversation";
 import type { RichMention } from "@app/types/assistant/mentions";
@@ -53,7 +54,6 @@ import {
   toMentionType,
 } from "@app/types/assistant/mentions";
 import type { ContentFragmentsType } from "@app/types/content_fragment";
-import type { ButlerSuggestionPublicType } from "@app/types/conversation_butler_suggestion";
 import type { Result } from "@app/types/shared/result";
 import { Err, Ok } from "@app/types/shared/result";
 import type { UserType, WorkspaceType } from "@app/types/user";
@@ -70,7 +70,6 @@ import debounce from "lodash/debounce";
 // biome-ignore lint/correctness/noUnusedImports: ignored using `--suppress`
 import React, {
   useCallback,
-  useContext,
   useEffect,
   useMemo,
   useRef,
@@ -177,6 +176,10 @@ export const ConversationViewer = ({
     options: { disabled: true },
   });
 
+  const [branchIdToApprove, setBranchIdToApprove] = useState<string | null>(
+    null
+  );
+
   const {
     conversation,
     conversationError,
@@ -244,8 +247,6 @@ export const ConversationViewer = ({
     conversationId,
   });
   const submitInFlightRef = useRef(false);
-
-  const { setSelectedAgent, setPendingInputText } = useContext(InputBarContext);
 
   const [initialListData, setInitialListData] = useState<
     VirtuosoMessage[] | undefined
@@ -319,6 +320,36 @@ export const ConversationViewer = ({
     conversation?.lastReadMs,
   ]);
 
+  // Sync the virtuoso ref with the side panel context.
+  const {
+    data: panelData,
+    currentPanel,
+    setVirtuosoMsg,
+  } = useConversationSidePanelContext();
+
+  // The ConversationSidePanel is not a children of the VirtuosoMessageList, therefor it doesn't have access to the state easily.
+  // This provide the msg to the "Agent Details" panel when it's open and keep it updated.
+  // It's a workaround until we found a cleaner way to handle this.
+  // Note: it's based on the "onRenderedDataChange" call so it means that if the message is not rendered, the panel won't be updated.
+  // It's highly unlikely to happen (we render much more than the viewport and it would be surprising that the user scroll to another message) but it's something to keep in mind.
+  const onRenderedDataChange = useCallback(
+    (renderedData: VirtuosoMessage[]) => {
+      if (currentPanel === "actions" && panelData) {
+        const { messageId } = parseDataAsMessageIdAndActionId(panelData);
+        if (!messageId) {
+          return;
+        }
+        const message = renderedData
+          .filter(isAgentMessageWithStreaming)
+          .find((m) => m.sId === messageId);
+        if (message) {
+          setVirtuosoMsg(message);
+        }
+      }
+    },
+    [currentPanel, panelData, setVirtuosoMsg]
+  );
+
   // This is to handle we just fetched more messages by scrolling up.
   useEffect(() => {
     // don't do anything until we have a first page of messages.
@@ -360,74 +391,6 @@ export const ConversationViewer = ({
     conversationId: conversationId ?? "",
     workspaceId: owner.sId,
   });
-
-  const [suggestionsByMessageSId, setSuggestionsByMessageSId] = useState(
-    () => new Map<string, ButlerSuggestionPublicType[]>()
-  );
-
-  const [isButlerThinking, setIsButlerThinking] = useState(false);
-
-  const handleSuggestionAction = useCallback(
-    async (
-      suggestionSId: string,
-      status: "accepted" | "dismissed"
-    ): Promise<void> => {
-      // Look up the suggestion before removing it so we can act on acceptance.
-      let matchedSuggestion: ButlerSuggestionPublicType | undefined;
-      for (const suggestions of suggestionsByMessageSId.values()) {
-        matchedSuggestion = suggestions.find((s) => s.sId === suggestionSId);
-        if (matchedSuggestion) {
-          break;
-        }
-      }
-
-      // If accepting a call_agent or create_frame suggestion, pre-fill the input bar
-      // with the agent mention and prompt so the user can review/edit before sending.
-      if (
-        status === "accepted" &&
-        (matchedSuggestion?.suggestionType === "call_agent" ||
-          matchedSuggestion?.suggestionType === "create_frame")
-      ) {
-        const { agentSId, agentName, prompt } = matchedSuggestion.metadata;
-        setSelectedAgent({
-          id: agentSId,
-          type: "agent",
-          label: agentName,
-          pictureUrl: "",
-          description: "",
-        });
-        setPendingInputText(prompt);
-      }
-
-      // Optimistic update: remove the suggestion from local state.
-      setSuggestionsByMessageSId((prev) => {
-        const next = new Map<string, ButlerSuggestionPublicType[]>();
-        for (const [msgSId, suggestions] of prev) {
-          const filtered = suggestions.filter((s) => s.sId !== suggestionSId);
-          if (filtered.length > 0) {
-            next.set(msgSId, filtered);
-          }
-        }
-        return next;
-      });
-
-      await clientFetch(
-        `/api/w/${owner.sId}/assistant/conversations/${conversationId}/butler_suggestions/${suggestionSId}`,
-        {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ status }),
-        }
-      );
-    },
-    [
-      conversationId,
-      owner.sId,
-      suggestionsByMessageSId,
-      setSelectedAgent,
-      setPendingInputText,
-    ]
-  );
 
   // Hooks related to conversation events streaming.
 
@@ -505,6 +468,17 @@ export const ConversationViewer = ({
               }
             }
             break;
+
+          case "user_message_promoted":
+            if (ref.current) {
+              ref.current.data.map((m) =>
+                isUserMessage(m) && m.sId === event.messageId
+                  ? { ...m, visibility: "visible" }
+                  : m
+              );
+            }
+            break;
+
           case "agent_message_new":
             if (ref.current) {
               const agentMessage = makeInitialMessageStreamState(
@@ -529,6 +503,10 @@ export const ConversationViewer = ({
                 } else {
                   ref.current.data.append([agentMessage]);
                 }
+              }
+
+              if (agentMessage.branchId) {
+                setBranchIdToApprove(agentMessage.branchId);
               }
 
               void mutateConversationParticipants(async (participants) =>
@@ -583,21 +561,9 @@ export const ConversationViewer = ({
             window.dispatchEvent(new AgentMessageCompletedEvent());
             void mutateConversationAttachments();
             break;
-          case "butler_thinking":
-            setIsButlerThinking(true);
-            break;
-          case "butler_done":
-            setIsButlerThinking(false);
-            break;
-          case "butler_suggestion_created":
-            setIsButlerThinking(false);
-            setSuggestionsByMessageSId((prev) => {
-              const { suggestion } = event;
-              const existing = prev.get(suggestion.sourceMessageSId) ?? [];
-              const next = new Map(prev);
-              next.set(suggestion.sourceMessageSId, [...existing, suggestion]);
-              return next;
-            });
+          case "compaction_message_new":
+          case "compaction_message_done":
+            // TODO(compaction): handle compaction events in the UI.
             break;
           default:
             ((t: never) => {
@@ -666,8 +632,8 @@ export const ConversationViewer = ({
 
         let rank =
           lastMessageRank +
-          // Content fragments are prepended as "message" in the conversation, before the user message.
-          // We need to account for their ranks as well.
+          // Content fragments are prepended as "message" in the conversation, before the user
+          // message.  We need to account for their ranks as well.
           contentFragments.contentNodes.length +
           contentFragments.uploaded.length +
           // +1 for the user message
@@ -683,19 +649,28 @@ export const ConversationViewer = ({
             contentFragments,
           });
 
+        // Skip placeholder agent messages if there's already a running agent in the conversation
+        // (steering: the message will be pending, no new agent message is created until the running
+        // one gracefully stops).
+        const hasRunningAgent = ref.current.data
+          .get()
+          .some((m) => m.type === "agent_message" && m.status === "created");
+
         const placeholderAgentMessages: VirtuosoMessage[] = [];
-        for (const mention of mentions) {
-          if (isRichAgentMention(mention)) {
-            // +1 per agent message mentioned
-            rank += 1;
-            placeholderAgentMessages.push(
-              createPlaceholderAgentMessage({
-                userMessage: placeholderUserMsg,
-                mention,
-                rank,
-                branchId: null, // We can't know the branch id yet, it will be set when the message is created.
-              })
-            );
+        if (!hasRunningAgent) {
+          for (const mention of mentions) {
+            if (isRichAgentMention(mention)) {
+              // +1 per agent message mentioned
+              rank += 1;
+              placeholderAgentMessages.push(
+                createPlaceholderAgentMessage({
+                  userMessage: placeholderUserMsg,
+                  mention,
+                  rank,
+                  branchId: null, // We can't know the branch id yet, it will be set when the message is created.
+                })
+              );
+            }
           }
         }
 
@@ -864,7 +839,7 @@ export const ConversationViewer = ({
   const firstMessage = messages.at(-1)?.messages.at(0);
   const isOnboardingConversation =
     !!firstMessage &&
-    isUserMessageType(firstMessage) &&
+    isUserMessageTypeWithContentFragments(firstMessage) &&
     firstMessage.context.origin === "onboarding_conversation";
 
   const context: VirtuosoMessageListContext = useMemo(() => {
@@ -877,15 +852,14 @@ export const ConversationViewer = ({
       draftKey: `conversation-${conversationId}`,
       agentBuilderContext,
       feedbacksByMessageId,
-      isButlerThinking,
-      suggestionsByMessageSId,
-      handleSuggestionAction,
       additionalMarkdownComponents,
       additionalMarkdownPlugins,
       isProjectMember,
       isProjectRestricted: spaceInfo?.isRestricted,
-      projectSpaceId: conversation?.spaceId ?? undefined,
+      projectId: conversation?.spaceId ?? undefined,
       projectSpaceName: spaceInfo?.name,
+      branchIdToApprove: branchIdToApprove ?? undefined,
+      setBranchIdToApprove,
     };
   }, [
     user,
@@ -896,14 +870,12 @@ export const ConversationViewer = ({
     conversationId,
     agentBuilderContext,
     feedbacksByMessageId,
-    isButlerThinking,
-    suggestionsByMessageSId,
-    handleSuggestionAction,
     additionalMarkdownComponents,
     additionalMarkdownPlugins,
     isProjectMember,
     spaceInfo?.isRestricted,
     spaceInfo?.name,
+    branchIdToApprove,
   ]);
 
   return (
@@ -917,6 +889,8 @@ export const ConversationViewer = ({
         licenseKey={process.env.NEXT_PUBLIC_VIRTUOSO_LICENSE_KEY ?? ""}
       >
         <VirtuosoMessageList<VirtuosoMessage, VirtuosoMessageListContext>
+          onRenderedDataChange={onRenderedDataChange}
+          StickyHeader={ConversationBranchApprovalModal}
           data={{
             data: initialListData,
             scrollModifier: {
@@ -936,7 +910,7 @@ export const ConversationViewer = ({
           className={cn(
             "dd-privacy-mask",
             "@container/conversation",
-            "h-full w-full px-4",
+            "h-full w-full px-5",
             !agentBuilderContext && "md:px-8"
           )}
           shortSizeAlign="top"
@@ -953,12 +927,3 @@ export const ConversationViewer = ({
     </>
   );
 };
-
-const convertLightMessageTypeToVirtuosoMessages = (
-  messages: LightMessageType[]
-) =>
-  messages.map((message) =>
-    isUserMessageTypeWithContentFragments(message)
-      ? message
-      : makeInitialMessageStreamState(message)
-  );

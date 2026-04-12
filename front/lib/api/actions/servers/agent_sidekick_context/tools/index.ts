@@ -46,10 +46,12 @@ import logger from "@app/logger/logger";
 import type { DataSourceViewCategory } from "@app/types/api/public/spaces";
 import type {
   AgentMessageType,
+  CompactionMessageType,
   UserMessageType,
 } from "@app/types/assistant/conversation";
 import {
   isAgentMessageType,
+  isCompactionMessageType,
   isUserMessageType,
 } from "@app/types/assistant/conversation";
 import { isAgentMention } from "@app/types/assistant/mentions";
@@ -78,6 +80,7 @@ import {
   isSubAgentSuggestion,
   isToolsSuggestion,
 } from "@app/types/suggestions/agent_suggestion";
+import { JSDOM } from "jsdom";
 
 const SIDEKICK_KNOWLEDGE_CATEGORIES: DataSourceViewCategory[] = [
   "managed",
@@ -189,6 +192,14 @@ async function markDuplicateSuggestionsAsOutdated(
 type InstructionSuggestionInput = z.infer<typeof InstructionsSuggestionSchema>;
 
 /**
+ * Returns the number of top-level HTML elements in the given HTML string
+ */
+function countTopLevelBlocks(html: string): number {
+  const dom = new JSDOM(`<body>${html}</body>`);
+  return dom.window.document.body.children.length;
+}
+
+/**
  * Shared logic for creating instruction suggestions. Used by both the
  * suggest_prompt_edits MCP handler and reinforced agent analysis.
  */
@@ -243,6 +254,19 @@ export async function createInstructionSuggestions({
 
   if (!agentConfiguration) {
     return new Err(`Agent configuration not found: ${agentConfigurationId}`);
+  }
+
+  // Reject non-root suggestions that contain multiple top-level blocks.
+  for (const suggestion of suggestions) {
+    if (suggestion.targetBlockId !== INSTRUCTIONS_ROOT_TARGET_BLOCK_ID) {
+      const blockCount = countTopLevelBlocks(suggestion.content);
+      if (blockCount > 1) {
+        return new Err(
+          `Suggestion for block "${suggestion.targetBlockId}" contains ${blockCount} top-level elements but replace only supports 1. ` +
+            `Keep it within a single tag, or use targetBlockId '${INSTRUCTIONS_ROOT_TARGET_BLOCK_ID}' if the change requires multiple blocks.`
+        );
+      }
+    }
   }
 
   const createdSuggestions: {
@@ -658,12 +682,15 @@ const handlers: ToolHandlers<typeof AGENT_SIDEKICK_CONTEXT_TOOLS_METADATA> = {
   },
 
   get_available_skills: async (_, { auth }) => {
-    const skillList = await listAvailableSkills(auth);
+    const [skillList, toolList] = await Promise.all([
+      listAvailableSkills(auth),
+      listAvailableTools(auth),
+    ]);
 
     return new Ok([
       {
         type: "text" as const,
-        text: formatAvailableSkills(skillList),
+        text: formatAvailableSkills(skillList, toolList),
       },
     ]);
   },
@@ -1524,11 +1551,16 @@ const handlers: ToolHandlers<typeof AGENT_SIDEKICK_CONTEXT_TOOLS_METADATA> = {
     const conversation = conversationRes.value;
 
     // Flatten to last version of each message, find the target by sId.
-    let foundMessage: UserMessageType | AgentMessageType | null = null;
+    let foundMessage:
+      | UserMessageType
+      | AgentMessageType
+      | CompactionMessageType
+      | null = null;
     let foundIndex = -1;
     const flatMessages: (
       | UserMessageType
       | AgentMessageType
+      | CompactionMessageType
       | ContentFragmentType
     )[] = [];
 
@@ -1543,7 +1575,9 @@ const handlers: ToolHandlers<typeof AGENT_SIDEKICK_CONTEXT_TOOLS_METADATA> = {
     for (let i = 0; i < flatMessages.length; i++) {
       const msg = flatMessages[i];
       if (
-        (isUserMessageType(msg) || isAgentMessageType(msg)) &&
+        (isUserMessageType(msg) ||
+          isAgentMessageType(msg) ||
+          isCompactionMessageType(msg)) &&
         msg.sId === messageId
       ) {
         foundMessage = msg;
@@ -1622,6 +1656,23 @@ const handlers: ToolHandlers<typeof AGENT_SIDEKICK_CONTEXT_TOOLS_METADATA> = {
       ]);
     }
 
+    if (isCompactionMessageType(foundMessage)) {
+      lines.push(`# Compaction message ${foundMessage.sId}`);
+      lines.push(`at ${foundMessage.created}`);
+      lines.push("");
+
+      lines.push("## Content");
+      lines.push(foundMessage.content ?? "_empty_");
+      lines.push("");
+
+      return new Ok([
+        {
+          type: "text" as const,
+          text: lines.join("\n"),
+        },
+      ]);
+    }
+
     // Agent message.
     const agentMsg = foundMessage;
     const status = agentMsg.status === "succeeded" ? "succeeded" : "failed";
@@ -1679,21 +1730,21 @@ const handlers: ToolHandlers<typeof AGENT_SIDEKICK_CONTEXT_TOOLS_METADATA> = {
     }
 
     // Find agents that this message handed off to.
-    const handoffTargets: { agentSId: string; agentName: string }[] = [];
+    const handoffTargets: { agentId: string; agentName: string }[] = [];
     for (const msg of flatMessages) {
       if (
         isAgentMessageType(msg) &&
         msg.parentAgentMessageId === agentMsg.sId
       ) {
         handoffTargets.push({
-          agentSId: msg.configuration.sId,
+          agentId: msg.configuration.sId,
           agentName: msg.configuration.name,
         });
       }
     }
     if (handoffTargets.length > 0) {
       lines.push(
-        `Handed off to: ${handoffTargets.map((h) => `${h.agentSId} (${h.agentName})`).join(", ")}`
+        `Handed off to: ${handoffTargets.map((h) => `${h.agentId} (${h.agentName})`).join(", ")}`
       );
       lines.push("");
     }

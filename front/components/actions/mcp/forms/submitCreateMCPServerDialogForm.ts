@@ -3,7 +3,10 @@ import { requiresBearerTokenConfiguration } from "@app/lib/actions/mcp_helper";
 import type { AuthorizationInfo } from "@app/lib/actions/mcp_metadata_extraction";
 import type { MCPServerType } from "@app/lib/api/mcp";
 import type { RegionInfo } from "@app/lib/api/regions/config";
-import type { MCPConnectionType } from "@app/lib/swr/mcp_servers";
+import {
+  isMCPCreateServerError,
+  type MCPConnectionType,
+} from "@app/lib/swr/mcp_servers";
 import type { CreateMCPServerResponseBody } from "@app/pages/api/w/[wId]/mcp";
 import type { DiscoverOAuthMetadataResponseBody } from "@app/pages/api/w/[wId]/mcp/discover_oauth_metadata";
 import { setupOAuthConnection } from "@app/types/oauth/client/setup";
@@ -35,20 +38,33 @@ export type CreateMCPServerDialogSubmitErrorKind =
 export class CreateMCPServerDialogSubmitError extends Error {
   readonly kind: CreateMCPServerDialogSubmitErrorKind;
   readonly remoteMCPServerOAuthDiscoveryDone: boolean;
+  readonly isRemoteServerError: boolean;
 
   constructor({
     kind,
     message,
     remoteMCPServerOAuthDiscoveryDone,
+    isRemoteServerError = false,
   }: {
     kind: CreateMCPServerDialogSubmitErrorKind;
     message: string;
     remoteMCPServerOAuthDiscoveryDone: boolean;
+    isRemoteServerError?: boolean;
   }) {
     super(message);
     this.kind = kind;
     this.remoteMCPServerOAuthDiscoveryDone = remoteMCPServerOAuthDiscoveryDone;
+    this.isRemoteServerError = isRemoteServerError;
   }
+}
+
+export function isCreateServerError(
+  error: Error
+): error is CreateMCPServerDialogSubmitError & { kind: "create_server" } {
+  return (
+    error instanceof CreateMCPServerDialogSubmitError &&
+    error.kind === "create_server"
+  );
 }
 
 type DiscoverOAuthMetadataFn = (
@@ -58,6 +74,7 @@ type DiscoverOAuthMetadataFn = (
 
 type CreateRemoteMCPServerFn = (args: {
   url: string;
+  defaultServerId?: number;
   includeGlobal: boolean;
   sharedSecret?: string;
   oauthConnection?: MCPConnectionType;
@@ -71,6 +88,7 @@ type CreateInternalMCPServerFn = (
     sharedSecret?: string;
     customHeaders?: Array<{ key: string; value: string }>;
     viewName?: string;
+    oauthScope?: string;
   } & (
     | { oauthConnection: MCPConnectionType; useCase?: never }
     | { oauthConnection?: never; useCase: MCPOAuthUseCase }
@@ -81,6 +99,7 @@ type CreateInternalMCPServerFn = (
 interface SubmitCreateMCPServerDialogFormParams {
   owner: WorkspaceType;
   internalMCPServer?: MCPServerType;
+  defaultServerId?: number;
   values: CreateMCPServerDialogFormValues;
   // Workflow state - managed via useState in the dialog, not in form state.
   // These are server-derived values, not user input.
@@ -96,6 +115,7 @@ interface SubmitCreateMCPServerDialogFormParams {
 export async function submitCreateMCPServerDialogForm({
   owner,
   internalMCPServer,
+  defaultServerId,
   values,
   authorization,
   remoteMCPServerOAuthDiscoveryDone,
@@ -165,9 +185,26 @@ export async function submitCreateMCPServerDialogForm({
     );
   }
 
-  if (authorization && oauthUseCase) {
-    const scope = authorization.scope;
+  // Compute the effective OAuth scope: use admin-selected scopes if provided,
+  // otherwise fall back to the server's full default scope.
+  // Scopes marked with `impliedBy` are excluded when their parent scope is
+  // selected (e.g. Files.Read.All is excluded when Files.ReadWrite.All is
+  // selected, since ReadWrite already includes read access).
+  const effectiveScope =
+    values.selectedScopes !== undefined && authorization?.availableScopes
+      ? values.selectedScopes
+          .filter((scopeValue) => {
+            const def = authorization.availableScopes!.find(
+              (s) => s.value === scopeValue
+            );
+            return !(
+              def?.impliedBy && values.selectedScopes!.includes(def.impliedBy)
+            );
+          })
+          .join(" ")
+      : authorization?.scope;
 
+  if (authorization && oauthUseCase) {
     const cRes = await setupOAuthConnection({
       owner,
       provider: authorization.provider,
@@ -175,7 +212,7 @@ export async function submitCreateMCPServerDialogForm({
       useCase: "platform_actions",
       extraConfig: {
         ...(values.authCredentials ?? {}),
-        ...(scope ? { scope } : {}),
+        ...(effectiveScope ? { scope: effectiveScope } : {}),
       },
       regionInfo,
     });
@@ -221,18 +258,23 @@ export async function submitCreateMCPServerDialogForm({
           }
         : {};
 
+    const scopeField =
+      effectiveScope !== undefined ? { oauthScope: effectiveScope } : {};
+
     const createRes = oauthConnection
       ? await createInternalMCPServer({
           name: internalMCPServer.name,
           oauthConnection,
           includeGlobal: true,
           viewName: values.viewName,
+          ...scopeField,
           ...optionalFields,
         })
       : await createInternalMCPServer({
           name: internalMCPServer.name,
           includeGlobal: true,
           viewName: values.viewName,
+          ...scopeField,
           ...optionalFields,
         });
 
@@ -253,6 +295,7 @@ export async function submitCreateMCPServerDialogForm({
   if (values.remoteServerUrl) {
     const createRes = await createWithURL({
       url: values.remoteServerUrl,
+      defaultServerId,
       includeGlobal: true,
       sharedSecret:
         values.authMethod === "bearer" ? values.sharedSecret : undefined,
@@ -263,12 +306,15 @@ export async function submitCreateMCPServerDialogForm({
     });
 
     if (createRes.isErr()) {
+      const err = createRes.error;
       return new Err(
         new CreateMCPServerDialogSubmitError({
           kind: "create_server",
-          message: createRes.error.message,
+          message: err.message,
           remoteMCPServerOAuthDiscoveryDone:
             nextRemoteMCPServerOAuthDiscoveryDone,
+          isRemoteServerError:
+            isMCPCreateServerError(err) && err.isRemoteServerError,
         })
       );
     }

@@ -1,10 +1,10 @@
+import type { InternalMCPServerNameType } from "@app/lib/actions/mcp_internal_actions/constants";
 import type { MCPApproveExecutionEvent } from "@app/lib/actions/mcp_internal_actions/events";
 import type { ActionGeneratedFileType } from "@app/lib/actions/types";
 import type { AgentMCPActionWithOutputType } from "@app/types/actions";
 import type { AgentContentItemType } from "@app/types/assistant/agent_message_content";
 
 import type { ContentFragmentType } from "../content_fragment";
-import type { ButlerSuggestionPublicType } from "../conversation_butler_suggestion";
 import type { AllSupportedWithDustSpecificFileContentType } from "../files";
 import type { ModelId } from "../shared/model_id";
 import type { UserType, WorkspaceType } from "../user";
@@ -15,7 +15,7 @@ import type {
 } from "./agent";
 import type { MentionType, RichMention } from "./mentions";
 
-export type MessageVisibility = "visible" | "deleted";
+export type MessageVisibility = "visible" | "deleted" | "pending";
 
 export type ConversationMessageReactions = {
   messageId: string;
@@ -37,18 +37,21 @@ export type MessageReactionType = {
 export type MessageType =
   | AgentMessageType
   | UserMessageType
-  | ContentFragmentType;
+  | ContentFragmentType
+  | CompactionMessageType;
 
 // This is the old format where content fragments are separated from the user messages.
 export type LegacyLightMessageType =
   | LightAgentMessageType
   | UserMessageType
-  | ContentFragmentType;
+  | ContentFragmentType
+  | CompactionMessageType;
 
 // This is the new format where content fragments are attached to the user messages.
 export type LightMessageType =
   | LightAgentMessageType
-  | UserMessageTypeWithContentFragments;
+  | UserMessageTypeWithContentFragments
+  | CompactionMessageType;
 
 /**
  * User messages
@@ -106,8 +109,8 @@ export type UserMessageOrigin =
   // have been used as a hack but should be removed and most likely handled as message metadata
   // (to be created).
   | "onboarding_conversation"
-  // for internal use, for the butler in projects
-  | "project_butler";
+  // for internal use, for reinforced agent batch LLM operations
+  | "reinforcement";
 
 /**
  * @swaggerschema Context (swagger_schemas.ts), PrivateUserMessageContext (swagger_private_schemas.ts)
@@ -201,11 +204,13 @@ export type AgentMessageStatus =
   | "created"
   | "succeeded"
   | "failed"
-  | "cancelled";
+  | "cancelled"
+  | "gracefully_stopped";
 
 export const AGENT_MESSAGE_STATUSES_TO_TRACK: AgentMessageStatus[] = [
   "succeeded",
   "cancelled",
+  "gracefully_stopped",
 ];
 
 export interface CitationType {
@@ -244,6 +249,17 @@ export type BaseAgentMessageType = {
   prunedContext?: boolean;
 };
 
+export type InlineActivityStep =
+  | { type: "thinking"; content: string; id: string }
+  | { type: "content"; content: string; id: string }
+  | {
+      type: "action";
+      label: string;
+      id: string;
+      actionId: string;
+      internalMCPServerName: InternalMCPServerNameType | null;
+    };
+
 export type ParsedContentItem =
   | { kind: "reasoning"; content: string }
   | { kind: "action"; action: AgentMCPActionWithOutputType };
@@ -281,6 +297,7 @@ export type LightAgentMessageType = BaseAgentMessageType & {
   };
   citations: Record<string, CitationType>;
   generatedFiles: Omit<ActionGeneratedFileType, "snippet">[];
+  activitySteps: InlineActivityStep[];
 };
 
 // This type represents the agent message we can reconstruct by accumulating streaming events
@@ -299,6 +316,42 @@ export function isLightAgentMessageWithActionsType(
 
 export function isAgentMessageType(arg: MessageType): arg is AgentMessageType {
   return arg.type === "agent_message";
+}
+
+// This guard is used to distinguish (light) agent message from the messages on the content of a
+// LightConversationType.
+export function isLightAgentMessageType(
+  message: LightMessageType
+): message is LightAgentMessageType {
+  return message.type === "agent_message";
+}
+
+/**
+ * Compaction messages
+ */
+export type CompactionMessageStatus = "created" | "succeeded" | "failed";
+
+/**
+ * @swaggerschema PrivateCompactionMessage (swagger_private_schemas.ts)
+ */
+export type CompactionMessageType = {
+  type: "compaction_message";
+  id: ModelId;
+  compactionMessageId: ModelId;
+  sId: string;
+  created: number;
+  visibility: MessageVisibility;
+  version: number;
+  rank: number;
+  branchId: string | null;
+  status: CompactionMessageStatus; // Lifecycle: created → succeeded | failed.
+  content: string | null; // null while status is "created".
+};
+
+export function isCompactionMessageType(
+  arg: MessageType | LegacyLightMessageType | LightMessageType
+): arg is CompactionMessageType {
+  return arg.type === "compaction_message";
 }
 
 /**
@@ -340,6 +393,7 @@ export type ConversationWithoutContentType = {
   triggerId: string | null;
   depth: number;
   metadata: ConversationMetadata;
+  branchId: string | null;
 
   // Ideally, this property should be moved to the ConversationType.
   requestedSpaceIds: string[];
@@ -354,8 +408,12 @@ export type ConversationWithoutContentType = {
 export type ConversationType = ConversationWithoutContentType & {
   owner: WorkspaceType;
   visibility: ConversationVisibility;
-  branchId: string | null;
-  content: (UserMessageType[] | AgentMessageType[] | ContentFragmentType[])[];
+  content: (
+    | UserMessageType[]
+    | AgentMessageType[]
+    | ContentFragmentType[]
+    | CompactionMessageType[]
+  )[];
 };
 
 /**
@@ -365,9 +423,20 @@ export type ConversationType = ConversationWithoutContentType & {
 export type LightConversationType = ConversationWithoutContentType & {
   owner: WorkspaceType;
   visibility: ConversationVisibility;
-  branchId: string | null;
-  content: (LightAgentMessageType | UserMessageTypeWithContentFragments)[];
+  content: (
+    | LightAgentMessageType
+    | UserMessageTypeWithContentFragments
+    | CompactionMessageType
+  )[];
 };
+
+export function isLightConversationType(
+  conversation: ConversationType | LightConversationType
+): conversation is LightConversationType {
+  // Content is not an array of arrays of messages, it's an array of messages.
+  // Just check that the item 0 is not an
+  return "content" in conversation && !Array.isArray(conversation.content[0]);
+}
 
 export const isProjectConversation = <T extends ConversationWithoutContentType>(
   conversation: T
@@ -409,6 +478,7 @@ export const CONVERSATION_ERROR_TYPES = [
   "message_not_found",
   "message_deletion_not_authorized",
   "branch_not_found",
+  "conversation_context_usage_not_found",
 ] as const;
 
 export type ConversationErrorType = (typeof CONVERSATION_ERROR_TYPES)[number];
@@ -445,6 +515,13 @@ export type UserMessageNewEvent = {
   message: UserMessageTypeWithContentFragments;
 };
 
+// Event sent when a pending user message is promoted to visible from pending.
+export type UserMessagePromotedEvent = {
+  type: "user_message_promoted";
+  created: number;
+  messageId: string;
+};
+
 // Event sent when the user message is created.
 export type UserMessageErrorEvent = {
   type: "user_message_error";
@@ -464,30 +541,27 @@ export type AgentMessageNewEvent = {
   message: AgentMessageType;
 };
 
+// Event sent when a new compaction message is created (compaction is starting).
+export type CompactionMessageNewEvent = {
+  type: "compaction_message_new";
+  created: number;
+  messageId: string;
+  message: CompactionMessageType;
+};
+
+// Event sent when compaction completes or fails.
+export type CompactionMessageDoneEvent = {
+  type: "compaction_message_done";
+  created: number;
+  messageId: string;
+  message: CompactionMessageType;
+};
+
 // Event sent when the conversation title is updated.
 export type ConversationTitleEvent = {
   type: "conversation_title";
   created: number;
   title: string;
-};
-
-// Event sent when a butler suggestion is created.
-export type ButlerSuggestionCreatedEvent = {
-  type: "butler_suggestion_created";
-  created: number;
-  suggestion: ButlerSuggestionPublicType;
-};
-
-// Event sent when the butler starts analyzing a conversation.
-export type ButlerThinkingEvent = {
-  type: "butler_thinking";
-  created: number;
-};
-
-// Event sent when the butler finishes analyzing a conversation.
-export type ButlerDoneEvent = {
-  type: "butler_done";
-  created: number;
 };
 
 export const ConversationMCPServerViewOrigins = [

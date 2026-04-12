@@ -14,6 +14,7 @@ import {
   voidFailedProCreditPurchaseInvoice,
 } from "@app/lib/credits/committed";
 import {
+  calculateFreeCreditAmountMicroUsd,
   grantFreeCreditFromSubscriptionStateChangeYearly,
   grantFreeCreditsFromSubscriptionStateChange,
 } from "@app/lib/credits/free";
@@ -22,6 +23,14 @@ import {
   invoiceEnterprisePAYGCredits,
   isPAYGEnabled,
 } from "@app/lib/credits/payg";
+import { handleMetronomeSetupCheckout } from "@app/lib/metronome/checkout";
+import {
+  createMetronomeCredit,
+  reactivateMetronomeContract,
+  scheduleMetronomeContractEnd,
+} from "@app/lib/metronome/client";
+import { getProductFreeMonthlyCreditId } from "@app/lib/metronome/constants";
+import { provisionMetronomeCustomerAndContract } from "@app/lib/metronome/contracts";
 import { PlanModel } from "@app/lib/models/plan";
 import { renderPlanFromModel } from "@app/lib/plans/renderers";
 import {
@@ -34,7 +43,7 @@ import {
 } from "@app/lib/plans/stripe";
 import { CreditResource } from "@app/lib/resources/credit_resource";
 import { MembershipResource } from "@app/lib/resources/membership_resource";
-import { generateRandomModelSId } from "@app/lib/resources/string_ids";
+import { generateRandomModelSId } from "@app/lib/resources/string_ids_server";
 import { SubscriptionResource } from "@app/lib/resources/subscription_resource";
 import { WorkspaceResource } from "@app/lib/resources/workspace_resource";
 import { ServerSideTracking } from "@app/lib/tracking/server";
@@ -42,12 +51,13 @@ import { withTransaction } from "@app/lib/utils/sql_utils";
 import { getStatsDClient } from "@app/lib/utils/statsd";
 import { renderLightWorkspaceType } from "@app/lib/workspace";
 import logger from "@app/logger/logger";
-
 import { apiError, withLogging } from "@app/logger/withlogging";
 import { launchScheduleWorkspaceScrubWorkflow } from "@app/temporal/scrub_workspace/client";
 import { launchWorkOSWorkspaceSubscriptionCreatedWorkflow } from "@app/temporal/workos_events_queue/client";
 import type { WithAPIErrorResponse } from "@app/types/error";
+import type { ModelId } from "@app/types/shared/model_id";
 import { assertNever } from "@app/types/shared/utils/assert_never";
+import { normalizeError } from "@app/types/shared/utils/error_utils";
 import { isString } from "@app/types/shared/utils/general";
 import assert from "assert";
 import type { NextApiRequest, NextApiResponse } from "next";
@@ -96,6 +106,133 @@ async function grantFreeCreditsForSubscription({
     auth,
     stripeSubscription,
   });
+}
+
+/**
+ * Shadow-provision Metronome customer + contract for a workspace.
+ * Uses shadow packages (no billing provider) so Metronome generates invoices
+ * but does NOT deliver them to Stripe. Fire-and-forget: logs errors but does not throw.
+ */
+async function shadowProvisionMetronome({
+  workspace,
+  stripeCustomerId,
+  metronomePackageAlias,
+  sessionId,
+  subscriptionModelId,
+}: {
+  workspace: WorkspaceResource;
+  stripeCustomerId: string;
+  metronomePackageAlias: string;
+  sessionId: string;
+  subscriptionModelId: ModelId;
+}): Promise<void> {
+  try {
+    const result = await provisionMetronomeCustomerAndContract({
+      workspace: renderLightWorkspaceType({ workspace }),
+      stripeCustomerId,
+      packageAlias: metronomePackageAlias,
+      uniquenessKey: sessionId,
+    });
+
+    if (result.isErr()) {
+      logger.error(
+        { workspaceId: workspace.sId, error: result.error.message },
+        "[Stripe Webhook] Failed to shadow-provision Metronome"
+      );
+      return;
+    }
+
+    const { metronomeCustomerId, metronomeContractId } = result.value;
+
+    await WorkspaceResource.updateMetronomeCustomerId(
+      workspace.id,
+      metronomeCustomerId
+    );
+    await SubscriptionResource.updateMetronomeContractId(
+      subscriptionModelId,
+      metronomeContractId
+    );
+
+    logger.info(
+      {
+        workspaceId: workspace.sId,
+        metronomeCustomerId,
+        metronomeContractId,
+      },
+      "[Stripe Webhook] Metronome shadow provisioned"
+    );
+  } catch (err) {
+    logger.error(
+      { workspaceId: workspace.sId, error: normalizeError(err) },
+      "[Stripe Webhook] Failed to shadow-provision Metronome"
+    );
+  }
+}
+
+/**
+ * Grant monthly free programmatic credits to a Metronome-billed workspace.
+ * Uses the same bracket formula as the Stripe credit system.
+ * Idempotent via uniqueness_key: free-legacy-{workspaceId}-{YYYY-MM}.
+ */
+async function grantMetronomeFreeCredits({
+  workspace,
+  stripeSubscription,
+}: {
+  workspace: WorkspaceResource;
+  stripeSubscription: Stripe.Subscription;
+}): Promise<void> {
+  if (!workspace.metronomeCustomerId) {
+    return;
+  }
+
+  try {
+    const productId = getProductFreeMonthlyCreditId();
+
+    // Count active members and compute bracket amount.
+    const memberCount = await MembershipResource.countActiveSeatsInWorkspace(
+      workspace.sId
+    );
+    const amountMicroUsd = calculateFreeCreditAmountMicroUsd(memberCount);
+    if (amountMicroUsd <= 0) {
+      return;
+    }
+
+    // Convert micro-USD to cents (Metronome credits are in cents).
+    const amountCents = Math.ceil(amountMicroUsd / 10_000);
+
+    const periodStart = new Date(
+      stripeSubscription.current_period_start * 1000
+    );
+    const periodEnd = new Date(stripeSubscription.current_period_end * 1000);
+    const monthKey = `${periodStart.getUTCFullYear()}-${String(periodStart.getUTCMonth() + 1).padStart(2, "0")}`;
+
+    const result = await createMetronomeCredit({
+      metronomeCustomerId: workspace.metronomeCustomerId,
+      productId,
+      amountCents,
+      startingAt: periodStart.toISOString(),
+      endingBefore: periodEnd.toISOString(),
+      name: `Free Monthly Credits (${memberCount} users, ${monthKey})`,
+      idempotencyKey: `free-legacy-${workspace.sId}-${monthKey}`,
+    });
+
+    if (result.isOk()) {
+      logger.info(
+        {
+          workspaceId: workspace.sId,
+          memberCount,
+          amountCents,
+          monthKey,
+        },
+        "[Stripe Webhook] Metronome free credits granted"
+      );
+    }
+  } catch (err) {
+    logger.error(
+      { workspaceId: workspace.sId, error: normalizeError(err) },
+      "[Stripe Webhook] Failed to grant Metronome free credits"
+    );
+  }
 }
 
 async function handler(
@@ -160,9 +297,9 @@ async function handler(
           const session = event.data.object as Stripe.Checkout.Session;
           const workspaceId = session.client_reference_id;
           const stripeSubscriptionId = session.subscription;
-          // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
           const planCode = session?.metadata?.planCode || null;
-          // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+          const metronomePackageAlias =
+            session?.metadata?.metronomePackageAlias || null;
           const userId = session?.metadata?.userId || null;
 
           if (session.status === "open" || session.status === "expired") {
@@ -189,6 +326,44 @@ async function handler(
               `[Stripe Webhook] Received checkout.session.completed with unkown status "${session.status}". Ignoring event.`
             );
             return res.status(200).json({ success: true });
+          }
+
+          // Branch on session mode: "setup" for Metronome, "subscription" for Stripe.
+          if (session.mode === "setup") {
+            const result = await handleMetronomeSetupCheckout({
+              session,
+              now,
+            });
+
+            if (result.isOk()) {
+              return res.status(200).json({ success: true });
+            }
+
+            switch (result.error.code) {
+              case "subscription_already_exists":
+              case "workspace_not_found":
+                logger.warn(
+                  { error: result.error, workspaceId, planCode },
+                  `[Stripe Webhook] Metronome setup: ${result.error.message}`
+                );
+                return res
+                  .status(200)
+                  .json({ success: false, message: result.error.message });
+
+              default:
+                logger.error(
+                  { error: result.error, workspaceId, planCode },
+                  `[Stripe Webhook] Metronome setup: ${result.error.message}`
+                );
+                return apiError(req, res, {
+                  status_code: 500,
+                  api_error: {
+                    type: "internal_server_error",
+                    message:
+                      "Stripe Webhook: error handling Metronome setup checkout.session.completed.",
+                  },
+                });
+            }
           }
 
           try {
@@ -222,8 +397,10 @@ async function handler(
                 `Cannot subscribe to plan ${planCode}: not found.`
               );
             }
+            const checkoutStripeSubscription =
+              await stripe.subscriptions.retrieve(stripeSubscriptionId);
 
-            await withTransaction(async (t) => {
+            const newSubscription = await withTransaction(async (t) => {
               const activeSubscription =
                 await SubscriptionResource.fetchActiveByWorkspaceModelId(
                   workspace.id,
@@ -274,16 +451,14 @@ async function handler(
               if (activeSubscription) {
                 await activeSubscription.markAsEnded("ended", t);
               }
-              const stripeSubscription =
-                await stripe.subscriptions.retrieve(stripeSubscriptionId);
 
-              await SubscriptionResource.makeNew(
+              return SubscriptionResource.makeNew(
                 {
                   sId: generateRandomModelSId(),
                   workspaceId: workspace.id,
                   planId: plan.id,
                   status: "active",
-                  trialing: stripeSubscription.status === "trialing",
+                  trialing: checkoutStripeSubscription.status === "trialing",
                   startDate: now,
                   stripeSubscriptionId: stripeSubscriptionId,
                 },
@@ -291,6 +466,31 @@ async function handler(
                 t
               );
             });
+            const auth = await Authenticator.internalAdminForWorkspace(
+              workspace.sId
+            );
+            const shouldGrantFreeCreditsOnCheckoutCompletion =
+              checkoutStripeSubscription.status === "active" ||
+              checkoutStripeSubscription.status === "trialing";
+
+            if (shouldGrantFreeCreditsOnCheckoutCompletion) {
+              const freeCreditsResult = await grantFreeCreditsForSubscription({
+                auth,
+                stripeSubscription: checkoutStripeSubscription,
+              });
+
+              if (freeCreditsResult.isErr()) {
+                logger.error(
+                  {
+                    error: freeCreditsResult.error,
+                    subscriptionId: checkoutStripeSubscription.id,
+                    workspaceId: workspace.sId,
+                  },
+                  "[Stripe Webhook] Error granting free credits on checkout.session.completed"
+                );
+              }
+            }
+
             if (userId) {
               const workspaceSeats =
                 await MembershipResource.countActiveSeatsInWorkspace(
@@ -304,9 +504,21 @@ async function handler(
                 subscriptionStartAt: now,
               });
             }
-            await restoreWorkspaceAfterSubscription(
-              await Authenticator.internalAdminForWorkspace(workspace.sId)
-            );
+            await restoreWorkspaceAfterSubscription(auth);
+
+            if (
+              metronomePackageAlias &&
+              newSubscription &&
+              isString(checkoutStripeSubscription.customer)
+            ) {
+              void shadowProvisionMetronome({
+                workspace,
+                stripeCustomerId: checkoutStripeSubscription.customer,
+                metronomePackageAlias,
+                sessionId: session.id,
+                subscriptionModelId: newSubscription.id,
+              });
+            }
 
             await launchWorkOSWorkspaceSubscriptionCreatedWorkflow({
               workspaceId,
@@ -940,6 +1152,13 @@ async function handler(
               );
             }
 
+            // Grant free credits in Metronome for legacy workspaces.
+            // Fire-and-forget: Metronome failure should not block the webhook.
+            void grantMetronomeFreeCredits({
+              workspace,
+              stripeSubscription,
+            });
+
             if (subscriptionCycleChanged) {
               const paygEnabled = await isPAYGEnabled(auth);
 
@@ -1018,6 +1237,21 @@ async function handler(
               await subscription.markAsCanceled({
                 endDate,
               });
+
+              // Schedule the Metronome contract end (always shadow-billed here).
+              if (subscription.metronomeContractId) {
+                const trialingWorkspace =
+                  await WorkspaceResource.fetchByModelId(
+                    subscription.workspaceId
+                  );
+                if (trialingWorkspace?.metronomeCustomerId) {
+                  void scheduleMetronomeContractEnd({
+                    metronomeCustomerId: trialingWorkspace.metronomeCustomerId,
+                    contractId: subscription.metronomeContractId,
+                    endingBefore: endDate,
+                  });
+                }
+              }
             }
           }
 
@@ -1059,10 +1293,33 @@ async function handler(
               "Workspace not found for subscription in customer.subscription.updated."
             );
 
+            // Schedule the Metronome contract end (always shadow-billed here).
+            if (
+              endDate &&
+              subscription.metronomeContractId &&
+              workspace.metronomeCustomerId
+            ) {
+              void scheduleMetronomeContractEnd({
+                metronomeCustomerId: workspace.metronomeCustomerId,
+                contractId: subscription.metronomeContractId,
+                endingBefore: endDate,
+              });
+            }
+
             const auth = await Authenticator.internalAdminForWorkspace(
               workspace.sId
             );
             if (!endDate) {
+              if (
+                subscription.metronomeContractId &&
+                workspace.metronomeCustomerId
+              ) {
+                void reactivateMetronomeContract({
+                  metronomeCustomerId: workspace.metronomeCustomerId,
+                  contractId: subscription.metronomeContractId,
+                });
+              }
+
               // Subscription is re-activated, so we need to unpause the connectors and re-enable triggers.
               await restoreWorkspaceAfterSubscription(auth);
 

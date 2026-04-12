@@ -6,8 +6,6 @@ import type { JSONSchema7 as JSONSchema } from "json-schema";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 
-export const DATA_WAREHOUSES_TOOL_NAME = "data_warehouses" as const;
-
 // Constants
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 100;
@@ -136,6 +134,12 @@ export const DATA_WAREHOUSES_TOOLS_METADATA = createToolsRecord({
         .describe(
           "Array of table identifiers in the format 'table-<dataSourceId>-<nodeId>'. " +
             "All tables must be from the same warehouse (same dataSourceId)."
+        ),
+      description: z
+        .string()
+        .describe(
+          "The reason this query is being run and what it achieves, in a few words. Use infinitive verbs (e.g. " +
+            '"Analyze revenue trends", "Identify top customers").'
         ),
       query: z
         .string()

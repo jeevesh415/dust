@@ -14,8 +14,12 @@ import type {
   AgentErrorEvent,
   AgentGenerationCancelledEvent,
   AgentMessageDoneEvent,
+  AgentMessageGracefullyStoppedEvent,
   AgentMessagePublicType,
   AgentMessageSuccessEvent,
+  AgentToolCallStartedEvent,
+  AnswerUserQuestionRequestBodyType,
+  AnswerUserQuestionResponseType,
   APIError,
   AppsCheckRequestType,
   BlockedActionsResponseType,
@@ -61,6 +65,7 @@ import type {
   ValidateActionResponseType,
 } from "./types";
 import {
+  AnswerUserQuestionResponseSchema,
   APIErrorSchema,
   AppsCheckResponseSchema,
   BlockedActionsResponseSchema,
@@ -157,14 +162,16 @@ function isTransientHttpStatus(status: number): boolean {
 const DEFAULT_MAX_RECONNECT_ATTEMPTS = 10;
 const DEFAULT_RECONNECT_DELAY = 5000;
 
-type AgentEvent =
+export type AgentEvent =
   | AgentActionSpecificEvent
   | AgentActionSuccessEvent
   | AgentContextPrunedEvent
   | AgentErrorEvent
   | AgentGenerationCancelledEvent
+  | AgentMessageGracefullyStoppedEvent
   | AgentMessageSuccessEvent
   | AgentMessageDoneEvent
+  | AgentToolCallStartedEvent
   | GenerationTokensEvent
   | UserMessageErrorEvent
   | ToolErrorEvent;
@@ -1016,8 +1023,8 @@ export class DustAPI {
 
     const agentMessage = agentMessages[0];
     return this.streamAgentMessageEvents({
-      conversation,
-      agentMessage,
+      conversationId: conversation.sId,
+      agentMessageId: agentMessage.sId,
       signal,
       options: {
         maxReconnectAttempts:
@@ -1029,13 +1036,13 @@ export class DustAPI {
   }
 
   async streamAgentMessageEvents({
-    conversation,
-    agentMessage,
+    conversationId,
+    agentMessageId,
     signal,
     options,
   }: {
-    conversation: ConversationPublicType;
-    agentMessage: AgentMessagePublicType;
+    conversationId: string;
+    agentMessageId: string;
     signal?: AbortSignal;
     options: {
       maxReconnectAttempts: number;
@@ -1056,13 +1063,14 @@ export class DustAPI {
 
     const terminalEventTypes: AgentEvent["type"][] = [
       "agent_message_success",
+      "agent_message_gracefully_stopped",
       "agent_error",
       "agent_generation_cancelled",
       "user_message_error",
     ];
 
     const createRequest = async (lastId?: string | null) => {
-      let path = `assistant/conversations/${conversation.sId}/messages/${agentMessage.sId}/events`;
+      let path = `assistant/conversations/${conversationId}/messages/${agentMessageId}/events`;
       if (lastId) {
         path += `?lastEventId=${lastId}`;
       }
@@ -1996,6 +2004,30 @@ export class DustAPI {
     });
 
     return this._resultFromResponse(ValidateActionResponseSchema, res);
+  }
+
+  async answerUserQuestion({
+    conversationId,
+    messageId,
+    actionId,
+    answer,
+    signal,
+  }: AnswerUserQuestionRequestBodyType & {
+    conversationId: string;
+    messageId: string;
+    signal?: AbortSignal;
+  }): Promise<Result<AnswerUserQuestionResponseType, APIError>> {
+    const res = await this.request({
+      method: "POST",
+      path: `assistant/conversations/${conversationId}/messages/${messageId}/answer-question`,
+      body: {
+        actionId,
+        answer,
+      },
+      signal,
+    });
+
+    return this._resultFromResponse(AnswerUserQuestionResponseSchema, res);
   }
 
   async registerMCPServer({

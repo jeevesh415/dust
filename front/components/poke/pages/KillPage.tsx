@@ -31,6 +31,16 @@ const killSwitchMap: Record<
     title: "Global Blacklist OpenAI",
     description: "Disable OpenAI models in global agents",
   },
+  global_disable_firecrawl: {
+    title: "Global Disable Firecrawl",
+    description:
+      "Disable Firecrawl for webbrowse tool, use Spider.cloud instead",
+  },
+  global_dust_agents_fallback: {
+    title: "Dust Agents Fallback Provider",
+    description:
+      "Force dust and deep-dive agents to use non-Anthropic models (OpenAI > Gemini > others). ONLY USE when either latest Sonnet or Opus models are down.",
+  },
 };
 
 export function KillPage() {

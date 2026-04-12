@@ -1,19 +1,24 @@
 import type {
   AgentMessageStateWithControlEvent,
-  MessageTemporaryState,
+  AgentMessageWithStreaming,
+  PendingToolCall,
   VirtuosoMessage,
   VirtuosoMessageListContext,
 } from "@app/components/assistant/conversation/types";
-import { isMessageTemporayState } from "@app/components/assistant/conversation/types";
+import { isAgentMessageWithStreaming } from "@app/components/assistant/conversation/types";
 import { useEventSource } from "@app/hooks/useEventSource";
 import type { ToolNotificationEvent } from "@app/lib/actions/mcp";
 import {
   isRunAgentChainOfThoughtProgressOutput,
   isRunAgentGenerationTokensProgressOutput,
 } from "@app/lib/actions/mcp_internal_actions/output_schemas";
+import { getActionOneLineLabel } from "@app/lib/api/assistant/activity_steps";
 import { getLightAgentMessageFromAgentMessage } from "@app/lib/api/assistant/citations";
 import type { AgentMCPActionWithOutputType } from "@app/types/actions";
-import type { LightAgentMessageWithActionsType } from "@app/types/assistant/conversation";
+import type {
+  InlineActivityStep,
+  LightAgentMessageWithActionsType,
+} from "@app/types/assistant/conversation";
 import { assertNeverAndIgnore } from "@app/types/shared/utils/assert_never";
 import type { LightWorkspaceType } from "@app/types/user";
 import type { VirtuosoMessageListMethods } from "@virtuoso.dev/message-list";
@@ -39,7 +44,7 @@ const updateMessageThrottled = _.throttle(
     sId: string;
   }) => {
     methods.data.map((m) => {
-      if (isMessageTemporayState(m) && m.sId === sId) {
+      if (isAgentMessageWithStreaming(m) && m.sId === sId) {
         return {
           ...m,
           content,
@@ -51,6 +56,58 @@ const updateMessageThrottled = _.throttle(
   },
   100
 );
+
+export function upsertPendingToolCall(
+  pendingToolCalls: PendingToolCall[],
+  pendingToolCall: PendingToolCall
+): PendingToolCall[] {
+  const matchIndex = pendingToolCalls.findIndex(
+    (toolCall) =>
+      (pendingToolCall.toolCallId &&
+        toolCall.toolCallId === pendingToolCall.toolCallId) ||
+      (pendingToolCall.toolCallIndex !== undefined &&
+        toolCall.toolCallIndex === pendingToolCall.toolCallIndex)
+  );
+
+  if (matchIndex === -1) {
+    return [...pendingToolCalls, pendingToolCall];
+  }
+
+  return pendingToolCalls.map((toolCall, index) =>
+    index === matchIndex
+      ? {
+          ...toolCall,
+          ...pendingToolCall,
+        }
+      : toolCall
+  );
+}
+
+export function removePendingToolCallForAction(
+  pendingToolCalls: PendingToolCall[],
+  action: Pick<
+    AgentMCPActionWithOutputType,
+    "functionCallId" | "functionCallName"
+  >
+): PendingToolCall[] {
+  const matchIndex = pendingToolCalls.findIndex(
+    (toolCall) => toolCall.toolCallId === action.functionCallId
+  );
+
+  if (matchIndex !== -1) {
+    return pendingToolCalls.filter((_, index) => index !== matchIndex);
+  }
+
+  const fallbackMatchIndex = pendingToolCalls.findIndex(
+    (toolCall) => toolCall.toolName === action.functionCallName
+  );
+
+  if (fallbackMatchIndex === -1) {
+    return pendingToolCalls;
+  }
+
+  return pendingToolCalls.filter((_, index) => index !== fallbackMatchIndex);
+}
 
 export function updateMessageWithAction(
   m: LightAgentMessageWithActionsType,
@@ -64,9 +121,9 @@ export function updateMessageWithAction(
 }
 
 export function updateProgress(
-  agentMessage: MessageTemporaryState,
+  agentMessage: AgentMessageWithStreaming,
   event: ToolNotificationEvent
-): MessageTemporaryState {
+): AgentMessageWithStreaming {
   const actionId = event.action.id;
   const currentProgress = agentMessage.streaming.actionProgress.get(actionId);
 
@@ -140,9 +197,84 @@ export function updateProgress(
     },
   };
 }
+
+/**
+ * Append a thinking step to the inline activity steps if the content
+ * is new (not a duplicate of the last thinking step).
+ */
+function appendThinkingStep(
+  steps: InlineActivityStep[],
+  cotContent: string,
+  id: string
+): InlineActivityStep[] {
+  for (let i = steps.length - 1; i >= 0; i--) {
+    const step = steps[i];
+    if (step.type === "thinking") {
+      if (step.content === cotContent) {
+        return steps;
+      }
+      break;
+    }
+  }
+  return [...steps, { type: "thinking", content: cotContent, id }];
+}
+
+function appendContentStep(
+  steps: InlineActivityStep[],
+  textContent: string,
+  id: string
+): InlineActivityStep[] {
+  return [...steps, { type: "content", content: textContent, id }];
+}
+
+/**
+ * Flush the current pending segment (CoT or content) as an activity step.
+ *
+ * In inline activity mode, a pending "tokens" segment is flushed as a content
+ * step and `content.current` is cleared so the next segment starts fresh.
+ * In non-inline mode, content is left untouched (it accumulates as the body).
+ *
+ * Returns the updated steps and whether the body content was cleared.
+ */
+function flushPendingSegment({
+  lastClassification,
+  chainOfThought,
+  content,
+  isInlineActivityEnabled,
+  steps,
+  suffix,
+}: {
+  lastClassification: { current: "tokens" | "chain_of_thought" | null };
+  chainOfThought: { current: string };
+  content: { current: string };
+  isInlineActivityEnabled: boolean;
+  steps: InlineActivityStep[];
+  suffix: string;
+}): { steps: InlineActivityStep[]; contentCleared: boolean } {
+  const cls = lastClassification.current;
+  if (cls === "chain_of_thought" && chainOfThought.current) {
+    const cotToFlush = chainOfThought.current;
+    chainOfThought.current = "";
+    return {
+      steps: appendThinkingStep(steps, cotToFlush, `thinking-${suffix}`),
+      contentCleared: false,
+    };
+  }
+  if (cls === "tokens" && content.current && isInlineActivityEnabled) {
+    const textToFlush = content.current;
+    content.current = "";
+    return {
+      steps: appendContentStep(steps, textToFlush, `content-${suffix}`),
+      contentCleared: true,
+    };
+  }
+  return { steps, contentCleared: false };
+}
+
 interface UseAgentMessageStreamParams {
-  agentMessage: MessageTemporaryState;
+  agentMessage: AgentMessageWithStreaming;
   conversationId: string | null;
+  isInlineActivityEnabled: boolean;
   owner: LightWorkspaceType;
   onEventCallback?: (event: {
     eventId: string;
@@ -155,6 +287,7 @@ interface UseAgentMessageStreamParams {
 export function useAgentMessageStream({
   agentMessage,
   conversationId,
+  isInlineActivityEnabled,
   owner,
   onEventCallback: customOnEventCallback,
   streamId,
@@ -177,7 +310,13 @@ export function useAgentMessageStream({
   );
 
   const chainOfThought = useRef(agentMessage.chainOfThought ?? "");
+  // In inline mode, content.current tracks the current text segment only
+  // (cleared on each flush). In non-inline mode, it accumulates all text.
   const content = useRef(agentMessage.content ?? "");
+  // Tracks the last token classification to detect transitions between
+  // thinking (chain_of_thought) and writing (tokens), flushing completed
+  // segments as activity steps on each switch.
+  const lastClassification = useRef<"tokens" | "chain_of_thought" | null>(null);
 
   const buildEventSourceURL = useCallback(
     (lastEvent: string | null) => {
@@ -210,6 +349,7 @@ export function useAgentMessageStream({
           // end of the stream to the client. So we just return.
           return;
 
+        case "tool_ask_user_question":
         case "tool_personal_auth_required":
         case "tool_file_auth_required":
         case "tool_approve_execution":
@@ -221,8 +361,6 @@ export function useAgentMessageStream({
             (eventPayload.data.classification === "tokens" ||
               eventPayload.data.classification === "chain_of_thought")
           ) {
-            // If this is a fresh mount with existing content and we're getting generation_tokens,
-            // we need to clear the content first to avoid duplication
             content.current = "";
             chainOfThought.current = "";
             isFreshMountWithContent.current = false;
@@ -235,6 +373,56 @@ export function useAgentMessageStream({
             classification === "tokens" ||
             classification === "chain_of_thought"
           ) {
+            // Detect classification transitions and flush completed segments.
+            if (
+              lastClassification.current !== null &&
+              classification !== lastClassification.current
+            ) {
+              const newAgentState =
+                classification === "tokens" && isInlineActivityEnabled
+                  ? "writing"
+                  : "thinking";
+              methods.data.map((m) => {
+                if (!isAgentMessageWithStreaming(m) || m.sId !== sId) {
+                  return m;
+                }
+                const { steps, contentCleared } = flushPendingSegment({
+                  lastClassification,
+                  chainOfThought,
+                  content,
+                  isInlineActivityEnabled,
+                  steps: m.streaming.inlineActivitySteps,
+                  suffix: `pre-${Date.now()}`,
+                });
+                return {
+                  ...m,
+                  ...(contentCleared ? { content: "" } : {}),
+                  streaming: {
+                    ...m.streaming,
+                    agentState: newAgentState,
+                    inlineActivitySteps: steps,
+                  },
+                };
+              });
+            } else if (
+              isInlineActivityEnabled &&
+              lastClassification.current === null &&
+              classification === "tokens"
+            ) {
+              // First tokens event in inline mode — set agentState to writing.
+              methods.data.map((m) => {
+                if (!isAgentMessageWithStreaming(m) || m.sId !== sId) {
+                  return m;
+                }
+                return {
+                  ...m,
+                  streaming: { ...m.streaming, agentState: "writing" },
+                };
+              });
+            }
+
+            lastClassification.current = classification;
+
             if (classification === "tokens") {
               content.current += generationTokens.text;
             } else if (classification === "chain_of_thought") {
@@ -251,71 +439,148 @@ export function useAgentMessageStream({
 
         case "agent_action_success":
           const action = eventPayload.data.action;
-          methods.data.map((m) =>
-            isMessageTemporayState(m) && m.sId === sId
-              ? {
-                  ...updateMessageWithAction(m, action),
-                  streaming: {
-                    ...m.streaming,
-                    agentState: "thinking",
-                    // Clean up progress for this specific action.
-                    actionProgress: new Map(
-                      Array.from(m.streaming.actionProgress.entries()).filter(
-                        ([id]) => id !== action.id
-                      )
-                    ),
+          methods.data.map((m) => {
+            if (!isAgentMessageWithStreaming(m) || m.sId !== sId) {
+              return m;
+            }
+            // Add the completed action to inline activity steps.
+            const alreadyCaptured = m.streaming.inlineActivitySteps.some(
+              (s) => s.id === `action-${action.id}`
+            );
+            const steps = alreadyCaptured
+              ? m.streaming.inlineActivitySteps
+              : [
+                  ...m.streaming.inlineActivitySteps,
+                  {
+                    type: "action" as const,
+                    label: getActionOneLineLabel(action),
+                    id: `action-${action.id}`,
+                    actionId: action.sId,
+                    internalMCPServerName: action.internalMCPServerName,
                   },
-                }
-              : m
-          );
+                ];
+            return {
+              ...updateMessageWithAction(m, action),
+              streaming: {
+                ...m.streaming,
+                agentState: "thinking",
+                inlineActivitySteps: steps,
+                // Clean up progress for this specific action.
+                actionProgress: new Map(
+                  Array.from(m.streaming.actionProgress.entries()).filter(
+                    ([id]) => id !== action.id
+                  )
+                ),
+                pendingToolCalls: removePendingToolCallForAction(
+                  m.streaming.pendingToolCalls,
+                  action
+                ),
+              },
+            };
+          });
 
           break;
 
         case "tool_params":
           const toolParams = eventPayload.data;
-          methods.data.map((m) =>
-            isMessageTemporayState(m) && m.sId === sId
-              ? {
-                  ...updateMessageWithAction(m, toolParams.action),
-                  streaming: {
-                    ...m.streaming,
-                    agentState: "acting",
-                  },
-                }
-              : m
-          );
+          methods.data.map((m) => {
+            if (!isAgentMessageWithStreaming(m) || m.sId !== sId) {
+              return m;
+            }
+            const { steps, contentCleared } = flushPendingSegment({
+              lastClassification,
+              chainOfThought,
+              content,
+              isInlineActivityEnabled,
+              steps: m.streaming.inlineActivitySteps,
+              suffix: `toolparams-${Date.now()}`,
+            });
+            return {
+              ...updateMessageWithAction(m, toolParams.action),
+              ...(contentCleared ? { content: "" } : {}),
+              streaming: {
+                ...m.streaming,
+                agentState: "acting",
+                inlineActivitySteps: steps,
+                pendingToolCalls: removePendingToolCallForAction(
+                  m.streaming.pendingToolCalls,
+                  toolParams.action
+                ),
+              },
+            };
+          });
+          lastClassification.current = null;
           break;
 
         case "tool_notification":
           const toolNotification = eventPayload.data;
           methods.data.map((m) =>
-            isMessageTemporayState(m) && m.sId === sId
+            isAgentMessageWithStreaming(m) && m.sId === sId
               ? updateProgress(m, toolNotification)
               : m
           );
           break;
 
+        case "tool_call_started":
+          const toolCallStarted = eventPayload.data;
+          if (toolCallStarted.type !== "tool_call_started") {
+            break;
+          }
+          methods.data.map((m) => {
+            if (!isAgentMessageWithStreaming(m) || m.sId !== sId) {
+              return m;
+            }
+
+            return {
+              ...m,
+              streaming: {
+                ...m.streaming,
+                pendingToolCalls: upsertPendingToolCall(
+                  m.streaming.pendingToolCalls,
+                  {
+                    toolName: toolCallStarted.toolName,
+                    toolCallId: toolCallStarted.toolCallId,
+                    toolCallIndex: toolCallStarted.toolCallIndex,
+                  }
+                ),
+              },
+            };
+          });
+          break;
+
         case "tool_error":
         case "agent_error":
           const error = eventPayload.data.error;
-          methods.data.map((m) =>
-            isMessageTemporayState(m) && m.sId === sId
-              ? {
-                  ...m,
-                  status: "failed",
-                  error: error,
-                  streaming: {
-                    ...m.streaming,
-                    agentState: "done",
-                  },
-                }
-              : m
-          );
+          methods.data.map((m) => {
+            if (!isAgentMessageWithStreaming(m) || m.sId !== sId) {
+              return m;
+            }
+            const { steps, contentCleared } = flushPendingSegment({
+              lastClassification,
+              chainOfThought,
+              content,
+              isInlineActivityEnabled,
+              steps: m.streaming.inlineActivitySteps,
+              suffix: `error-${Date.now()}`,
+            });
+            return {
+              ...m,
+              status: "failed",
+              error: error,
+              ...(contentCleared ? { content: null } : {}),
+              streaming: {
+                ...m.streaming,
+                agentState: "done",
+                inlineActivitySteps: steps,
+                pendingToolCalls: [],
+              },
+            };
+          });
           break;
 
         case "agent_context_pruned":
           methods.data.map((m) =>
-            isMessageTemporayState(m) && m.sId === sId
+            isAgentMessageWithStreaming(m) && m.sId === sId
               ? {
                   ...m,
                   prunedContext: true,
@@ -324,39 +589,74 @@ export function useAgentMessageStream({
           );
           break;
 
-        case "agent_generation_cancelled":
-          methods.data.map((m) =>
-            isMessageTemporayState(m) && m.sId === sId
-              ? {
-                  ...m,
-                  status: "cancelled",
-                  streaming: {
-                    ...m.streaming,
-                    agentState: "done",
-                  },
-                }
-              : m
-          );
+        case "agent_generation_cancelled": {
+          methods.data.map((m) => {
+            if (!isAgentMessageWithStreaming(m) || m.sId !== sId) {
+              return m;
+            }
+            const { steps, contentCleared } = flushPendingSegment({
+              lastClassification,
+              chainOfThought,
+              content,
+              isInlineActivityEnabled,
+              steps: m.streaming.inlineActivitySteps,
+              suffix: `cancel-${Date.now()}`,
+            });
+            return {
+              ...m,
+              status: "cancelled",
+              ...(contentCleared ? { content: null } : {}),
+              streaming: {
+                ...m.streaming,
+                agentState: "done",
+                inlineActivitySteps: steps,
+                pendingToolCalls: [],
+              },
+            };
+          });
           break;
+        }
 
-        case "agent_message_success":
+        case "agent_message_gracefully_stopped":
+        case "agent_message_success": {
           const messageSuccess = eventPayload.data;
-          methods.data.map((m) =>
-            isMessageTemporayState(m) && m.sId === sId
-              ? {
-                  ...m,
-                  ...getLightAgentMessageFromAgentMessage(
-                    messageSuccess.message
-                  ),
-                  status: "succeeded",
-                  streaming: {
-                    ...m.streaming,
-                    agentState: "done",
-                  },
-                }
-              : m
-          );
+          // Flush any remaining CoT (but not content — the final text segment
+          // becomes the message body via the server's canonical message).
+          const cotAtSuccess = chainOfThought.current;
+          chainOfThought.current = "";
+          // In inline activity mode, content.current tracks only the final
+          // text segment (intermediate segments were flushed to content steps).
+          // The server's full message includes ALL text, so we override with
+          // the tracked final segment. In non-inline mode, we trust the server.
+          const finalSegment = content.current;
+          lastClassification.current = null;
+          methods.data.map((m) => {
+            if (!isAgentMessageWithStreaming(m) || m.sId !== sId) {
+              return m;
+            }
+            const steps = cotAtSuccess
+              ? appendThinkingStep(
+                  m.streaming.inlineActivitySteps,
+                  cotAtSuccess,
+                  `thinking-final-${Date.now()}`
+                )
+              : m.streaming.inlineActivitySteps;
+            return {
+              ...m,
+              ...getLightAgentMessageFromAgentMessage(messageSuccess.message),
+              ...(isInlineActivityEnabled
+                ? { content: finalSegment || null }
+                : {}),
+              streaming: {
+                ...m.streaming,
+                agentState: "done",
+                inlineActivitySteps: steps,
+                pendingToolCalls: [],
+              },
+            };
+          });
           break;
+        }
 
         default:
           assertNeverAndIgnore(eventType);
@@ -366,14 +666,20 @@ export function useAgentMessageStream({
         customOnEventCallback(eventPayload);
       }
     },
-    [customOnEventCallback, methods, sId]
+    [customOnEventCallback, isInlineActivityEnabled, methods, sId]
   );
 
-  useEventSource(buildEventSourceURL, onEventCallback, streamId, {
-    isReadyToConsumeStream: shouldStream,
-  });
+  const { isError } = useEventSource(
+    buildEventSourceURL,
+    onEventCallback,
+    streamId,
+    {
+      isReadyToConsumeStream: shouldStream,
+    }
+  );
 
   return {
+    streamError: isError,
     shouldStream,
     isFreshMountWithContent,
   };

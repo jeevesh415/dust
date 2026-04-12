@@ -24,13 +24,14 @@ import { auditLog } from "@app/logger/logger";
 import type {
   AgentMessageType,
   AgentMessageTypeWithoutMentions,
-  ConversationType,
+  ConversationWithoutContentType,
   RichMentionWithStatus,
   UserMessageType,
   UserMessageTypeWithoutMentions,
 } from "@app/types/assistant/conversation";
 import {
   isAgentMessageType,
+  isCompactionMessageType,
   isProjectConversation,
   isUserMessageType,
 } from "@app/types/assistant/conversation";
@@ -55,7 +56,7 @@ import { getConversation } from "./fetch";
 export async function getMentionStatus(
   auth: Authenticator,
   data: {
-    conversation: ConversationType;
+    conversation: ConversationWithoutContentType;
     message: UserMessageTypeWithoutMentions | AgentMessageTypeWithoutMentions;
     isParticipant: boolean;
     mentionedUser: UserResource;
@@ -123,7 +124,7 @@ export const createUserMentions = async (
   }: {
     mentions: MentionType[];
     message: AgentMessageTypeWithoutMentions | UserMessageTypeWithoutMentions;
-    conversation: ConversationType;
+    conversation: ConversationWithoutContentType;
     transaction?: Transaction;
   }
 ): Promise<RichMentionWithStatus[]> => {
@@ -323,7 +324,10 @@ export async function validateUserMention(
         },
       });
     }
-  } else if (isContentFragmentType(message)) {
+  } else if (
+    isContentFragmentType(message) ||
+    isCompactionMessageType(message)
+  ) {
     return new Err({
       status_code: 400,
       api_error: {
@@ -365,6 +369,7 @@ export async function validateUserMention(
     if (
       latestMessage.visibility !== "deleted" &&
       !isContentFragmentType(latestMessage) &&
+      !isCompactionMessageType(latestMessage) &&
       latestMessage.richMentions.some(
         (m) => isPendingStatus(m.status) && m.id === userId
       )
@@ -517,7 +522,10 @@ export async function dismissMention(
         },
       });
     }
-  } else if (isContentFragmentType(message)) {
+  } else if (
+    isContentFragmentType(message) ||
+    isCompactionMessageType(message)
+  ) {
     return new Err({
       status_code: 400,
       api_error: {
@@ -568,6 +576,7 @@ export async function dismissMention(
     if (
       latestMessage.visibility !== "deleted" &&
       !isContentFragmentType(latestMessage) &&
+      !isCompactionMessageType(latestMessage) &&
       latestMessage.richMentions.some(predicate)
     ) {
       const mentionModel = await MentionModel.findOne({

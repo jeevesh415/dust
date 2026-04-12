@@ -1,4 +1,4 @@
-import type { MessageTemporaryState } from "@app/components/assistant/conversation/types";
+import type { AgentMessageWithStreaming } from "@app/components/assistant/conversation/types";
 import type { UserMessageType } from "@app/types/assistant/conversation";
 import type { RichMention } from "@app/types/assistant/mentions";
 import { toMentionType } from "@app/types/assistant/mentions";
@@ -87,6 +87,7 @@ export function createPlaceholderUserMessage({
             sourceProvider: null,
             sourceIcon: null,
             isInProjectContext: false,
+            hidden: false,
           }) satisfies FileContentFragmentType
       ),
       ...(contentFragments?.contentNodes ?? []).map(
@@ -145,7 +146,7 @@ export function createPlaceholderAgentMessage({
   mention: RichMention & { pictureUrl: string };
   rank: number;
   branchId: string | null;
-}): MessageTemporaryState {
+}): AgentMessageWithStreaming {
   const createdAt = new Date().getTime();
   return {
     sId: `placeholder-agent-message-${createdAt.toString()}`,
@@ -171,6 +172,7 @@ export function createPlaceholderAgentMessage({
     },
     citations: {},
     generatedFiles: [],
+    activitySteps: [],
     actions: [],
     richMentions: [],
     completionDurationMs: null,
@@ -178,9 +180,11 @@ export function createPlaceholderAgentMessage({
 
     streaming: {
       agentState: "placeholder",
+      inlineActivitySteps: [],
       isRetrying: false,
       lastUpdated: new Date(),
       actionProgress: new Map(),
+      pendingToolCalls: [],
       useFullChainOfThought: false,
     },
   };

@@ -4,6 +4,7 @@ import { AgentSuggestionModel } from "@app/lib/models/agent/agent_suggestion";
 import {
   AgentMessageFeedbackModel,
   AgentMessageModel,
+  CompactionMessageModel,
   MentionModel,
   MessageModel,
   MessageReactionModel,
@@ -14,21 +15,24 @@ import {
   AgentMessageSkillModel,
   ConversationSkillModel,
 } from "@app/lib/models/skill/conversation_skill";
+import { SkillSuggestionModel } from "@app/lib/models/skill/skill_suggestion";
 import { AgentMCPActionResource } from "@app/lib/resources/agent_mcp_action_resource";
 import { AgentStepContentResource } from "@app/lib/resources/agent_step_content_resource";
 import { ContentFragmentResource } from "@app/lib/resources/content_fragment_resource";
-import { ConversationResource } from "@app/lib/resources/conversation_resource";
+import { ConversationForkResource } from "@app/lib/resources/conversation_fork_resource";
+import type { ConversationResource } from "@app/lib/resources/conversation_resource";
 import { DataSourceResource } from "@app/lib/resources/data_source_resource";
 import { SandboxResource } from "@app/lib/resources/sandbox_resource";
-import { ConversationButlerSuggestionModel } from "@app/lib/resources/storage/models/conversation_butler_suggestion";
+import {
+  ProjectTodoConversationModel,
+  ProjectTodoSourceModel,
+} from "@app/lib/resources/storage/models/project_todo";
+
 import { UserProjectDigestModel } from "@app/lib/resources/storage/models/user_project_digest";
-import type {
-  ConversationError,
-  ConversationWithoutContentType,
-} from "@app/types/assistant/conversation";
+import type { ConversationWithoutContentType } from "@app/types/assistant/conversation";
 import type { ModelId } from "@app/types/shared/model_id";
 import type { Result } from "@app/types/shared/result";
-import { Err, Ok } from "@app/types/shared/result";
+import { Ok } from "@app/types/shared/result";
 import { removeNulls } from "@app/types/shared/utils/general";
 import chunk from "lodash/chunk";
 import type { WhereOptions } from "sequelize";
@@ -63,24 +67,14 @@ async function destroyMessageRelatedResources(
 ) {
   const owner = auth.getNonNullableWorkspace();
 
+  await ConversationForkResource.deleteBySourceMessageModelIds(auth, {
+    sourceMessageModelIds: messageIds,
+  });
+
   await ConversationBranchModel.destroy({
     where: {
       workspaceId: owner.id,
       previousMessageId: messageIds,
-    },
-  });
-
-  await ConversationButlerSuggestionModel.destroy({
-    where: {
-      workspaceId: owner.id,
-      sourceMessageId: messageIds,
-    },
-  });
-
-  await ConversationButlerSuggestionModel.destroy({
-    where: {
-      workspaceId: owner.id,
-      resultMessageId: messageIds,
     },
   });
 
@@ -177,29 +171,16 @@ async function destroyConversationDataSource(
 export async function destroyConversation(
   auth: Authenticator,
   {
-    conversationId,
+    conversation,
   }: {
-    conversationId: string;
+    conversation: ConversationResource;
   }
-): Promise<Result<void, ConversationError>> {
+): Promise<Result<void, Error>> {
   const owner = auth.getNonNullableWorkspace();
 
-  const conversationRes =
-    await ConversationResource.fetchConversationWithoutContent(
-      auth,
-      conversationId,
-      // We skip access checks as some conversations associated with deleted spaces may have become
-      // inaccessible, yet we want to be able to delete them here.
-      {
-        includeDeleted: true,
-        dangerouslySkipPermissionFiltering: true,
-      }
-    );
-  if (conversationRes.isErr()) {
-    return new Err(conversationRes.error);
-  }
-
-  const conversation = conversationRes.value;
+  await ConversationForkResource.deleteForConversationModelId(auth, {
+    conversationModelId: conversation.id,
+  });
 
   // Clean up all branches attached to this conversation before deleting messages.
   await ConversationBranchModel.destroy({
@@ -216,6 +197,7 @@ export async function destroyConversation(
       "userMessageId",
       "agentMessageId",
       "contentFragmentId",
+      "compactionMessageId",
     ],
     where: {
       conversationId: conversation.id,
@@ -227,10 +209,17 @@ export async function destroyConversation(
   const messagesChunks = chunk(messages, DESTROY_MESSAGE_BATCH);
   for (const messagesChunk of messagesChunks) {
     const messageIds = messagesChunk.map((m) => m.id);
-    const userMessageIds = removeNulls(messages.map((m) => m.userMessageId));
-    const agentMessageIds = removeNulls(messages.map((m) => m.agentMessageId));
+    const userMessageIds = removeNulls(
+      messagesChunk.map((m) => m.userMessageId)
+    );
+    const agentMessageIds = removeNulls(
+      messagesChunk.map((m) => m.agentMessageId)
+    );
+    const compactionMessageIds = removeNulls(
+      messagesChunk.map((m) => m.compactionMessageId)
+    );
     const messageAndContentFragmentIds = removeNulls(
-      messages.map((m) => {
+      messagesChunk.map((m) => {
         if (m.contentFragmentId) {
           return { contentFragmentId: m.contentFragmentId, messageId: m.sId };
         }
@@ -276,22 +265,24 @@ export async function destroyConversation(
       conversationId: conversation.sId,
     });
 
+    await CompactionMessageModel.destroy({
+      where: {
+        id: compactionMessageIds,
+        workspaceId: owner.id,
+      },
+    });
+
     await destroyMessageRelatedResources(auth, messageIds);
   }
 
-  await destroyConversationDataSource(auth, { conversation });
+  await destroyConversationDataSource(auth, {
+    conversation: conversation.toJSON(),
+  });
 
   await UserProjectDigestModel.destroy({
     where: {
       workspaceId: owner.id,
       sourceConversationId: conversation.id,
-    },
-  });
-
-  await ConversationButlerSuggestionModel.destroy({
-    where: {
-      workspaceId: owner.id,
-      conversationId: conversation.id,
     },
   });
 
@@ -302,11 +293,25 @@ export async function destroyConversation(
     },
   });
 
+  await SkillSuggestionModel.destroy({
+    where: {
+      workspaceId: owner.id,
+      sourceConversationId: conversation.id,
+    },
+  });
+
   await ConversationSkillModel.destroy({
     where: {
       workspaceId: owner.id,
       conversationId: conversation.id,
     },
+  });
+
+  await ProjectTodoConversationModel.destroy({
+    where: { workspaceId: owner.id, conversationId: conversation.id },
+  });
+  await ProjectTodoSourceModel.destroy({
+    where: { workspaceId: owner.id, sourceId: conversation.sId },
   });
 
   await SandboxResource.deleteByConversationId(auth, conversation.sId);
@@ -323,16 +328,9 @@ export async function destroyConversation(
   //     conversationId: conversation.sId,
   //   })
   // );
-
-  const c = await ConversationResource.fetchById(auth, conversation.sId, {
-    includeDeleted: true,
-    dangerouslySkipPermissionFiltering: true,
-  });
-  if (c) {
-    const r = await c.delete(auth);
-    if (r.isErr()) {
-      throw r.error;
-    }
+  const result = await conversation.delete(auth);
+  if (result.isErr()) {
+    return result;
   }
 
   return new Ok(undefined);

@@ -43,6 +43,7 @@ export type BaseConversationAttachmentType = {
   isQueryable: boolean;
   isInProjectContext: boolean;
   creator: AttachmentCreator | null;
+  hidden: boolean; // Do not show this attachment to the user.
 };
 
 export type FileAttachmentType = BaseConversationAttachmentType & {
@@ -58,6 +59,7 @@ export type ContentNodeAttachmentType = BaseConversationAttachmentType & {
   nodeDataSourceViewId: string;
   nodeType: ContentNodeType;
   sourceUrl: string | null;
+  lastUpdatedAt?: number | null; //Last sync / update timestamp for the underlying data source node (Core node timestamp).
 };
 
 export type LargePasteType = {
@@ -68,6 +70,9 @@ export type LargePasteType = {
 export type ConversationAttachmentType =
   | FileAttachmentType
   | ContentNodeAttachmentType;
+
+/** Same item shape as GET `/assistant/conversations/[cId]/attachments` and GET project context. */
+export type ContextAttachmentItem = ConversationAttachmentType;
 
 export function isFileAttachmentType(
   attachment: ConversationAttachmentType
@@ -155,6 +160,7 @@ export function getAttachmentFromContentNodeContentFragment(
     isQueryable,
     isSearchable,
     isInProjectContext: false, // For now, content nodes can only be from the conversation, not the project. To be revisited if/when we allow connected data in the projects.
+    hidden: false, // For now, content nodes are not hidden from the user.
     creator,
   };
 
@@ -215,6 +221,7 @@ export function getAttachmentFromFileContentFragment(
     isQueryable,
     isSearchable,
     isInProjectContext: cf.isInProjectContext,
+    hidden: cf.hidden,
     creator,
   };
 
@@ -226,7 +233,7 @@ export function getAttachmentFromFileContentFragment(
   };
 }
 
-export function getAttachmentFromFile({
+export function makeFileAttachment({
   fileId,
   source,
   createdAt,
@@ -235,6 +242,7 @@ export function getAttachmentFromFile({
   title,
   snippet,
   isInProjectContext,
+  hideFromUser,
   creator = null,
 }: {
   fileId: string;
@@ -245,6 +253,7 @@ export function getAttachmentFromFile({
   title: string;
   snippet: string | null;
   isInProjectContext: boolean;
+  hideFromUser: boolean;
   creator?: AttachmentCreator | null;
 }): FileAttachmentType {
   const canDoJIT = snippet !== null;
@@ -267,6 +276,7 @@ export function getAttachmentFromFile({
     isQueryable,
     isSearchable,
     isInProjectContext,
+    hidden: hideFromUser,
     creator,
   };
 }
@@ -284,23 +294,30 @@ export function renderLargePasteXml({
 export function renderAttachmentXml({
   attachment,
   content = null,
+  hideFlagsAndVersion = false,
 }: {
   attachment: ConversationAttachmentType;
   content?: string | null;
+  hideFlagsAndVersion?: boolean;
 }): string {
   const params = [
     `id="${conversationAttachmentId(attachment)}"`,
     `type="${attachment.contentType}"`,
     `title="${attachment.title}"`,
-    `version="${attachment.contentFragmentVersion}"`,
-    `isInProjectContext="${attachment.isInProjectContext}"`,
-    `isIncludable="${attachment.isIncludable}"`,
-    `isQueryable="${attachment.isQueryable}"`,
-    `isSearchable="${attachment.isSearchable}"`,
+    ...(hideFlagsAndVersion
+      ? []
+      : [
+          `version="${attachment.contentFragmentVersion}"`,
+          `isInProjectContext="${attachment.isInProjectContext}"`,
+          `isIncludable="${attachment.isIncludable}"`,
+          `isQueryable="${attachment.isQueryable}"`,
+          `isSearchable="${attachment.isSearchable}"`,
+        ]),
   ];
 
   if (isContentNodeAttachmentType(attachment) && attachment.sourceUrl) {
     params.push(`sourceUrl="${attachment.sourceUrl}"`);
+    params.push(`nodeId="${attachment.nodeId}"`);
   }
 
   let tag = `<attachment ${params.join(" ")}`;

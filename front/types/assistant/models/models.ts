@@ -1,5 +1,6 @@
 import type { ModelIdType } from "@app/types/assistant/models/types";
 import { ioTsEnum } from "@app/types/shared/utils/iots_utils";
+import { z } from "zod";
 
 import {
   CLAUDE_3_5_HAIKU_20241022_MODEL_ID,
@@ -61,6 +62,9 @@ import {
   GEMINI_2_5_FLASH_MODEL_ID,
   GEMINI_2_5_PRO_MODEL_CONFIG,
   GEMINI_2_5_PRO_MODEL_ID,
+  GEMINI_3_1_FLASH_IMAGE_MODEL_ID,
+  GEMINI_3_1_FLASH_LITE_MODEL_CONFIG,
+  GEMINI_3_1_FLASH_LITE_MODEL_ID,
   GEMINI_3_1_PRO_MODEL_CONFIG,
   GEMINI_3_1_PRO_MODEL_ID,
   GEMINI_3_FLASH_MODEL_CONFIG,
@@ -107,6 +111,7 @@ import {
   GPT_5_MODEL_ID,
   GPT_5_NANO_MODEL_CONFIG,
   GPT_5_NANO_MODEL_ID,
+  GPT_IMAGE_1_5_MODEL_ID,
   O1_MINI_MODEL_CONFIG,
   O1_MINI_MODEL_ID,
   O1_MODEL_CONFIG,
@@ -190,6 +195,7 @@ export const STATIC_MODEL_IDS = [
   GEMINI_2_5_FLASH_LITE_MODEL_ID,
   GEMINI_2_5_PRO_MODEL_ID,
   GEMINI_3_PRO_MODEL_ID,
+  GEMINI_3_1_FLASH_LITE_MODEL_ID,
   GEMINI_3_1_PRO_MODEL_ID,
   GEMINI_3_FLASH_MODEL_ID,
   TOGETHERAI_LLAMA_3_3_70B_INSTRUCT_TURBO_MODEL_ID,
@@ -227,8 +233,19 @@ export const isModelId = (modelId: string): modelId is ModelIdType =>
 
 export const ModelIdCodec = ioTsEnum<(typeof MODEL_IDS)[number]>(MODEL_IDS);
 
+// Note: MODEL_IDS includes dynamic custom models from GCS, so we use z.custom
+// with the isModelId guard rather than z.enum (which requires a static tuple).
+export const ModelIdSchema = z.custom<ModelIdType>(
+  (val) => typeof val === "string" && isModelId(val),
+  { message: "Invalid model ID" }
+);
+
 // Image generation model IDs (internal-only, not user-selectable)
-export const IMAGE_MODEL_IDS = [GEMINI_3_PRO_IMAGE_MODEL_ID] as const;
+export const IMAGE_MODEL_IDS = [
+  GEMINI_3_PRO_IMAGE_MODEL_ID,
+  GEMINI_3_1_FLASH_IMAGE_MODEL_ID,
+  GPT_IMAGE_1_5_MODEL_ID,
+] as const;
 
 export type ImageModelIdType = (typeof IMAGE_MODEL_IDS)[number];
 export const SUPPORTED_MODEL_CONFIGS: ModelConfigurationType[] = [
@@ -271,6 +288,7 @@ export const SUPPORTED_MODEL_CONFIGS: ModelConfigurationType[] = [
   GEMINI_2_5_FLASH_LITE_MODEL_CONFIG,
   GEMINI_2_5_PRO_MODEL_CONFIG,
   GEMINI_3_PRO_MODEL_CONFIG,
+  GEMINI_3_1_FLASH_LITE_MODEL_CONFIG,
   GEMINI_3_1_PRO_MODEL_CONFIG,
   GEMINI_3_FLASH_MODEL_CONFIG,
   TOGETHERAI_LLAMA_3_3_70B_INSTRUCT_TURBO_MODEL_CONFIG,

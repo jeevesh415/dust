@@ -5,6 +5,7 @@ import { getPriceAsString } from "@app/lib/client/subscription";
 import { useSubmitFunction } from "@app/lib/client/utils";
 import { clientFetch } from "@app/lib/egress/client";
 import {
+  isEntreprisePlanPrefix,
   isProPlan,
   isUpgraded,
   isWhitelistedBusinessPlan,
@@ -450,17 +451,24 @@ export function SubscriptionPage() {
               title={`Your subscription ends on ${endDate}.`}
               variant="warning"
             >
-              <>
-                Connections will be deleted and members will be revoked. Details{" "}
-                <LinkWrapper
-                  href="https://docs.dust.tt/docs/subscriptions#what-happens-when-we-cancel-our-dust-subscription"
-                  target="_blank"
-                  className="underline"
-                >
-                  here
-                </LinkWrapper>
-                .
-              </>
+              {isEntreprisePlanPrefix(plan.code) ? (
+                <>
+                  Please reach out to your account manager to ensure continuity.
+                </>
+              ) : (
+                <>
+                  Connections will be deleted and members will be revoked.
+                  Details{" "}
+                  <LinkWrapper
+                    href="https://docs.dust.tt/docs/subscriptions#what-happens-when-we-cancel-our-dust-subscription"
+                    target="_blank"
+                    className="underline"
+                  >
+                    here
+                  </LinkWrapper>
+                  .
+                </>
+              )}
             </ContentMessage>
           )}
 
@@ -600,24 +608,27 @@ export function SubscriptionPage() {
                   <Page.H variant="h5">Choose a plan</Page.H>
                   <Page.P>Pick a plan that best suits your team.</Page.P>
                 </div>
-                <ButtonsSwitchList
-                  defaultValue={billingPeriod}
-                  size="xs"
-                  onValueChange={(v) => {
-                    if (v === "monthly" || v === "yearly") {
-                      setBillingPeriod(v);
-                    }
-                  }}
-                >
-                  <ButtonsSwitch value="monthly" label="Monthly billing" />
-                  <ButtonsSwitch value="yearly" label="Yearly billing" />
-                </ButtonsSwitchList>
+                {!isWorkspaceWhitelistedBusinessPlan && (
+                  <ButtonsSwitchList
+                    defaultValue={billingPeriod}
+                    size="xs"
+                    onValueChange={(v) => {
+                      if (v === "monthly" || v === "yearly") {
+                        setBillingPeriod(v);
+                      }
+                    }}
+                  >
+                    <ButtonsSwitch value="monthly" label="Monthly billing" />
+                    <ButtonsSwitch value="yearly" label="Yearly billing" />
+                  </ButtonsSwitchList>
+                )}
               </div>
               <div className="pt-4">
                 <SubscriptionPlanCards
                   billingPeriod={billingPeriod}
                   onSubscribe={handleSubscribePlan}
                   isProcessing={isProcessing}
+                  owner={owner}
                 />
               </div>
             </div>

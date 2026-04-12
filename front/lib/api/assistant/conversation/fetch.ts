@@ -1,9 +1,9 @@
-import { getMaximalVersionAgentStepContent } from "@app/lib/api/assistant/configuration/steps";
+import { groupMessagesIntoInteractions } from "@app/lib/api/assistant/conversation/interactions";
 import { batchRenderMessages } from "@app/lib/api/assistant/messages";
 import type { Authenticator } from "@app/lib/auth";
-import { AgentStepContentModel } from "@app/lib/models/agent/agent_step_content";
 import {
   AgentMessageModel,
+  CompactionMessageModel,
   MessageModel,
   UserMessageModel,
 } from "@app/lib/models/agent/conversation";
@@ -12,6 +12,7 @@ import { ConversationResource } from "@app/lib/resources/conversation_resource";
 import { ContentFragmentModel } from "@app/lib/resources/storage/models/content_fragment";
 import type {
   AgentMessageType,
+  CompactionMessageType,
   ConversationType,
   LightAgentMessageType,
   LightConversationType,
@@ -23,11 +24,13 @@ import type {
 import {
   ConversationError,
   isAgentMessageType,
+  isCompactionMessageType,
   isUserMessageType,
   isUserMessageTypeWithContentFragments,
 } from "@app/types/assistant/conversation";
 import type { ContentFragmentType } from "@app/types/content_fragment";
 import { isContentFragmentType } from "@app/types/content_fragment";
+import type { ModelId } from "@app/types/shared/model_id";
 import type { Result } from "@app/types/shared/result";
 import { Err, Ok } from "@app/types/shared/result";
 import { isArrayOf } from "@app/types/shared/typescipt_utils";
@@ -45,8 +48,19 @@ export const getConversation = async (
   auth: Authenticator,
   conversationId: string,
   includeDeleted: boolean = false,
-  branchId: string | null = null
-) => _getConversation(auth, conversationId, includeDeleted, branchId, "full");
+  branchId: string | null = null,
+  lastInteractionsToFetchToolOutputContentFor: number | null = null,
+  messagePagination?: { limit: number; lastRank: number | null }
+) =>
+  _getConversation(
+    auth,
+    conversationId,
+    includeDeleted,
+    branchId,
+    "full",
+    lastInteractionsToFetchToolOutputContentFor,
+    messagePagination
+  );
 
 export const getLightConversation = async (
   auth: Authenticator,
@@ -60,14 +74,16 @@ async function _getConversation<V extends "light" | "full">(
   conversationId: string,
   includeDeleted: boolean = false,
   branchId: string | null = null,
-  viewType: V = "full" as V
+  viewType: V = "full" as V,
+  lastInteractionsToFetchToolOutputContentFor: number | null = null,
+  messagePagination?: { limit: number; lastRank: number | null }
 ): Promise<
   Result<
-    V extends "light"
+    (V extends "light"
       ? LightConversationType
       : V extends "full"
         ? ConversationType
-        : never,
+        : never) & { hasMore?: boolean; lastValue?: number | null },
     ConversationError
   >
 > {
@@ -127,48 +143,89 @@ async function _getConversation<V extends "light" | "full">(
     };
   }
 
-  const messages = await MessageModel.findAll({
-    where,
-    order: [
-      ["rank", "ASC"],
-      ["version", "ASC"],
-    ],
-    include: [
-      {
-        model: UserMessageModel,
-        as: "userMessage",
-        required: false,
-      },
-      {
-        model: AgentMessageModel,
-        as: "agentMessage",
-        required: false,
-        include: [
-          {
-            model: AgentStepContentModel,
-            as: "agentStepContents",
-            required: false,
-          },
-        ],
-      },
-      // We skip ContentFragmentResource here for efficiency reasons (retrieving contentFragments
-      // along with messages in one query). Only once we move to a MessageResource will we be able
-      // to properly abstract this.
-      {
-        model: ContentFragmentModel,
-        as: "contentFragment",
-        required: false,
-      },
-    ],
-  });
+  let messages: MessageModel[];
+  let paginationHasMore: boolean | undefined;
 
-  // Filter to only keep the step content with the maximum version for each step and index combination.
-  for (const message of messages) {
-    if (message.agentMessage && message.agentMessage.agentStepContents) {
-      message.agentMessage.agentStepContents =
-        getMaximalVersionAgentStepContent(
-          message.agentMessage.agentStepContents
-        );
+  if (messagePagination) {
+    const { hasMore, messages: paginatedMessages } =
+      await conversation.fetchMessagesForPage(auth, {
+        limit: messagePagination.limit,
+        lastRank: messagePagination.lastRank,
+      });
+    messages = paginatedMessages;
+    paginationHasMore = hasMore;
+  } else {
+    messages = await MessageModel.findAll({
+      where,
+      order: [
+        ["rank", "ASC"],
+        ["version", "ASC"],
+      ],
+      include: [
+        {
+          model: UserMessageModel,
+          as: "userMessage",
+          required: false,
+        },
+        {
+          model: AgentMessageModel,
+          as: "agentMessage",
+          required: false,
+        },
+        // We skip ContentFragmentResource here for efficiency reasons (retrieving contentFragments
+        // along with messages in one query). Only once we move to a MessageResource will we be able
+        // to properly abstract this.
+        {
+          model: ContentFragmentModel,
+          as: "contentFragment",
+          required: false,
+        },
+        {
+          model: CompactionMessageModel,
+          as: "compactionMessage",
+          required: false,
+        },
+      ],
+    });
+  }
+
+  let messagesWithToolOutputContent: Set<ModelId> | null = null;
+
+  // In the case of the agentic loop, to save memory and latency, we only want to fetch content for the last N interactions.
+  if (lastInteractionsToFetchToolOutputContentFor !== null) {
+    if (lastInteractionsToFetchToolOutputContentFor <= 0) {
+      messagesWithToolOutputContent = new Set();
+    } else {
+      const interactions = groupMessagesIntoInteractions(
+        removeNulls(
+          messages.map((m) => {
+            if (m.userMessageId) {
+              return {
+                id: m.userMessageId,
+                role: "user",
+              };
+            } else if (m.agentMessageId) {
+              return {
+                id: m.agentMessageId,
+                role: "agent",
+              };
+            }
+            // We don't care about the other messages.
+          })
+        )
+      );
+
+      // Keep the last N interactions with the highest ranks (order is correct because of the sort above).
+      const interactionsToKeep = interactions.slice(
+        -lastInteractionsToFetchToolOutputContentFor
+      );
+
+      // We only need to fetch content for the actions of the last N interactions.
+      messagesWithToolOutputContent = new Set(
+        interactionsToKeep.flatMap((i) =>
+          i.messages.filter((m) => m.role === "agent").map((m) => m.id)
+        )
+      );
     }
   }
 
@@ -176,7 +233,8 @@ async function _getConversation<V extends "light" | "full">(
     auth,
     conversation,
     messages,
-    viewType
+    viewType,
+    messagesWithToolOutputContent
   );
 
   if (renderRes.isErr()) {
@@ -212,6 +270,7 @@ async function _getConversation<V extends "light" | "full">(
     const typeCheckedContent: (
       | LightAgentMessageType
       | UserMessageTypeWithContentFragments
+      | CompactionMessageType
     )[] = removeNulls(
       (content as LightMessageType[][]).map((c) => {
         if (c.length === 0) {
@@ -232,6 +291,13 @@ async function _getConversation<V extends "light" | "full">(
           )
         ) {
           return c[c.length - 1];
+        } else if (
+          isArrayOf<LightMessageType, CompactionMessageType>(
+            c,
+            isCompactionMessageType
+          )
+        ) {
+          return c[c.length - 1];
         } else {
           throw new Error(
             "Unexpected content type as everything should be array of same type. This should never happen."
@@ -240,7 +306,10 @@ async function _getConversation<V extends "light" | "full">(
       })
     );
 
-    const conversationType: LightConversationType = {
+    const conversationType: LightConversationType & {
+      hasMore?: boolean;
+      lastValue?: number | null;
+    } = {
       id: conversation.id,
       created: conversation.createdAt.getTime(),
       updated: conversation.updatedAt.getTime(),
@@ -261,12 +330,18 @@ async function _getConversation<V extends "light" | "full">(
       branchId,
     };
 
+    if (paginationHasMore !== undefined) {
+      conversationType.hasMore = paginationHasMore;
+      conversationType.lastValue =
+        messagesWithRank.length > 0 ? messagesWithRank[0].rank : null;
+    }
+
     return new Ok(conversationType) as Result<
-      V extends "light"
+      (V extends "light"
         ? LightConversationType
         : V extends "full"
           ? ConversationType
-          : never,
+          : never) & { hasMore?: boolean; lastValue?: number | null },
       ConversationError
     >;
   } else {
@@ -275,6 +350,7 @@ async function _getConversation<V extends "light" | "full">(
       | AgentMessageType[]
       | UserMessageType[]
       | ContentFragmentType[]
+      | CompactionMessageType[]
     )[] = removeNulls(
       (content as MessageType[][]).map((c) => {
         if (c.length === 0) {
@@ -291,6 +367,13 @@ async function _getConversation<V extends "light" | "full">(
           isArrayOf<MessageType, ContentFragmentType>(c, isContentFragmentType)
         ) {
           return c.map((m) => m);
+        } else if (
+          isArrayOf<MessageType, CompactionMessageType>(
+            c,
+            isCompactionMessageType
+          )
+        ) {
+          return c.map((m) => m);
         } else {
           throw new Error(
             "Unexpected content type as everything should be array of same type. This should never happen."
@@ -299,7 +382,10 @@ async function _getConversation<V extends "light" | "full">(
       })
     );
 
-    const conversationType: ConversationType = {
+    const conversationType: ConversationType & {
+      hasMore?: boolean;
+      lastValue?: number | null;
+    } = {
       id: conversation.id,
       created: conversation.createdAt.getTime(),
       updated: conversation.updatedAt.getTime(),
@@ -321,12 +407,18 @@ async function _getConversation<V extends "light" | "full">(
       branchId,
     };
 
+    if (paginationHasMore !== undefined) {
+      conversationType.hasMore = paginationHasMore;
+      conversationType.lastValue =
+        messagesWithRank.length > 0 ? messagesWithRank[0].rank : null;
+    }
+
     return new Ok(conversationType) as Result<
-      V extends "light"
+      (V extends "light"
         ? LightConversationType
         : V extends "full"
           ? ConversationType
-          : never,
+          : never) & { hasMore?: boolean; lastValue?: number | null },
       ConversationError
     >;
   }

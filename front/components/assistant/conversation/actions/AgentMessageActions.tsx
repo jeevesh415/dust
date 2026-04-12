@@ -1,9 +1,11 @@
 import { MCPActionDetails } from "@app/components/actions/mcp/details/MCPActionDetails";
 import { MCPImageGenerationGroupedDetails } from "@app/components/actions/mcp/details/MCPImageGenerationActionDetails";
+import { PendingToolCallDetails } from "@app/components/assistant/conversation/actions/PendingToolCallDetails";
 import { useConversationSidePanelContext } from "@app/components/assistant/conversation/ConversationSidePanelContext";
 import type {
   ActionProgressState,
   AgentStateClassification,
+  PendingToolCall,
 } from "@app/components/assistant/conversation/types";
 import { GENERATE_IMAGE_TOOL_NAME } from "@app/lib/actions/mcp_internal_actions/constants";
 import type {
@@ -26,6 +28,7 @@ interface AgentMessageActionsProps {
   agentMessage: LightAgentMessageType | LightAgentMessageWithActionsType;
   lastAgentStateClassification: AgentStateClassification;
   actionProgress: ActionProgressState;
+  pendingToolCalls: PendingToolCall[];
   owner: LightWorkspaceType;
 }
 
@@ -33,6 +36,7 @@ export function AgentMessageActions({
   agentMessage,
   lastAgentStateClassification,
   actionProgress,
+  pendingToolCalls,
   owner,
 }: AgentMessageActionsProps) {
   const { openPanel, currentPanel, data } = useConversationSidePanelContext();
@@ -84,6 +88,11 @@ export function AgentMessageActions({
 
   const showMessageBreakdownButton =
     lastAgentStateClassification === "done" || agentMessage.status === "failed";
+  const showPendingToolCalls =
+    lastAgentStateClassification !== "acting" && pendingToolCalls.length > 0;
+  const latestPendingToolCall = showPendingToolCalls
+    ? pendingToolCalls[pendingToolCalls.length - 1]
+    : null;
 
   return !showMessageBreakdownButton ? (
     <div
@@ -110,6 +119,14 @@ export function AgentMessageActions({
               messageStatus={agentMessage.status}
             />
           )}
+        </Card>
+      ) : latestPendingToolCall ? (
+        <Card variant="secondary" className="max-w-xl">
+          <PendingToolCallDetails
+            displayContext="conversation"
+            functionCallName={latestPendingToolCall.toolName}
+            labelContext="running"
+          />
         </Card>
       ) : (
         <div>

@@ -1,5 +1,6 @@
 import { archiveAgentConfiguration } from "@app/lib/api/assistant/configuration/agent";
 import {
+  compactConversation,
   editUserMessage,
   isConversationEventAllowedForAuth,
   postNewContentFragment,
@@ -10,15 +11,19 @@ import {
 import { getContentFragmentBlob } from "@app/lib/api/assistant/conversation/content_fragment";
 import { getConversation } from "@app/lib/api/assistant/conversation/fetch";
 import { publishAgentMessagesEvents } from "@app/lib/api/assistant/streaming/events";
+import * as attachmentsModule from "@app/lib/api/files/attachments";
+import { fetchLatestProjectContextFileContentFragment } from "@app/lib/api/projects";
 import { Authenticator } from "@app/lib/auth";
+import { serializeMention } from "@app/lib/mentions/format";
+import { GlobalAgentSettingsModel } from "@app/lib/models/agent/agent";
 import {
+  AgentMessageModel,
+  CompactionMessageModel,
   ConversationModel,
   MentionModel,
   MessageModel,
   UserMessageModel,
 } from "@app/lib/models/agent/conversation";
-import { ConversationBranchModel } from "@app/lib/models/agent/conversation_branch";
-
 import { launchAgentLoopWorkflow } from "@app/temporal/agent_loop/client";
 import { AgentConfigurationFactory } from "@app/tests/utils/AgentConfigurationFactory";
 import { ConversationFactory } from "@app/tests/utils/ConversationFactory";
@@ -26,11 +31,16 @@ import { DataSourceViewFactory } from "@app/tests/utils/DataSourceViewFactory";
 import { createResourceTest } from "@app/tests/utils/generic_resource_tests";
 import { KeyFactory } from "@app/tests/utils/KeyFactory";
 import { MembershipFactory } from "@app/tests/utils/MembershipFactory";
+import { ProjectFileFactory } from "@app/tests/utils/ProjectFileFactory";
 import { SpaceFactory } from "@app/tests/utils/SpaceFactory";
 import { UserFactory } from "@app/tests/utils/UserFactory";
-import type { ContentFragmentInputWithContentNode } from "@app/types/api/internal/assistant";
+import type {
+  ContentFragmentInputWithContentNode,
+  ContentFragmentInputWithFileIdType,
+} from "@app/types/api/internal/assistant";
 import { isContentFragmentInputWithContentNode } from "@app/types/api/internal/assistant";
 import type { LightAgentConfigurationType } from "@app/types/assistant/agent";
+import { GLOBAL_AGENTS_SID } from "@app/types/assistant/assistant";
 import type {
   AgentMessageType,
   ConversationType,
@@ -52,10 +62,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 // Mock the dependencies
 vi.mock("@app/temporal/agent_loop/client", () => ({
   launchAgentLoopWorkflow: vi.fn(),
+  launchCompactionWorkflow: vi.fn(),
 }));
 
 vi.mock("@app/lib/api/assistant/streaming/events", () => ({
   publishAgentMessagesEvents: vi.fn(),
+  publishConversationEvent: vi.fn(),
   publishMessageEventsOnMessagePostOrEdit: vi.fn(),
 }));
 
@@ -65,7 +77,8 @@ vi.mock("@app/lib/api/assistant/conversation/content_fragment", () => ({
 
 import { ConversationBranchResource } from "@app/lib/resources/conversation_branch_resource";
 import { ConversationResource } from "@app/lib/resources/conversation_resource";
-import { generateRandomModelSId, makeSId } from "@app/lib/resources/string_ids";
+import { makeSId } from "@app/lib/resources/string_ids";
+import { generateRandomModelSId } from "@app/lib/resources/string_ids_server";
 // Mock rateLimiter from the utils module
 import * as rateLimiterModule from "@app/lib/utils/rate_limiter";
 import { FeatureFlagFactory } from "@app/tests/utils/FeatureFlagFactory";
@@ -842,8 +855,8 @@ describe("retryAgentMessage", () => {
 describe("getConversation with branches", () => {
   let auth: Authenticator;
   let workspace: Awaited<ReturnType<typeof createResourceTest>>["workspace"];
-  let conversationSId: string;
-  let branchSId: string;
+  let conversationId: string;
+  let branchId: string;
 
   beforeEach(async () => {
     const setup = await createResourceTest({});
@@ -858,7 +871,7 @@ describe("getConversation with branches", () => {
       title: "Branching conversation",
       requestedSpaceIds: [],
     });
-    conversationSId = conversation.sId;
+    conversationId = conversation.sId;
 
     const beforeBranchUserMessage = await UserMessageModel.create({
       userId: user.id,
@@ -929,17 +942,13 @@ describe("getConversation with branches", () => {
       contentFragmentId: null,
     });
 
-    const branch = await ConversationBranchModel.create({
-      workspaceId: workspace.id,
+    const branch = await ConversationBranchResource.makeNew(auth, {
       state: "open",
       previousMessageId: atBranchMessage.id,
       conversationId: conversation.id,
       userId: user.id,
     });
-    branchSId = makeSId("conversation_branch", {
-      id: branch.id,
-      workspaceId: workspace.id,
-    });
+    branchId = branch.sId;
 
     const branchUserMessage = await UserMessageModel.create({
       userId: user.id,
@@ -967,7 +976,7 @@ describe("getConversation with branches", () => {
   });
 
   it("returns only main-thread messages when branchId is not provided", async () => {
-    const result = await getConversation(auth, conversationSId);
+    const result = await getConversation(auth, conversationId);
 
     expect(result.isOk()).toBe(true);
     if (result.isOk()) {
@@ -989,17 +998,12 @@ describe("getConversation with branches", () => {
   });
 
   it("returns messages up to the branch point plus branch messages when branchId is provided, and sets branchId on the conversation", async () => {
-    const result = await getConversation(
-      auth,
-      conversationSId,
-      false,
-      branchSId
-    );
+    const result = await getConversation(auth, conversationId, false, branchId);
 
     expect(result.isOk()).toBe(true);
     if (result.isOk()) {
       const conv = result.value;
-      expect(conv.branchId).toBe(branchSId);
+      expect(conv.branchId).toBe(branchId);
 
       const userMessages = conv.content.flat().filter(isUserMessageType);
       const contents = userMessages.map((m) => m.content);
@@ -1433,7 +1437,7 @@ describe("postUserMessage", () => {
         fullName: userJson.fullName,
         email: userJson.email,
         profilePictureUrl: userJson.image,
-        origin: "web",
+        origin: "api",
       },
       skipToolsValidation: false,
     });
@@ -1453,6 +1457,547 @@ describe("postUserMessage", () => {
       // Verify launchAgentLoopWorkflow was NOT called (no agent mentions)
       expect(launchAgentLoopWorkflow).not.toHaveBeenCalled();
     }
+  });
+
+  describe("compaction blocking", () => {
+    it("should reject posting when a compaction message is running", async () => {
+      const user = auth.getNonNullableUser();
+      const userJson = user.toJSON();
+
+      // Insert a compaction message with status "created" into the conversation.
+      const compactionMessageRow = await CompactionMessageModel.create({
+        status: "created",
+        content: null,
+        workspaceId: workspace.id,
+      });
+      await MessageModel.create({
+        sId: generateRandomModelSId(),
+        rank: 0,
+        conversationId: conversation.id,
+        compactionMessageId: compactionMessageRow.id,
+        workspaceId: workspace.id,
+      });
+
+      // Re-fetch the conversation so its content includes the compaction message.
+      const fetched = await getConversation(auth, conversation.sId);
+      expect(fetched.isOk()).toBe(true);
+      if (fetched.isErr()) {
+        return;
+      }
+
+      const result = await postUserMessage(auth, {
+        conversation: fetched.value,
+        content: "should be blocked",
+        mentions: [],
+        context: {
+          username: userJson.username,
+          timezone: "UTC",
+          fullName: userJson.fullName,
+          email: userJson.email,
+          profilePictureUrl: userJson.image,
+          origin: "web",
+        },
+        skipToolsValidation: false,
+      });
+
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) {
+        expect(result.error.status_code).toBe(409);
+        expect(result.error.api_error.message).toContain("compacted");
+      }
+    });
+
+    it("should allow posting when a compaction message has succeeded", async () => {
+      const user = auth.getNonNullableUser();
+      const userJson = user.toJSON();
+
+      const rateLimiterSpy = vi
+        .spyOn(rateLimiterModule, "rateLimiter")
+        .mockResolvedValue(100);
+
+      // Insert a completed compaction message into the conversation.
+      const compactionMessageRow = await CompactionMessageModel.create({
+        status: "succeeded",
+        content: "compacted summary",
+        workspaceId: workspace.id,
+      });
+      await MessageModel.create({
+        sId: generateRandomModelSId(),
+        rank: 0,
+        conversationId: conversation.id,
+        compactionMessageId: compactionMessageRow.id,
+        workspaceId: workspace.id,
+      });
+
+      // Re-fetch the conversation so its content includes the compaction message.
+      const fetched = await getConversation(auth, conversation.sId);
+      expect(fetched.isOk()).toBe(true);
+      if (fetched.isErr()) {
+        rateLimiterSpy.mockRestore();
+        return;
+      }
+
+      const result = await postUserMessage(auth, {
+        conversation: fetched.value,
+        content: "should be allowed",
+        mentions: [],
+        context: {
+          username: userJson.username,
+          timezone: "UTC",
+          fullName: userJson.fullName,
+          email: userJson.email,
+          profilePictureUrl: userJson.image,
+          origin: "web",
+        },
+        skipToolsValidation: false,
+      });
+
+      rateLimiterSpy.mockRestore();
+
+      expect(result.isOk()).toBe(true);
+    });
+  });
+
+  describe("auto-mention global @dust when posting without mentions", () => {
+    const expectedDustMentionPrefix = serializeMention({
+      id: GLOBAL_AGENTS_SID.DUST,
+      type: "agent",
+      label: "dust",
+    });
+
+    it("prepends serialized @dust and persists the mention for web origin", async () => {
+      const user = auth.getNonNullableUser();
+      const userJson = user.toJSON();
+
+      const result = await postUserMessage(auth, {
+        conversation,
+        content: "Hello without explicit mentions",
+        mentions: [],
+        context: {
+          username: userJson.username,
+          timezone: "UTC",
+          fullName: userJson.fullName,
+          email: userJson.email,
+          profilePictureUrl: userJson.image,
+          origin: "web",
+        },
+        skipToolsValidation: false,
+      });
+
+      expect(result.isOk()).toBe(true);
+      if (!result.isOk()) {
+        return;
+      }
+
+      const { userMessage } = result.value;
+      expect(userMessage.content).toBe(
+        `${expectedDustMentionPrefix} Hello without explicit mentions`
+      );
+
+      expect(userMessage.mentions?.length).toBe(1);
+      expect(userMessage.mentions?.[0]).toEqual({
+        configurationId: GLOBAL_AGENTS_SID.DUST,
+      });
+
+      const agentMentions = userMessage.richMentions.filter(isRichAgentMention);
+      expect(agentMentions.some((m) => m.id === GLOBAL_AGENTS_SID.DUST)).toBe(
+        true
+      );
+
+      const mentionsInDb = await MentionModel.findAll({
+        where: {
+          messageId: userMessage.id,
+          workspaceId: workspace.id,
+        },
+      });
+      expect(
+        mentionsInDb.some(
+          (m) => m.agentConfigurationId === GLOBAL_AGENTS_SID.DUST
+        )
+      ).toBe(true);
+
+      expect(launchAgentLoopWorkflow).toHaveBeenCalled();
+    });
+
+    it("auto-mentions @dust again when only the same user already posted", async () => {
+      const rateLimiterSpy = vi
+        .spyOn(rateLimiterModule, "rateLimiter")
+        .mockResolvedValue(100);
+
+      const user = auth.getNonNullableUser();
+      const userJson = user.toJSON();
+
+      const firstFromUser = await postUserMessage(auth, {
+        conversation,
+        content: "first from A",
+        mentions: [],
+        context: {
+          username: userJson.username,
+          timezone: "UTC",
+          fullName: userJson.fullName,
+          email: userJson.email,
+          profilePictureUrl: userJson.image,
+          origin: "web",
+        },
+        skipToolsValidation: false,
+      });
+
+      expect(firstFromUser.isOk()).toBe(true);
+      if (!firstFromUser.isOk()) {
+        rateLimiterSpy.mockRestore();
+        return;
+      }
+
+      expect(firstFromUser.value.userMessage.content).toBe(
+        `${expectedDustMentionPrefix} first from A`
+      );
+      expect(firstFromUser.value.userMessage.mentions?.length ?? 0).toBe(1);
+
+      const afterFirst = await getConversation(auth, conversation.sId);
+      expect(afterFirst.isOk()).toBe(true);
+      if (!afterFirst.isOk()) {
+        rateLimiterSpy.mockRestore();
+        return;
+      }
+
+      vi.clearAllMocks();
+
+      const secondFromUser = await postUserMessage(auth, {
+        conversation: afterFirst.value,
+        content: "second from A",
+        mentions: [],
+        context: {
+          username: userJson.username,
+          timezone: "UTC",
+          fullName: userJson.fullName,
+          email: userJson.email,
+          profilePictureUrl: userJson.image,
+          origin: "web",
+        },
+        skipToolsValidation: false,
+      });
+
+      rateLimiterSpy.mockRestore();
+
+      expect(secondFromUser.isOk()).toBe(true);
+      if (!secondFromUser.isOk()) {
+        return;
+      }
+
+      // With no other humans present, we should still prepend @dust.
+      expect(secondFromUser.value.userMessage.content).toBe(
+        `${expectedDustMentionPrefix} second from A`
+      );
+      expect(secondFromUser.value.userMessage.mentions?.length ?? 0).toBe(1);
+
+      const mentionsInDb = await MentionModel.findAll({
+        where: {
+          messageId: secondFromUser.value.userMessage.id,
+          workspaceId: workspace.id,
+        },
+      });
+      expect(
+        mentionsInDb.some(
+          (m) => m.agentConfigurationId === GLOBAL_AGENTS_SID.DUST
+        )
+      ).toBe(true);
+
+      expect(launchAgentLoopWorkflow).toHaveBeenCalled();
+    });
+
+    it("prepends serialized @dust for extension origin", async () => {
+      const user = auth.getNonNullableUser();
+      const userJson = user.toJSON();
+
+      const result = await postUserMessage(auth, {
+        conversation,
+        content: "From extension",
+        mentions: [],
+        context: {
+          username: userJson.username,
+          timezone: "UTC",
+          fullName: userJson.fullName,
+          email: userJson.email,
+          profilePictureUrl: userJson.image,
+          origin: "extension",
+        },
+        skipToolsValidation: false,
+      });
+
+      expect(result.isOk()).toBe(true);
+      if (!result.isOk()) {
+        return;
+      }
+
+      expect(result.value.userMessage.content).toBe(
+        `${expectedDustMentionPrefix} From extension`
+      );
+      expect(result.value.userMessage.mentions?.[0]).toEqual({
+        configurationId: GLOBAL_AGENTS_SID.DUST,
+      });
+    });
+
+    it("does not auto-mention @dust when global @dust agent is disabled for the workspace", async () => {
+      await GlobalAgentSettingsModel.create({
+        workspaceId: workspace.id,
+        agentId: GLOBAL_AGENTS_SID.DUST,
+        status: "disabled_by_admin",
+      });
+
+      const user = auth.getNonNullableUser();
+      const userJson = user.toJSON();
+
+      const result = await postUserMessage(auth, {
+        conversation,
+        content: "Hello without explicit mentions",
+        mentions: [],
+        context: {
+          username: userJson.username,
+          timezone: "UTC",
+          fullName: userJson.fullName,
+          email: userJson.email,
+          profilePictureUrl: userJson.image,
+          origin: "web",
+        },
+        skipToolsValidation: false,
+      });
+
+      expect(result.isOk()).toBe(true);
+      if (!result.isOk()) {
+        return;
+      }
+
+      expect(result.value.userMessage.content).toBe(
+        "Hello without explicit mentions"
+      );
+      expect(result.value.userMessage.mentions?.length ?? 0).toBe(0);
+      expect(launchAgentLoopWorkflow).not.toHaveBeenCalled();
+
+      const mentionsInDb = await MentionModel.findAll({
+        where: {
+          messageId: result.value.userMessage.id,
+          workspaceId: workspace.id,
+        },
+      });
+      expect(mentionsInDb).toHaveLength(0);
+
+      // Even if @dust is disabled, we should still be able to explicitly call
+      // other active agents.
+      const rateLimiterSpy = vi
+        .spyOn(rateLimiterModule, "rateLimiter")
+        .mockResolvedValue(100);
+
+      let resultWithOtherAgent:
+        | Awaited<ReturnType<typeof postUserMessage>>
+        | undefined;
+      try {
+        const afterFirstPostResult = await getConversation(
+          auth,
+          conversation.sId
+        );
+        expect(afterFirstPostResult.isOk()).toBe(true);
+
+        if (!afterFirstPostResult.isOk()) {
+          return;
+        }
+
+        resultWithOtherAgent = await postUserMessage(auth, {
+          conversation: afterFirstPostResult.value,
+          content: "Hello with explicit agent mention",
+          mentions: [
+            {
+              configurationId: agentConfig1.sId,
+            } satisfies AgentMention,
+          ],
+          context: {
+            username: userJson.username,
+            timezone: "UTC",
+            fullName: userJson.fullName,
+            email: userJson.email,
+            profilePictureUrl: userJson.image,
+            origin: "web",
+          },
+          skipToolsValidation: false,
+        });
+      } finally {
+        rateLimiterSpy.mockRestore();
+      }
+
+      expect(resultWithOtherAgent?.isOk()).toBe(true);
+      if (!resultWithOtherAgent || !resultWithOtherAgent.isOk()) {
+        return;
+      }
+
+      expect(resultWithOtherAgent.value.userMessage.content).toBe(
+        "Hello with explicit agent mention"
+      );
+      expect(resultWithOtherAgent.value.userMessage.mentions?.length ?? 0).toBe(
+        1
+      );
+      expect(resultWithOtherAgent.value.userMessage.mentions?.[0]).toEqual({
+        configurationId: agentConfig1.sId,
+      });
+
+      const agentMentions =
+        resultWithOtherAgent.value.userMessage.richMentions.filter(
+          isRichAgentMention
+        );
+      expect(agentMentions.some((m) => m.id === agentConfig1.sId)).toBe(true);
+      expect(agentMentions.some((m) => m.id === GLOBAL_AGENTS_SID.DUST)).toBe(
+        false
+      );
+
+      expect(launchAgentLoopWorkflow).toHaveBeenCalledTimes(1);
+
+      const otherAgentMentionsInDb = await MentionModel.findAll({
+        where: {
+          messageId: resultWithOtherAgent.value.userMessage.id,
+          workspaceId: workspace.id,
+        },
+      });
+      expect(
+        otherAgentMentionsInDb.some(
+          (m) => m.agentConfigurationId === agentConfig1.sId
+        )
+      ).toBe(true);
+      expect(
+        otherAgentMentionsInDb.some(
+          (m) => m.agentConfigurationId === GLOBAL_AGENTS_SID.DUST
+        )
+      ).toBe(false);
+    });
+
+    it("does not auto-mention @dust for api origin", async () => {
+      const user = auth.getNonNullableUser();
+      const userJson = user.toJSON();
+
+      const result = await postUserMessage(auth, {
+        conversation,
+        content: "API message",
+        mentions: [],
+        context: {
+          username: userJson.username,
+          timezone: "UTC",
+          fullName: userJson.fullName,
+          email: userJson.email,
+          profilePictureUrl: userJson.image,
+          origin: "api",
+        },
+        skipToolsValidation: false,
+      });
+
+      expect(result.isOk()).toBe(true);
+      if (!result.isOk()) {
+        return;
+      }
+
+      expect(result.value.userMessage.content).toBe("API message");
+      expect(result.value.userMessage.mentions?.length ?? 0).toBe(0);
+      expect(launchAgentLoopWorkflow).not.toHaveBeenCalled();
+    });
+
+    it("does not auto-mention @dust when two distinct users already posted", async () => {
+      const rateLimiterSpy = vi
+        .spyOn(rateLimiterModule, "rateLimiter")
+        .mockResolvedValue(100);
+
+      const userA = auth.getNonNullableUser();
+      const userAJson = userA.toJSON();
+
+      const userBModel = await UserFactory.basic();
+      await MembershipFactory.associate(workspace, userBModel, {
+        role: "user",
+      });
+      const authB = await Authenticator.fromUserIdAndWorkspaceId(
+        userBModel.sId,
+        workspace.sId
+      );
+      const userB = authB.getNonNullableUser();
+      const userBJson = userB.toJSON();
+
+      const firstFromA = await postUserMessage(auth, {
+        conversation,
+        content: "first from A",
+        mentions: [],
+        context: {
+          username: userAJson.username,
+          timezone: "UTC",
+          fullName: userAJson.fullName,
+          email: userAJson.email,
+          profilePictureUrl: userAJson.image,
+          origin: "web",
+        },
+        skipToolsValidation: false,
+      });
+      expect(firstFromA.isOk()).toBe(true);
+      if (!firstFromA.isOk()) {
+        rateLimiterSpy.mockRestore();
+        return;
+      }
+
+      const afterA = await getConversation(auth, conversation.sId);
+      expect(afterA.isOk()).toBe(true);
+      if (afterA.isErr()) {
+        rateLimiterSpy.mockRestore();
+        return;
+      }
+
+      const firstFromB = await postUserMessage(authB, {
+        conversation: afterA.value,
+        content: "first from B",
+        mentions: [],
+        context: {
+          username: userBJson.username,
+          timezone: "UTC",
+          fullName: userBJson.fullName,
+          email: userBJson.email,
+          profilePictureUrl: userBJson.image,
+          origin: "web",
+        },
+        skipToolsValidation: false,
+      });
+      expect(firstFromB.isOk()).toBe(true);
+      if (!firstFromB.isOk()) {
+        rateLimiterSpy.mockRestore();
+        return;
+      }
+
+      const afterB = await getConversation(auth, conversation.sId);
+      expect(afterB.isOk()).toBe(true);
+      if (afterB.isErr()) {
+        rateLimiterSpy.mockRestore();
+        return;
+      }
+
+      vi.clearAllMocks();
+
+      const secondFromA = await postUserMessage(auth, {
+        conversation: afterB.value,
+        content: "second from A",
+        mentions: [],
+        context: {
+          username: userAJson.username,
+          timezone: "UTC",
+          fullName: userAJson.fullName,
+          email: userAJson.email,
+          profilePictureUrl: userAJson.image,
+          origin: "web",
+        },
+        skipToolsValidation: false,
+      });
+
+      expect(secondFromA.isOk()).toBe(true);
+      if (!secondFromA.isOk()) {
+        rateLimiterSpy.mockRestore();
+        return;
+      }
+
+      expect(secondFromA.value.userMessage.content).toBe("second from A");
+      expect(secondFromA.value.userMessage.mentions?.length ?? 0).toBe(0);
+      expect(launchAgentLoopWorkflow).not.toHaveBeenCalled();
+
+      rateLimiterSpy.mockRestore();
+    });
   });
 
   describe("project conversation member constraint", () => {
@@ -1537,7 +2082,7 @@ describe("postUserMessage", () => {
           fullName: userJson.fullName,
           email: userJson.email,
           profilePictureUrl: userJson.image,
-          origin: "web",
+          origin: "api",
         },
         skipToolsValidation: false,
       });
@@ -1644,7 +2189,7 @@ describe("postUserMessage", () => {
           fullName: userJson.fullName,
           email: userJson.email,
           profilePictureUrl: userJson.image,
-          origin: "web",
+          origin: "api",
         },
         skipToolsValidation: false,
       });
@@ -1750,7 +2295,7 @@ describe("postUserMessage", () => {
     describe("with conversation_branches feature flag enabled", () => {
       beforeEach(async () => {
         await setupProjectWithRestrictedAgent();
-        await FeatureFlagFactory.basic("conversation_branches", workspace);
+        await FeatureFlagFactory.basic(auth, "conversation_branches");
       });
 
       it("should create a branch and put first message in branch when posting with restricted agent", async () => {
@@ -1850,13 +2395,13 @@ describe("postUserMessage", () => {
         }
 
         expect(projectConversation.branchId).toBeDefined();
-        const branchSId = projectConversation.branchId!;
+        const branchId = projectConversation.branchId!;
 
         const conversationWithBranch = await getConversation(
           auth,
           projectConversation.sId,
           false,
-          branchSId
+          branchId
         );
         expect(conversationWithBranch.isOk()).toBe(true);
         if (conversationWithBranch.isErr()) {
@@ -1893,7 +2438,7 @@ describe("postUserMessage", () => {
         expect(secondUserMessageRow).not.toBeNull();
         const branchRow = await ConversationBranchResource.fetchById(
           auth,
-          branchSId
+          branchId
         );
         expect(branchRow).not.toBeNull();
         expect(secondUserMessageRow!.branchId).toBe(branchRow!.id);
@@ -1957,6 +2502,92 @@ describe("postUserMessage", () => {
         rateLimiterSpy.mockRestore();
       });
     });
+  });
+});
+
+describe("compactConversation", () => {
+  let auth: Authenticator;
+  let workspace: Awaited<ReturnType<typeof createResourceTest>>["workspace"];
+  let conversation: ConversationType;
+  let agentConfig: LightAgentConfigurationType;
+
+  beforeEach(async () => {
+    const setup = await createResourceTest({});
+    auth = setup.authenticator;
+    workspace = setup.workspace;
+
+    agentConfig = await AgentConfigurationFactory.createTestAgent(auth, {
+      name: "Test Agent",
+      description: "Test Agent Description",
+    });
+
+    const conversationWithoutContent = await ConversationFactory.create(auth, {
+      agentConfigurationId: agentConfig.sId,
+      messagesCreatedAt: [],
+    });
+
+    const fetched = await getConversation(auth, conversationWithoutContent.sId);
+    if (fetched.isErr()) {
+      throw new Error("Failed to fetch conversation");
+    }
+    conversation = fetched.value;
+
+    vi.clearAllMocks();
+  });
+
+  it("should create a compaction message on an idle conversation", async () => {
+    const result = await compactConversation(auth, { conversation });
+
+    expect(result.isOk()).toBe(true);
+    if (result.isErr()) {
+      return;
+    }
+
+    const { compactionMessage } = result.value;
+    expect(compactionMessage.status).toBe("created");
+    expect(compactionMessage.content).toBeNull();
+  });
+
+  it("should reject compaction when an agent message is running", async () => {
+    // Insert a user message then an agent message with status "created" (running).
+    const { messageRow: userMessageRow } =
+      await ConversationFactory.createUserMessage({
+        auth,
+        workspace,
+        conversation,
+        content: "hello",
+      });
+    const agentMessageRow = await AgentMessageModel.create({
+      status: "created",
+      agentConfigurationId: agentConfig.sId,
+      agentConfigurationVersion: 0,
+      workspaceId: workspace.id,
+      skipToolsValidation: false,
+    });
+    await MessageModel.create({
+      sId: generateRandomModelSId(),
+      rank: 1,
+      conversationId: conversation.id,
+      parentId: userMessageRow.id,
+      agentMessageId: agentMessageRow.id,
+      workspaceId: workspace.id,
+    });
+
+    // Re-fetch so the conversation content includes the running agent message.
+    const fetched = await getConversation(auth, conversation.sId);
+    expect(fetched.isOk()).toBe(true);
+    if (fetched.isErr()) {
+      return;
+    }
+
+    const result = await compactConversation(auth, {
+      conversation: fetched.value,
+    });
+
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) {
+      expect(result.error.status_code).toBe(409);
+    }
   });
 });
 
@@ -2645,13 +3276,183 @@ describe("postNewContentFragment", () => {
       expect(getContentFragmentBlob).not.toHaveBeenCalled();
     });
   });
+
+  describe("project-context file reuse in project conversations", () => {
+    it("reuses existing project content fragment and skips attachment upsert and blob fetch", async () => {
+      const user = auth.getNonNullableUser();
+      const projectFile = await ProjectFileFactory.create(
+        auth,
+        user,
+        projectSpace,
+        {
+          contentType: "text/plain",
+          fileName: "project-doc.txt",
+          fileSize: 12,
+          status: "ready",
+        }
+      );
+
+      const latestContext = await fetchLatestProjectContextFileContentFragment(
+        auth,
+        projectSpace,
+        projectFile.sId
+      );
+      expect(latestContext).not.toBeNull();
+
+      const conversationWithoutContent = await ConversationFactory.create(
+        auth,
+        {
+          agentConfigurationId: agentConfig.sId,
+          messagesCreatedAt: [],
+          spaceId: projectSpace.id,
+        }
+      );
+
+      const fetchedConversationResult = await getConversation(
+        auth,
+        conversationWithoutContent.sId
+      );
+      if (fetchedConversationResult.isErr()) {
+        throw new Error("Failed to fetch conversation");
+      }
+      conversation = fetchedConversationResult.value;
+
+      const maybeUpsertSpy = vi.spyOn(
+        attachmentsModule,
+        "maybeUpsertFileAttachment"
+      );
+
+      const input: ContentFragmentInputWithFileIdType = {
+        title: projectFile.fileName,
+        fileId: projectFile.sId,
+      };
+
+      const result = await postNewContentFragment(auth, conversation, input, {
+        username: user.username,
+        fullName: user.fullName(),
+        email: user.email,
+        profilePictureUrl: null,
+      });
+
+      maybeUpsertSpy.mockRestore();
+
+      expect(result.isOk()).toBe(true);
+      expect(maybeUpsertSpy).not.toHaveBeenCalled();
+      expect(getContentFragmentBlob).not.toHaveBeenCalled();
+
+      if (result.isOk()) {
+        expect(result.value.contentFragmentId).toBe(
+          latestContext!.fragment.sId
+        );
+        expect(result.value.contentFragmentType).toBe("file");
+        if (result.value.contentFragmentType === "file") {
+          expect(result.value.fileId).toBe(projectFile.sId);
+          expect(result.value.isInProjectContext).toBe(true);
+        }
+      }
+    });
+
+    it("does not create a second message row when the project fragment is already in the conversation", async () => {
+      const user = auth.getNonNullableUser();
+      const projectFile = await ProjectFileFactory.create(
+        auth,
+        user,
+        projectSpace,
+        {
+          contentType: "text/plain",
+          fileName: "project-doc-duplicate.txt",
+          fileSize: 12,
+          status: "ready",
+        }
+      );
+
+      const latestContext = await fetchLatestProjectContextFileContentFragment(
+        auth,
+        projectSpace,
+        projectFile.sId
+      );
+      expect(latestContext).not.toBeNull();
+      const fragmentModelId = latestContext!.fragment.id;
+
+      const conversationWithoutContent = await ConversationFactory.create(
+        auth,
+        {
+          agentConfigurationId: agentConfig.sId,
+          messagesCreatedAt: [],
+          spaceId: projectSpace.id,
+        }
+      );
+
+      let fetchedConversationResult = await getConversation(
+        auth,
+        conversationWithoutContent.sId
+      );
+      if (fetchedConversationResult.isErr()) {
+        throw new Error("Failed to fetch conversation");
+      }
+      conversation = fetchedConversationResult.value;
+
+      const context = {
+        username: user.username,
+        fullName: user.fullName(),
+        email: user.email,
+        profilePictureUrl: null,
+      };
+
+      const input: ContentFragmentInputWithFileIdType = {
+        title: projectFile.fileName,
+        fileId: projectFile.sId,
+      };
+
+      const first = await postNewContentFragment(
+        auth,
+        conversation,
+        input,
+        context
+      );
+      expect(first.isOk()).toBe(true);
+
+      const messageCountAfterFirst = await MessageModel.count({
+        where: {
+          conversationId: conversation.id,
+          contentFragmentId: fragmentModelId,
+        },
+      });
+      expect(messageCountAfterFirst).toBe(1);
+
+      fetchedConversationResult = await getConversation(
+        auth,
+        conversationWithoutContent.sId
+      );
+      if (fetchedConversationResult.isErr()) {
+        throw new Error("Failed to fetch conversation");
+      }
+      const conversationAfterFirst = fetchedConversationResult.value;
+
+      const second = await postNewContentFragment(
+        auth,
+        conversationAfterFirst,
+        input,
+        context
+      );
+      expect(second.isOk()).toBe(true);
+
+      const messageCountAfterSecond = await MessageModel.count({
+        where: {
+          conversationId: conversation.id,
+          contentFragmentId: fragmentModelId,
+        },
+      });
+      expect(messageCountAfterSecond).toBe(1);
+    });
+  });
 });
 
 describe("isConversationEventAllowedForAuth", () => {
   let auth: Authenticator;
   let workspace: Awaited<ReturnType<typeof createResourceTest>>["workspace"];
   let otherAuth: Authenticator;
-  let branchSId: string;
+  let branchId: string;
 
   beforeEach(async () => {
     const setup = await createResourceTest({});
@@ -2697,17 +3498,13 @@ describe("isConversationEventAllowedForAuth", () => {
       contentFragmentId: null,
     });
 
-    const branch = await ConversationBranchModel.create({
-      workspaceId: workspace.id,
+    const branch = await ConversationBranchResource.makeNew(auth, {
       state: "open",
       previousMessageId: baseMessage.id,
       conversationId: conversation.id,
       userId: user.id,
     });
-    branchSId = makeSId("conversation_branch", {
-      id: branch.id,
-      workspaceId: workspace.id,
-    });
+    branchId = branch.sId;
   });
 
   it("returns true for agent_message_done event", async () => {
@@ -2718,43 +3515,6 @@ describe("isConversationEventAllowedForAuth", () => {
       configurationId: "config-1",
       messageId: "msg-1",
       status: "success" as const,
-    };
-    const result = await isConversationEventAllowedForAuth(auth, { event });
-    expect(result).toBe(true);
-  });
-
-  it("returns true for butler_suggestion_created event", async () => {
-    const event = {
-      type: "butler_suggestion_created" as const,
-      created: Date.now(),
-      suggestion: {
-        sId: "suggestion-1",
-        createdAt: 1,
-        updatedAt: 1,
-        sourceMessageSId: "msg-1",
-        resultMessageSId: null,
-        status: "pending" as const,
-        suggestionType: "rename_title" as const,
-        metadata: { suggestedTitle: "New title" },
-      },
-    };
-    const result = await isConversationEventAllowedForAuth(auth, { event });
-    expect(result).toBe(true);
-  });
-
-  it("returns true for butler_done event", async () => {
-    const event = {
-      type: "butler_done" as const,
-      created: Date.now(),
-    };
-    const result = await isConversationEventAllowedForAuth(auth, { event });
-    expect(result).toBe(true);
-  });
-
-  it("returns true for butler_thinking event", async () => {
-    const event = {
-      type: "butler_thinking" as const,
-      created: Date.now(),
     };
     const result = await isConversationEventAllowedForAuth(auth, { event });
     expect(result).toBe(true);
@@ -2790,7 +3550,7 @@ describe("isConversationEventAllowedForAuth", () => {
       created: Date.now(),
       messageId: "msg-1",
       message: {
-        branchId: branchSId,
+        branchId,
         contentFragments: [],
       } as unknown as UserMessageNewEvent["message"],
     };
@@ -2804,7 +3564,7 @@ describe("isConversationEventAllowedForAuth", () => {
       created: Date.now(),
       messageId: "msg-1",
       message: {
-        branchId: branchSId,
+        branchId,
         contentFragments: [],
       } as unknown as UserMessageNewEvent["message"],
     };
@@ -2849,7 +3609,7 @@ describe("isConversationEventAllowedForAuth", () => {
       created: Date.now(),
       configurationId: "config-1",
       messageId: "msg-1",
-      message: { branchId: branchSId } as AgentMessageType,
+      message: { branchId } as AgentMessageType,
     };
     const result = await isConversationEventAllowedForAuth(auth, { event });
     expect(result).toBe(true);
@@ -2861,7 +3621,7 @@ describe("isConversationEventAllowedForAuth", () => {
       created: Date.now(),
       configurationId: "config-1",
       messageId: "msg-1",
-      message: { branchId: branchSId } as AgentMessageType,
+      message: { branchId } as AgentMessageType,
     };
     const result = await isConversationEventAllowedForAuth(otherAuth, {
       event,

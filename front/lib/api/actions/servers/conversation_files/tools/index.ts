@@ -1,6 +1,6 @@
 import {
   computeTextByteSize,
-  MAX_TEXT_CONTENT_SIZE_BYTES,
+  FILE_OFFLOAD_TEXT_SIZE_BYTES,
 } from "@app/lib/actions/action_output_limits";
 import { MCPError } from "@app/lib/actions/mcp_errors";
 import { getDataSourceURI } from "@app/lib/actions/mcp_internal_actions/input_configuration";
@@ -8,7 +8,6 @@ import type { ToolHandlers } from "@app/lib/actions/mcp_internal_actions/tool_de
 import { buildTools } from "@app/lib/actions/mcp_internal_actions/tool_definition";
 import {
   CONVERSATION_CAT_FILE_ACTION_NAME,
-  CONVERSATION_FILES_TOOLS_IN_PROJECT_METADATA,
   CONVERSATION_FILES_TOOLS_METADATA,
   CONVERSATION_LIST_FILES_ACTION_NAME,
   CONVERSATION_SEARCH_FILES_ACTION_NAME,
@@ -17,27 +16,20 @@ import { searchFunction } from "@app/lib/api/actions/servers/search/tools";
 import type { DataSourceConfiguration } from "@app/lib/api/assistant/configuration/types";
 import {
   type ContentNodeAttachmentType,
+  type ConversationAttachmentType,
   conversationAttachmentId,
   isContentNodeAttachmentType,
   renderAttachmentXml,
 } from "@app/lib/api/assistant/conversation/attachments";
-import {
-  getConversationDataSourceViews,
-  getProjectContextDataSourceView,
-} from "@app/lib/api/assistant/jit/utils";
+import { getConversationDataSourceViews } from "@app/lib/api/assistant/jit/utils";
 import { listAttachments } from "@app/lib/api/assistant/jit_utils";
-import { PROJECT_CONTEXT_FOLDER_ID } from "@app/lib/api/projects/constants";
 import type { Authenticator } from "@app/lib/auth";
 import { getSupportedModelConfig } from "@app/lib/llms/model_configurations";
 import {
   CONTENT_OUTDATED_MSG,
   getContentFragmentFromAttachmentFile,
 } from "@app/lib/resources/content_fragment_resource";
-import logger from "@app/logger/logger";
-import {
-  type ConversationType,
-  isProjectConversation,
-} from "@app/types/assistant/conversation";
+import type { ConversationType } from "@app/types/assistant/conversation";
 import type {
   ImageContent,
   TextContent,
@@ -50,6 +42,41 @@ import { normalizeError } from "@app/types/shared/utils/error_utils";
 import { INTERNAL_MIME_TYPES } from "@dust-tt/client";
 
 const MAX_FILE_SIZE_FOR_GREP = 20 * 1024 * 1024; // 20MB.
+const MAX_CONTENT_SIZE_FOR_LIST_FILES = 1024 * 256; // 256KB.
+
+export const contentFromAttachments = (
+  attachments: ConversationAttachmentType[],
+  snippetContent?: string
+) => {
+  let content = "";
+
+  // Directly attached files.
+  attachments
+    .filter((a) => !a.isInProjectContext)
+    .forEach((attachment, i) => {
+      if (i === 0) {
+        content +=
+          "The following files are currently attached to the conversation directly:\n";
+      } else {
+        content += "\n";
+      }
+      content += renderAttachmentXml({ attachment, content: snippetContent });
+    });
+
+  // Project context attached files.
+  attachments
+    .filter((a) => a.isInProjectContext)
+    .forEach((attachment, i) => {
+      if (i === 0) {
+        content +=
+          "The following files are currently attached to the conversation via the project context:\n";
+      } else {
+        content += "\n";
+      }
+      content += renderAttachmentXml({ attachment, content: snippetContent });
+    });
+  return content;
+};
 
 const handlers: ToolHandlers<typeof CONVERSATION_FILES_TOOLS_METADATA> = {
   [CONVERSATION_LIST_FILES_ACTION_NAME]: async (
@@ -72,33 +99,14 @@ const handlers: ToolHandlers<typeof CONVERSATION_FILES_TOOLS_METADATA> = {
       ]);
     }
 
-    let content = "";
+    let content = contentFromAttachments(attachments);
 
-    // Directly attached files.
-    attachments
-      .filter((a) => !a.isInProjectContext)
-      .forEach((attachment, i) => {
-        if (i === 0) {
-          content +=
-            "The following files are currently attached to the conversation directly:\n";
-        } else {
-          content += "\n";
-        }
-        content += renderAttachmentXml({ attachment });
-      });
-
-    // Project context attached files.
-    attachments
-      .filter((a) => a.isInProjectContext)
-      .forEach((attachment, i) => {
-        if (i === 0) {
-          content +=
-            "The following files are currently attached to the conversation via the project context:\n";
-        } else {
-          content += "\n";
-        }
-        content += renderAttachmentXml({ attachment });
-      });
+    if (content.length > MAX_CONTENT_SIZE_FOR_LIST_FILES) {
+      content = contentFromAttachments(
+        attachments,
+        "Snippet content too large."
+      );
+    }
 
     return new Ok([
       {
@@ -184,9 +192,9 @@ const handlers: ToolHandlers<typeof CONVERSATION_FILES_TOOLS_METADATA> = {
       );
     }
 
-    // Cap to MAX_TEXT_CONTENT_SIZE_BYTES to avoid storing oversized content in the DB.
-    // For ASCII-dominant text, 1 char ≈ 1 byte, so we use MAX_TEXT_CONTENT_SIZE_BYTES directly.
-    const maxCharacters = MAX_TEXT_CONTENT_SIZE_BYTES;
+    // Cap to FILE_OFFLOAD_TEXT_SIZE_BYTES to avoid storing oversized content in the DB.
+    // For ASCII-dominant text, 1 char ≈ 1 byte, so we use FILE_OFFLOAD_TEXT_SIZE_BYTES directly.
+    const maxCharacters = FILE_OFFLOAD_TEXT_SIZE_BYTES;
     const effectiveLimit =
       limit !== undefined ? Math.min(limit, maxCharacters) : maxCharacters;
     const end = start + effectiveLimit;
@@ -309,33 +317,6 @@ const handlers: ToolHandlers<typeof CONVERSATION_FILES_TOOLS_METADATA> = {
       });
     }
 
-    const isPartOfProject = isProjectConversation(conversation);
-
-    if (isPartOfProject) {
-      const projectDatasourceView = await getProjectContextDataSourceView(
-        auth,
-        conversation
-      );
-
-      if (!projectDatasourceView) {
-        logger.warn(
-          { conversationId: conversation.sId },
-          "Project context datasource view not found for conversation."
-        );
-      } else {
-        dataSources.push({
-          workspaceId: auth.getNonNullableWorkspace().sId,
-          dataSourceViewId: projectDatasourceView.sId,
-          filter: {
-            // Intentionaly only search the project context folder, not the entire project.
-            // The conversations from the project can be searched using the project search action.
-            parents: { in: [PROJECT_CONTEXT_FOLDER_ID], not: [] },
-            tags: null,
-          },
-        });
-      }
-    }
-
     const searchResults = await searchFunction(auth, {
       query,
       relativeTimeFrame: "all",
@@ -411,7 +392,3 @@ async function getFileFromConversation(
 }
 
 export const TOOLS = buildTools(CONVERSATION_FILES_TOOLS_METADATA, handlers);
-export const TOOLS_IN_PROJECT = buildTools(
-  CONVERSATION_FILES_TOOLS_IN_PROJECT_METADATA,
-  handlers
-);

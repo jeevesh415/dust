@@ -18,7 +18,7 @@ import { KeyResource } from "@app/lib/resources/key_resource";
 import { LabsTranscriptsConfigurationResource } from "@app/lib/resources/labs_transcripts_resource";
 import { MembershipResource } from "@app/lib/resources/membership_resource";
 import { SpaceResource } from "@app/lib/resources/space_resource";
-import { generateRandomModelSId } from "@app/lib/resources/string_ids";
+import { generateRandomModelSId } from "@app/lib/resources/string_ids_server";
 import { SubscriptionResource } from "@app/lib/resources/subscription_resource";
 import { UserResource } from "@app/lib/resources/user_resource";
 import { WebhookRequestResource } from "@app/lib/resources/webhook_request_resource";
@@ -37,6 +37,7 @@ import {
 } from "@app/temporal/labs/transcripts/client";
 import { REGISTERED_CHECKS } from "@app/temporal/production_checks/activities";
 import { ConnectorsAPI } from "@app/types/connectors/connectors_api";
+import { labsTranscriptsProviders } from "@app/types/labs";
 import { assertNever } from "@app/types/shared/utils/assert_never";
 import { removeNulls } from "@app/types/shared/utils/general";
 import { isRoleType } from "@app/types/user";
@@ -692,6 +693,46 @@ const transcripts = async (command: string, args: parseArgs.ParsedArgs) => {
         }
       }
       logger.info(`Restarted ${activeConfigSIds.length} workflows.`);
+      return;
+    }
+    case "stop-all": {
+      const provider = labsTranscriptsProviders.find(
+        (p) => p === args.provider
+      );
+      if (!provider) {
+        throw new Error(
+          `Missing or invalid --provider argument. Valid values: ${labsTranscriptsProviders.join(", ")}`
+        );
+      }
+
+      const providerConfigs =
+        await LabsTranscriptsConfigurationResource.listByWorkspaceAndProvider({
+          auth,
+          provider,
+        });
+
+      if (providerConfigs.length === 0) {
+        logger.info(
+          `No transcript configurations found for provider '${provider}' in workspace '${args.wId}'.`
+        );
+        return;
+      }
+
+      let stoppedCount = 0;
+      for (const config of providerConfigs) {
+        if (config.isActive()) {
+          await stopRetrieveTranscriptsWorkflow(config);
+          stoppedCount++;
+          logger.info(
+            { configId: config.sId },
+            `Stopped transcript workflow for config ${config.sId}.`
+          );
+        }
+      }
+
+      logger.info(
+        `Stopped ${stoppedCount}/${providerConfigs.length} workflows for provider '${provider}'.`
+      );
       return;
     }
   }

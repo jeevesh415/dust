@@ -8,19 +8,24 @@ import type { AgentMCPActionType } from "@app/types/actions";
 import type { LightAgentConfigurationType } from "@app/types/assistant/agent";
 import type {
   ConversationWithoutContentType,
+  InlineActivityStep,
   LightAgentMessageType,
   LightAgentMessageWithActionsType,
+  LightMessageType,
   UserMessageOrigin,
   UserMessageTypeWithContentFragments,
 } from "@app/types/assistant/conversation";
-import { isLightAgentMessageWithActionsType } from "@app/types/assistant/conversation";
+import {
+  isCompactionMessageType,
+  isLightAgentMessageWithActionsType,
+  isUserMessageTypeWithContentFragments,
+} from "@app/types/assistant/conversation";
+
 import type { RichMention } from "@app/types/assistant/mentions";
 import type { ContentFragmentsType } from "@app/types/content_fragment";
-import type { ButlerSuggestionPublicType } from "@app/types/conversation_butler_suggestion";
 import type { ModelId } from "@app/types/shared/model_id";
 import type { Result } from "@app/types/shared/result";
 import type { LightWorkspaceType, UserType } from "@app/types/user";
-import uniq from "lodash/uniq";
 import type { Components } from "react-markdown";
 import type { PluggableList } from "react-markdown/lib/react-markdown";
 
@@ -39,13 +44,36 @@ export type ActionProgressState = Map<
   }
 >;
 
-export type MessageTemporaryState = LightAgentMessageWithActionsType & {
+export type PendingToolCall = {
+  toolName: string;
+  toolCallId?: string;
+  toolCallIndex?: number;
+};
+
+export function getPendingToolCallKey(
+  pendingToolCall: PendingToolCall,
+  index: number
+): string {
+  if (pendingToolCall.toolCallId) {
+    return `id-${pendingToolCall.toolCallId}`;
+  }
+
+  if (pendingToolCall.toolCallIndex !== undefined) {
+    return `index-${pendingToolCall.toolCallIndex}`;
+  }
+
+  return `name-${pendingToolCall.toolName}-${index}`;
+}
+
+export type AgentMessageWithStreaming = LightAgentMessageWithActionsType & {
   streaming: {
     agentState: AgentStateClassification;
     isRetrying: boolean;
     lastUpdated: Date;
     actionProgress: ActionProgressState;
+    pendingToolCalls: PendingToolCall[];
     useFullChainOfThought: boolean;
+    inlineActivitySteps: InlineActivityStep[];
   };
 };
 
@@ -59,7 +87,7 @@ export type AgentMessageStateWithControlEvent =
   | { type: "end-of-stream" };
 
 export type VirtuosoMessage =
-  | MessageTemporaryState
+  | AgentMessageWithStreaming
   | UserMessageTypeWithContentFragments;
 
 export type VirtuosoMessageListContext = {
@@ -82,19 +110,15 @@ export type VirtuosoMessageListContext = {
     skipToolsValidation?: boolean;
   };
   feedbacksByMessageId: Record<string, AgentMessageFeedbackType>;
-  suggestionsByMessageSId: Map<string, ButlerSuggestionPublicType[]>;
-  handleSuggestionAction: (
-    suggestionSId: string,
-    status: "accepted" | "dismissed"
-  ) => Promise<void>;
-  isButlerThinking: boolean;
   additionalMarkdownComponents?: Components;
   additionalMarkdownPlugins?: PluggableList;
   // Project membership fields (undefined for non-project conversations)
   isProjectMember?: boolean;
   isProjectRestricted?: boolean;
-  projectSpaceId?: string;
+  projectId?: string;
   projectSpaceName?: string;
+  branchIdToApprove?: string;
+  setBranchIdToApprove?: (branchId: string | null) => void;
 };
 
 export const areSameRankAndBranch = (
@@ -137,34 +161,46 @@ export const isUserMessage = (
 export const isHandoverUserMessage = (msg: VirtuosoMessage): boolean =>
   isUserMessage(msg) && msg.agenticMessageData?.type === "agent_handover";
 
-export const isMessageTemporayState = (
+export const isAgentMessageWithStreaming = (
   msg: VirtuosoMessage
-): msg is MessageTemporaryState => "streaming" in msg;
+): msg is AgentMessageWithStreaming =>
+  "streaming" in msg && msg.type === "agent_message";
 
 export const getMessageDate = (msg: VirtuosoMessage): Date =>
   new Date(msg.created);
 
 export const makeInitialMessageStreamState = (
   message: LightAgentMessageType | LightAgentMessageWithActionsType
-): MessageTemporaryState => {
+): AgentMessageWithStreaming => {
   return {
     ...message,
     actions: isLightAgentMessageWithActionsType(message) ? message.actions : [],
     streaming: {
       actionProgress: new Map(),
       agentState: message.status === "created" ? "thinking" : "done",
+      inlineActivitySteps: message.activitySteps ?? [],
       isRetrying: false,
       lastUpdated: new Date(),
+      pendingToolCalls: [],
       useFullChainOfThought: false,
     },
   };
 };
-
-export const hasHumansInteracting = (messages: VirtuosoMessage[]) =>
-  uniq(messages.filter(isUserMessage).map((m) => m.user?.sId)).length >= 2;
 
 export const isSidekickBootstrapMessage = (
   message: UserMessageTypeWithContentFragments
 ): boolean => {
   return message.context.origin === "agent_sidekick" && message.rank === 0;
 };
+
+export const convertLightMessageTypeToVirtuosoMessages = (
+  messages: LightMessageType[]
+) =>
+  messages
+    // TODO(compaction): Add support for compaction messages in the UI instead of filtering.
+    .filter((message) => !isCompactionMessageType(message))
+    .map((message) =>
+      isUserMessageTypeWithContentFragments(message)
+        ? message
+        : makeInitialMessageStreamState(message)
+    );

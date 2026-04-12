@@ -1,5 +1,6 @@
 import type { Authenticator } from "@app/lib/auth";
 import {
+  isByokTransitioningPlan,
   isDustCompanyPlan,
   isEntreprisePlanPrefix,
   isUpgraded,
@@ -22,6 +23,7 @@ import {
   GPT_5_MINI_MODEL_CONFIG,
 } from "@app/types/assistant/models/openai";
 import {
+  BYOK_MODEL_PROVIDER_IDS,
   isByokProviderId,
   MODEL_PROVIDER_IDS,
 } from "@app/types/assistant/models/providers";
@@ -59,6 +61,18 @@ export function getWhitelistedProviders(
     return whiteListedProviders;
   }
 
+  // For BYOK_TRANSITIONING workspaces, we fall back on Dust-managed keys for BYOK providers when
+  // the customer hasn't configured their own. Whitelist all BYOK providers so they remain available
+  // even if not yet configured.
+  if (isByokTransitioningPlan(plan)) {
+    const allByokProviderIds = new Set<ModelProviderIdType>(
+      BYOK_MODEL_PROVIDER_IDS
+    );
+    allByokProviderIds.add("noop");
+
+    return allByokProviderIds;
+  }
+
   const providersHealth = auth.providersHealth();
 
   const configuredProviders = new Set(
@@ -93,17 +107,21 @@ export function getFastestWhitelistedModel(
 }
 
 export function getSmallWhitelistedModel(
-  auth: Authenticator
+  auth: Authenticator,
+  excludeProviders: ReadonlySet<ModelProviderIdType> = new Set()
 ): ModelConfigurationType | null {
-  const whitelistedProviders = getWhitelistedProviders(auth);
-  return _getSmallWhitelistedModel(whitelistedProviders);
+  return _getSmallWhitelistedModel(
+    getWhitelistedProviders(auth).difference(excludeProviders)
+  );
 }
 
 export function getLargeWhitelistedModel(
-  auth: Authenticator
+  auth: Authenticator,
+  excludeProviders: ReadonlySet<ModelProviderIdType> = new Set()
 ): ModelConfigurationType | null {
-  const whitelistedProviders = getWhitelistedProviders(auth);
-  return _getLargeWhitelistedModel(whitelistedProviders);
+  return _getLargeWhitelistedModel(
+    getWhitelistedProviders(auth).difference(excludeProviders)
+  );
 }
 
 function _getSmallWhitelistedModel(

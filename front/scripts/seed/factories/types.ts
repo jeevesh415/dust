@@ -60,7 +60,7 @@ export interface ConversationAsset {
   sId: string;
   title: string;
   agentName?: string;
-  userSId?: string;
+  userId: string;
   exchanges: Exchange[];
 }
 
@@ -70,8 +70,8 @@ export interface ConversationsAsset {
 }
 
 export interface FeedbackAsset {
-  conversationSId: string;
-  agentMessageSId: string;
+  conversationId: string;
+  agentMessageId: string;
   thumbDirection: "up" | "down";
   content: string | null;
 }

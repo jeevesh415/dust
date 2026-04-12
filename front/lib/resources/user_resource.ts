@@ -141,11 +141,15 @@ export class UserResource extends BaseResource<UserModel> {
     return users.map((user) => new UserResource(UserModel, user.get()));
   }
 
-  static async fetchByModelIds(ids: ModelId[]): Promise<UserResource[]> {
+  static async fetchByModelIds(
+    ids: ModelId[],
+    { transaction }: { transaction?: Transaction } = {}
+  ): Promise<UserResource[]> {
     const users = await UserModel.findAll({
       where: {
         id: ids,
       },
+      transaction,
     });
 
     return users.map((user) => new UserResource(UserModel, user.get()));
@@ -285,6 +289,20 @@ export class UserResource extends BaseResource<UserModel> {
     return sortedUsers[0] ?? null;
   }
 
+  static async fetchByEmails(emails: string[]): Promise<UserResource[]> {
+    if (emails.length === 0) {
+      return [];
+    }
+
+    const users = await UserModel.findAll({
+      where: {
+        email: emails.map((e) => e.toLowerCase()),
+      },
+    });
+
+    return users.map((user) => new UserResource(UserModel, user.get()));
+  }
+
   static async getWorkspaceFirstAdmin(
     workspaceId: number
   ): Promise<UserResource | null> {
@@ -394,7 +412,7 @@ export class UserResource extends BaseResource<UserModel> {
       logger.error(
         {
           workspaceId: owner.sId,
-          missingUserSIds: missingUserIds,
+          missingUserIds,
           owner: "spolu",
         },
         // This log is expected as user search queries may happen before the index update completes

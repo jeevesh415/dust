@@ -4,17 +4,15 @@ import type { JSONSchema7 as JSONSchema } from "json-schema";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 
-export const PRODUCTBOARD_TOOL_NAME = "productboard" as const;
-
 export const PRODUCTBOARD_TOOLS_METADATA = createToolsRecord({
   create_note: {
     description:
       "Create a note in Productboard to capture customer feedback, insights, or support conversations.",
     schema: {
       type: z
-        .enum(["simple", "conversation"])
+        .enum(["textNote", "conversationNote"])
         .describe(
-          "Note type: 'simple' for plain feedback, 'conversation' for chat/email threads"
+          "Note type: 'textNote' for plain feedback, 'conversationNote' for chat/email threads"
         ),
       fields: z
         .object({})
@@ -345,8 +343,8 @@ export const PRODUCTBOARD_TOOLS_METADATA = createToolsRecord({
     schema: {
       entity_type: z
         .enum([
-          "simple",
-          "conversation",
+          "textNote",
+          "conversationNote",
           "product",
           "component",
           "feature",
@@ -360,7 +358,7 @@ export const PRODUCTBOARD_TOOLS_METADATA = createToolsRecord({
           "user",
         ])
         .describe(
-          "Entity type to get configuration for. Note types: 'simple', 'conversation'. Entity types: 'product', 'component', 'feature', etc."
+          "Entity type to get configuration for. Note types: 'textNote', 'conversationNote'. Entity types: 'product', 'component', 'feature', etc."
         ),
     },
     stake: "never_ask",
@@ -378,7 +376,7 @@ Productboard uses a configuration-driven API. Always start by calling get_config
 
 ### Entity Types Reference
 
-**Notes:** Use \`entity_type='simple'\` or \`entity_type='conversation'\`
+**Notes:** Use \`entity_type='textNote'\` or \`entity_type='conversationNote'\`
 **Entities:** Use \`entity_type='product'\`, \`'component'\`, \`'feature'\`, \`'subfeature'\`, \`'initiative'\`, \`'objective'\`, \`'keyResult'\`, \`'release'\`, \`'releaseGroup'\`, \`'company'\`, or \`'user'\`
 
 ### Required Workflow for Creating
@@ -515,6 +513,7 @@ interface ConversationNotePart {
 `;
 
 export const PRODUCTBOARD_SERVER = {
+  // biome-ignore lint/plugin/noMcpServerInstructions: existing usage
   serverInfo: {
     name: "productboard",
     version: "1.0.0",
@@ -525,9 +524,6 @@ export const PRODUCTBOARD_SERVER = {
     },
     icon: "ProductboardLogo",
     documentationUrl: "https://docs.dust.tt/docs/productboard",
-    // Predates the introduction of the rule, would require extensive work to
-    // improve, as it's already widely adopted.
-    // biome-ignore lint/plugin/noMcpServerInstructions: existing usage
     instructions: PRODUCTBOARD_SERVER_INSTRUCTIONS,
   },
   tools: Object.values(PRODUCTBOARD_TOOLS_METADATA).map((t) => ({

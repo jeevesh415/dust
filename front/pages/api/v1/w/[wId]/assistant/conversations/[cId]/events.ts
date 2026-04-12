@@ -122,11 +122,11 @@ async function handler(
       let backpressureCount = 0;
 
       for await (const event of eventStream) {
-        // Butler suggestions are internal events, not exposed via the public API.
+        // Internal events are not exposed via the public API.
         if (
-          event.data.type === "butler_suggestion_created" ||
-          event.data.type === "butler_done" ||
-          event.data.type === "butler_thinking"
+          event.data.type === "user_message_promoted" ||
+          event.data.type === "compaction_message_new" ||
+          event.data.type === "compaction_message_done"
         ) {
           continue;
         }

@@ -7,6 +7,7 @@ import { deleteWebhookSource } from "@app/lib/api/webhook_source";
 import { deleteWorksOSOrganizationWithWorkspace } from "@app/lib/api/workos/organization";
 import { areAllSubscriptionsCanceled } from "@app/lib/api/workspace";
 import { Authenticator } from "@app/lib/auth";
+import { scheduleMetronomeContractEnd } from "@app/lib/metronome/client";
 import { AgentDataSourceConfigurationModel } from "@app/lib/models/agent/actions/data_sources";
 import {
   AgentChildAgentConfigurationModel,
@@ -43,6 +44,7 @@ import { OnboardingTaskResource } from "@app/lib/resources/onboarding_task_resou
 import { PluginRunResource } from "@app/lib/resources/plugin_run_resource";
 import { ProgrammaticUsageConfigurationResource } from "@app/lib/resources/programmatic_usage_configuration_resource";
 import { ProjectMetadataResource } from "@app/lib/resources/project_metadata_resource";
+import { ProjectTodoResource } from "@app/lib/resources/project_todo_resource";
 import { ProviderCredentialResource } from "@app/lib/resources/provider_credential_resource";
 import { RemoteMCPServerResource } from "@app/lib/resources/remote_mcp_servers_resource";
 import { RunResource } from "@app/lib/resources/run_resource";
@@ -62,7 +64,9 @@ import {
 } from "@app/lib/resources/storage/models/user";
 import { UserProjectDigestModel } from "@app/lib/resources/storage/models/user_project_digest";
 import { WorkspaceHasDomainModel } from "@app/lib/resources/storage/models/workspace_has_domain";
+import { SubscriptionResource } from "@app/lib/resources/subscription_resource";
 import { TagResource } from "@app/lib/resources/tags_resource";
+import { TakeawaysResource } from "@app/lib/resources/takeaways_resource";
 import { TriggerResource } from "@app/lib/resources/trigger_resource";
 import { UserResource } from "@app/lib/resources/user_resource";
 import { WebhookSourceResource } from "@app/lib/resources/webhook_source_resource";
@@ -172,6 +176,26 @@ export async function scrubSpaceActivity({
     });
   }
 
+  // Delete all takeaways for this space. This must run before project todos because
+  // ProjectTodoTakeawaySourcesModel holds RESTRICT FKs on both ProjectTodoModel and
+  // TakeawaySourcesModel, so the join-table rows must be removed first.
+  await TakeawaysResource.deleteAllForSpace(auth, { spaceModelId: space.id });
+
+  // Delete all project todos for this space, before the conversations as it's linked to convo
+  const projectTodos = await ProjectTodoResource.fetchBySpace(auth, {
+    spaceId: space.id,
+  });
+  await concurrentExecutor(
+    projectTodos,
+    async (todo) => {
+      const res = await todo.delete(auth, {});
+      if (res.isErr()) {
+        throw res.error;
+      }
+    },
+    { concurrency: 8 }
+  );
+
   // Delete all conversations in the space.
   // Won't scale if there's tons of conversations in spaces.
   await deleteSpaceConversations(auth, space);
@@ -193,6 +217,19 @@ export async function scrubSpaceActivity({
         throw metadataRes.error;
       }
     }
+    const projectTodoStates = await ProjectTodoResource.fetchBySpace(auth, {
+      spaceId: space.id,
+    });
+    await concurrentExecutor(
+      projectTodoStates,
+      async (todoState) => {
+        const result = await todoState.delete(auth, {});
+        if (result.isErr()) {
+          throw result.error;
+        }
+      },
+      { concurrency: 8 }
+    );
   }
 
   hardDeleteLogger.info({ space: space.sId, workspaceId }, "Deleting space");
@@ -224,10 +261,8 @@ async function deleteSpaceConversations(
   await concurrentExecutor(
     conversations,
     async (conversation) => {
-      const result = await destroyConversation(auth, {
-        conversationId: conversation.sId,
-      });
-      if (result.isErr() && result.error.type !== "conversation_not_found") {
+      const result = await destroyConversation(auth, { conversation });
+      if (result.isErr()) {
         throw result.error;
       }
     },
@@ -684,6 +719,28 @@ export async function deleteWorkspaceActivity({
     return;
   }
   const workspace = auth.getNonNullableWorkspace();
+
+  // End the Metronome contract if one exists.
+  if (workspace.metronomeCustomerId) {
+    const workspaceResource = await WorkspaceResource.fetchById(workspace.sId);
+    const subscription = workspaceResource
+      ? await SubscriptionResource.fetchActiveByWorkspaceModelId(
+          workspaceResource.id
+        )
+      : null;
+    if (subscription?.metronomeContractId) {
+      const endResult = await scheduleMetronomeContractEnd({
+        metronomeCustomerId: workspace.metronomeCustomerId,
+        contractId: subscription.metronomeContractId,
+      });
+      if (endResult.isErr()) {
+        hardDeleteLogger.error(
+          { workspaceId, error: endResult.error.message },
+          "Failed to end Metronome contract"
+        );
+      }
+    }
+  }
 
   await SubscriptionModel.destroy({
     where: {

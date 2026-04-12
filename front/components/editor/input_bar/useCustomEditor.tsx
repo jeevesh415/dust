@@ -5,7 +5,10 @@ import { KeyboardShortcutsExtension } from "@app/components/editor/extensions/in
 import { PastedAttachmentExtension } from "@app/components/editor/extensions/input_bar/PastedAttachmentExtension";
 import { URLDetectionExtension } from "@app/components/editor/extensions/input_bar/URLDetectionExtension";
 import { URLStorageExtension } from "@app/components/editor/extensions/input_bar/URLStorageExtension";
-import { MentionExtension } from "@app/components/editor/extensions/MentionExtension";
+import {
+  MentionExtension,
+  type MentionsStrippedPayload,
+} from "@app/components/editor/extensions/MentionExtension";
 import { BlockquoteExtension } from "@app/components/editor/input_bar/BlockquoteExtension";
 import { cleanupPastedHTML } from "@app/components/editor/input_bar/cleanupPastedHTML";
 import { emojiPluginKey } from "@app/components/editor/input_bar/emojiSuggestion";
@@ -72,14 +75,17 @@ const useEditorService = (editor: Editor | null) => {
           .insertContent(" ") // Add an extra space after the mention.
           .run();
       },
-      setContent: (content: string) => {
-        editor
+      setContent: (
+        content: string,
+        { focus = true }: { focus?: boolean } = {}
+      ) => {
+        const chain = editor
           ?.chain()
-          .setContent(content, {
-            contentType: "markdown",
-          })
-          .focus()
-          .run();
+          .setContent(content, { contentType: "markdown" });
+        if (focus) {
+          chain?.focus();
+        }
+        chain?.run();
       },
       resetWithMentions: (
         mentions: RichMention[],
@@ -147,6 +153,24 @@ const useEditorService = (editor: Editor | null) => {
         return editor?.commands.clearContent();
       },
 
+      removeUserMentions(): boolean {
+        if (!editor) {
+          return false;
+        }
+        const { tr } = editor.state;
+        let modified = false;
+        editor.state.doc.descendants((node, pos) => {
+          if (node.type.name === "mention" && node.attrs.type === "user") {
+            tr.delete(tr.mapping.map(pos), tr.mapping.map(pos + node.nodeSize));
+            modified = true;
+          }
+        });
+        if (modified) {
+          editor.view.dispatch(tr);
+        }
+        return modified;
+      },
+
       setLoading(loading: boolean) {
         if (loading) {
           editor?.view.dom.classList.add("loading-text");
@@ -173,6 +197,8 @@ export interface CustomEditorProps {
   disableAutoFocus: boolean;
   disableUserMentions?: boolean;
   onUrlDetected?: (candidate: UrlCandidate | NodeCandidate | null) => void;
+  onAgentSelect?: (mention: RichMention) => void;
+  singleAgentInputEnabled?: boolean;
   owner: WorkspaceType;
   conversationId?: string | null;
   spaceId?: string;
@@ -184,6 +210,16 @@ export interface CustomEditorProps {
   }) => void;
   longTextPasteCharsThreshold?: number;
   onInlineText?: (fileId: string, textContent: string) => void;
+  // When true, agent suggestions are fully disabled (e.g. edit mode).
+  disableAgentMentions?: boolean;
+  // Ref that dynamically controls whether agent suggestions are shown for single agent mode.
+  shouldSuggestAgentRef?: React.RefObject<boolean>;
+  onFirstAgentMentionPasteRef?: React.RefObject<
+    ((agentId: string) => void) | undefined
+  >;
+  onAgentMentionsStrippedRef?: React.RefObject<
+    ((payload: MentionsStrippedPayload) => void) | undefined
+  >;
 }
 
 export const buildEditorExtensions = ({
@@ -191,15 +227,31 @@ export const buildEditorExtensions = ({
   conversationId,
   spaceId,
   disableUserMentions,
+  disableAgentMentions,
   onInlineText,
   onUrlDetected,
+  onAgentSelect,
+  singleAgentInputEnabled,
+  shouldSuggestAgentRef,
+  onFirstAgentMentionPasteRef,
+  onAgentMentionsStrippedRef,
 }: {
   owner: WorkspaceType;
   conversationId?: string | null;
   spaceId?: string;
   disableUserMentions?: boolean;
+  disableAgentMentions?: boolean;
   onInlineText?: (fileId: string, textContent: string) => void;
   onUrlDetected?: (candidate: UrlCandidate | NodeCandidate | null) => void;
+  onAgentSelect?: (mention: RichMention) => void;
+  singleAgentInputEnabled?: boolean;
+  shouldSuggestAgentRef?: React.RefObject<boolean>;
+  onFirstAgentMentionPasteRef?: React.RefObject<
+    ((agentId: string) => void) | undefined
+  >;
+  onAgentMentionsStrippedRef?: React.RefObject<
+    ((payload: MentionsStrippedPayload) => void) | undefined
+  >;
 }) => {
   const extensions = [
     KeyboardShortcutsExtension,
@@ -261,6 +313,8 @@ export const buildEditorExtensions = ({
     }),
     MentionExtension.configure({
       owner,
+      onFirstAgentMentionPasteRef,
+      onAgentMentionsStrippedRef,
       HTMLAttributes: {
         class:
           "min-w-0 px-0 py-0 border-none outline-none focus:outline-none focus:border-none ring-0 focus:ring-0 text-highlight-500 font-semibold",
@@ -270,9 +324,12 @@ export const buildEditorExtensions = ({
         conversationId,
         spaceId,
         select: {
-          agents: true,
+          agents: !disableAgentMentions,
           users: !disableUserMentions,
         },
+        shouldSuggestAgentRef,
+        onAgentSelect,
+        singleAgentInputEnabled,
       }),
     }),
     EmojiExtension,
@@ -281,7 +338,9 @@ export const buildEditorExtensions = ({
         if (node.type.name !== "paragraph") {
           return "";
         }
-        return "Ask an @agent a question, or get some @help";
+        return singleAgentInputEnabled
+          ? "Ask a question"
+          : "Ask an @agent a question, or get some @help";
       },
       emptyNodeClass:
         "first:before:text-gray-400 first:before:content-[attr(data-placeholder)] first:before:pointer-events-none first:before:absolute",
@@ -307,12 +366,18 @@ const useCustomEditor = ({
   disableAutoFocus,
   disableUserMentions,
   onUrlDetected,
+  onAgentSelect,
+  singleAgentInputEnabled,
   owner,
   conversationId,
   spaceId,
   onLongTextPaste,
   longTextPasteCharsThreshold,
   onInlineText,
+  disableAgentMentions,
+  shouldSuggestAgentRef,
+  onFirstAgentMentionPasteRef,
+  onAgentMentionsStrippedRef,
 }: CustomEditorProps) => {
   const editor = useEditor(
     {
@@ -322,8 +387,14 @@ const useCustomEditor = ({
         conversationId,
         spaceId,
         disableUserMentions,
+        disableAgentMentions,
         onInlineText,
         onUrlDetected,
+        onAgentSelect,
+        singleAgentInputEnabled,
+        shouldSuggestAgentRef,
+        onFirstAgentMentionPasteRef,
+        onAgentMentionsStrippedRef,
       }),
       shouldRerenderOnTransaction: true, // necessary to update the editor state (and so the toolbar icons "activation") in real time
       editorProps: {

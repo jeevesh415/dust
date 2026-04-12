@@ -114,7 +114,7 @@ export const FEEDBACK_DISTRIBUTION_LEGEND = [
 
 export type AnalyticsVisibleOrigin = Exclude<
   UserMessageOrigin,
-  "reinforced_agent_notification"
+  "reinforced_agent_notification" | "reinforcement"
 >;
 
 export const USER_MESSAGE_ORIGIN_LABELS: Record<
@@ -152,10 +152,6 @@ export const USER_MESSAGE_ORIGIN_LABELS: Record<
     color: buildColorClass("rose", 300),
   },
   agent_sidekick: { label: "Sidekick", color: buildColorClass("emerald", 300) },
-  project_butler: {
-    label: "Project Butler",
-    color: buildColorClass("gray", 300),
-  },
   project_kickoff: {
     label: "Project Kickoff",
     color: buildColorClass("lime", 300),

@@ -1,6 +1,7 @@
 import { useSearchMembers } from "@app/lib/swr/memberships";
 import type { LightWorkspaceType, UserType } from "@app/types/user";
 import {
+  Avatar,
   createSelectionColumn,
   DataTable,
   SearchInput,
@@ -66,6 +67,7 @@ export function MemberSelectionTable({
     pageIndex: pagination.pageIndex,
     pageSize: pagination.pageSize,
     buildersOnly,
+    disabled: !searchText,
   });
 
   // Internal map to resolve sId -> UserType, seeded with initialMembers and
@@ -81,37 +83,16 @@ export function MemberSelectionTable({
     }
   }
 
-  // Selected members resolved from the internal map, filtered by search text.
-  const selectedRows = useMemo(() => {
-    const selected = Array.from(selectedMemberIds)
-      .map((sId) => userMapRef.current.get(sId))
-      .filter((u): u is UserType => !!u);
-
-    if (!searchText) {
-      return getMemberTableRows(selected);
-    }
-
-    const lower = searchText.toLowerCase();
-    return getMemberTableRows(
-      selected.filter(
-        (u) =>
-          u.fullName.toLowerCase().includes(lower) ||
-          (u.email ?? "").toLowerCase().includes(lower)
-      )
-    );
-  }, [selectedMemberIds, searchText]);
-
-  // On page 0, prepend selected members and remove duplicates from API results.
-  // On other pages, only show unselected API results.
+  // When not searching, show selected members; when searching, show search results.
   const rows = useMemo(() => {
-    const unselected = getMemberTableRows(
-      members.filter((m) => !selectedMemberIds.has(m.sId))
-    );
-    if (pagination.pageIndex === 0) {
-      return [...selectedRows, ...unselected];
+    if (!searchText) {
+      const selectedUsers = Array.from(selectedMemberIds)
+        .map((sId) => userMapRef.current.get(sId))
+        .filter((u): u is UserType => !!u);
+      return getMemberTableRows(selectedUsers);
     }
-    return unselected;
-  }, [members, selectedMemberIds, selectedRows, pagination.pageIndex]);
+    return getMemberTableRows(members);
+  }, [searchText, selectedMemberIds, members]);
 
   const rowSelectionState: RowSelectionState = useMemo(
     () =>
@@ -139,7 +120,9 @@ export function MemberSelectionTable({
 
   const columns: ColumnDef<MemberRowData>[] = useMemo(() => {
     return [
-      createSelectionColumn<MemberRowData>(),
+      createSelectionColumn<MemberRowData>({
+        hideSelectAll: !!searchText && rows.length <= 1,
+      }),
       {
         accessorKey: "fullName",
         header: "Name",
@@ -148,19 +131,26 @@ export function MemberSelectionTable({
         meta: {
           className: "w-full",
         },
-        cell: (info: CellContext<MemberRowData, unknown>) => (
-          <DataTable.CellContent
-            avatarUrl={info.row.original.image}
-            roundedAvatar
-            description={info.row.original.email}
-          >
-            {info.row.original.fullName}
-          </DataTable.CellContent>
-        ),
+        cell: (info: CellContext<MemberRowData, unknown>) => {
+          const { fullName, image, email } = info.row.original;
+          return (
+            <DataTable.CellContent description={email}>
+              <div className="flex items-center gap-2">
+                <Avatar
+                  name={fullName}
+                  visual={image || undefined}
+                  size="xs"
+                  isRounded
+                />
+                <span className="text-sm">{fullName}</span>
+              </div>
+            </DataTable.CellContent>
+          );
+        },
       },
       ...(extraColumns ?? []),
     ];
-  }, [extraColumns]);
+  }, [extraColumns, rows.length, searchText]);
 
   return (
     <>
@@ -184,7 +174,7 @@ export function MemberSelectionTable({
             columns={columns}
             pagination={pagination}
             setPagination={setPagination}
-            totalRowCount={totalMembersCount}
+            totalRowCount={searchText ? totalMembersCount : rows.length}
             rowSelection={rowSelectionState}
             setRowSelection={handleRowSelectionChange}
             enableRowSelection

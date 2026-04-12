@@ -17,6 +17,7 @@ import type { Result } from "@app/types/shared/result";
 import { Err, Ok } from "@app/types/shared/result";
 import { assertNever } from "@app/types/shared/utils/assert_never";
 import { normalizeError } from "@app/types/shared/utils/error_utils";
+import { isString } from "@app/types/shared/utils/general";
 import type { StripePricingData } from "@app/types/stripe/pricing";
 import type {
   LightWorkspaceType,
@@ -148,7 +149,7 @@ export const ENTERPRISE_N30_PAYMENTS_DAYS = 30;
 // At the time of writing, this is only used for Credit Purchase self-serve flow
 export const MAX_PRO_INVOICE_ATTEMPTS_BEFORE_VOIDED = 3;
 
-type SupportedPaymentMethod = (typeof SUPPORTED_PAYMENT_METHODS)[number];
+export type SupportedPaymentMethod = (typeof SUPPORTED_PAYMENT_METHODS)[number];
 
 /**
  * Calls the Stripe API to create a pro plan checkout session for a given workspace.
@@ -157,15 +158,17 @@ type SupportedPaymentMethod = (typeof SUPPORTED_PAYMENT_METHODS)[number];
  * The `auth` role is not checked, because we allow anyone (even if not logged in or not part of the WS)
  * to go through the checkout process.
  */
-export const createProPlanCheckoutSession = async ({
+export const createStripeSubscriptionCheckoutSession = async ({
   allowedPaymentMethods = ["card"],
   billingPeriod,
+  metronomePackageAlias,
   owner,
   planCode,
   user,
 }: {
   allowedPaymentMethods?: SupportedPaymentMethod[];
   billingPeriod: BillingPeriod;
+  metronomePackageAlias?: string;
   owner: WorkspaceType;
   planCode: string;
   user: UserType;
@@ -232,6 +235,7 @@ export const createProPlanCheckoutSession = async ({
     metadata: {
       planCode: planCode,
       userId: `${user.id}`,
+      ...(metronomePackageAlias ? { metronomePackageAlias } : {}),
     },
     line_items: [
       {
@@ -246,6 +250,57 @@ export const createProPlanCheckoutSession = async ({
     automatic_tax: {
       enabled: true,
     },
+    tax_id_collection: {
+      enabled: true,
+    },
+    success_url: `${config.getAppUrl()}/w/${owner.sId}/subscription/payment_processing?type=succeeded&session_id={CHECKOUT_SESSION_ID}&plan_code=${planCode}`,
+    cancel_url: `${config.getAppUrl()}/w/${owner.sId}/subscription?type=cancelled`,
+    consent_collection: {
+      terms_of_service: "required",
+    },
+    custom_text: {
+      terms_of_service_acceptance: {
+        message:
+          "I have read and accept the [Master Services Agreement](https://dust-tt.notion.site/Master-Services-Agreement-2bdcf30156db4a40bcb20d27b0b1bd4e?pvs=4) and [Data Processing Addendum](https://www.notion.so/dust-tt/Data-Processing-Addendum-466528e861e34f08949428e06eecd5f4?pvs=4).",
+      },
+    },
+  });
+
+  return session.url;
+};
+
+/**
+ * Creates a Stripe Checkout session in "setup" mode for Metronome-billed workspaces.
+ * This captures the payment method without creating a Stripe subscription.
+ * After checkout, the webhook provisions a Metronome customer + contract.
+ */
+export const createMetronomeSetupCheckoutSession = async ({
+  allowedPaymentMethods = ["card"],
+  metronomePackageAlias,
+  owner,
+  planCode,
+  user,
+}: {
+  allowedPaymentMethods?: SupportedPaymentMethod[];
+  metronomePackageAlias: string;
+  owner: WorkspaceType;
+  planCode: string;
+  user: UserType;
+}): Promise<string | null> => {
+  const stripe = getStripeClient();
+
+  const session = await stripe.checkout.sessions.create({
+    mode: "setup",
+    client_reference_id: owner.sId,
+    customer_email: user.email,
+    customer_creation: "always",
+    payment_method_types: allowedPaymentMethods,
+    metadata: {
+      planCode,
+      userId: `${user.id}`,
+      metronomePackageAlias,
+    },
+    billing_address_collection: "auto",
     tax_id_collection: {
       enabled: true,
     },
@@ -489,11 +544,10 @@ export async function cancelSubscriptionAtPeriodEnd({
 }
 
 /**
- * Upgrades a Pro subscription to Business by swapping the Stripe product/price.
- * Always uses monthly billing for Business plan regardless of the original billing period.
- * Also updates the subscription metadata to reflect the new plan code.
+ * Creates a new Stripe Business subscription for upgrading Pro → Business.
+ * The old subscription is cancelled separately after the DB flip.
  */
-export async function upgradeProSubscriptionToBusiness({
+export async function createStripeBusinessSubscription({
   stripeSubscriptionId,
   owner,
   planCode,
@@ -501,12 +555,13 @@ export async function upgradeProSubscriptionToBusiness({
   stripeSubscriptionId: string;
   owner: WorkspaceType;
   planCode: string;
-}): Promise<Result<Stripe.Subscription, Error>> {
+}): Promise<Result<{ stripeSubscriptionId: string }, Error>> {
   const stripe = getStripeClient();
 
-  const subscription = await getStripeSubscription(stripeSubscriptionId);
-  if (!subscription) {
-    return new Err(new Error("Subscription not found"));
+  const existingSubscription =
+    await getStripeSubscription(stripeSubscriptionId);
+  if (!existingSubscription) {
+    return new Err(new Error("Existing subscription not found"));
   }
 
   const businessProductId = getBusinessProPlanProductId();
@@ -514,36 +569,38 @@ export async function upgradeProSubscriptionToBusiness({
     businessProductId,
     "IS_DEFAULT_MONHTLY_PRICE"
   );
-
   if (!newPriceId) {
     return new Err(new Error("Business monthly price not found"));
   }
 
-  const currentItem = subscription.items.data[0];
-  if (!currentItem) {
-    return new Err(new Error("Subscription has no items"));
+  const defaultPaymentMethodId =
+    getDefaultPaymentMethodId(existingSubscription);
+
+  if (!defaultPaymentMethodId) {
+    return new Err(
+      new Error("Existing subscription has no default payment method")
+    );
   }
 
-  // Update the subscription with the new price and metadata.
-  // Proration will handle billing adjustment.
-  const updatedSubscription = await stripe.subscriptions.update(
-    stripeSubscriptionId,
-    {
-      items: [
-        {
-          id: currentItem.id,
-          price: newPriceId,
-        },
-      ],
-      proration_behavior: "create_prorations",
-      metadata: {
-        planCode,
-        workspaceId: owner.sId,
-      },
-    }
+  const quantity = await MembershipResource.countActiveSeatsInWorkspace(
+    owner.sId
   );
 
-  return new Ok(updatedSubscription);
+  const newSubscription = await stripe.subscriptions.create({
+    customer: getCustomerId(existingSubscription),
+    currency: existingSubscription.currency,
+    items: [{ price: newPriceId, quantity }],
+    default_payment_method: defaultPaymentMethodId,
+    automatic_tax: {
+      enabled: existingSubscription.automatic_tax.enabled,
+    },
+    metadata: {
+      planCode,
+      workspaceId: owner.sId,
+    },
+  });
+
+  return new Ok({ stripeSubscriptionId: newSubscription.id });
 }
 
 /**
@@ -604,6 +661,14 @@ export function getCustomerId(subscription: Stripe.Subscription): string {
   return typeof subscription.customer === "string"
     ? subscription.customer
     : subscription.customer.id;
+}
+
+export function getDefaultPaymentMethodId(
+  subscription: Stripe.Subscription
+): string | null {
+  return isString(subscription.default_payment_method)
+    ? subscription.default_payment_method
+    : (subscription.default_payment_method?.id ?? null);
 }
 
 /**

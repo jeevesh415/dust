@@ -1,5 +1,8 @@
 import type { AgentMessageFeedbackDirection } from "@app/lib/api/assistant/conversation/feedbacks";
-import { formatConversationForShrinkWrap } from "@app/lib/api/assistant/conversation/shrink_wrap";
+import {
+  formatConversationForShrinkWrap,
+  type ShrinkWrapAction,
+} from "@app/lib/api/assistant/conversation/shrink_wrap";
 import {
   formatAvailableSkills,
   formatAvailableTools,
@@ -56,7 +59,7 @@ export function mockSkill(
     userFacingDescription: description,
     agentFacingDescription: description,
     icon: null,
-    toolSIds: [],
+    toolIds: [],
   };
 }
 
@@ -64,7 +67,10 @@ export function mockSkill(
 export function buildToolsAndSkillsContextFromWorkspace(
   ctx: WorkspaceContext
 ): string {
-  return [formatAvailableSkills(ctx.skills), formatAvailableTools(ctx.tools)]
+  return [
+    formatAvailableSkills(ctx.skills, ctx.tools),
+    formatAvailableTools(ctx.tools),
+  ]
     .filter(Boolean)
     .join("\n\n");
 }
@@ -74,10 +80,19 @@ export interface MockFeedback {
   comment?: string;
 }
 
+/** Lightweight action descriptor for mock conversations. */
+export interface MockAction {
+  functionCallName: string;
+  status: "succeeded" | "failed";
+  params?: Record<string, unknown>;
+  output?: string | null;
+}
+
 export interface MockConversationMessage {
   role: "user" | "agent";
   content: string;
   feedback?: MockFeedback;
+  actions?: MockAction[];
 }
 
 /**
@@ -117,6 +132,14 @@ export function buildConversationText(
       ]);
     }
 
+    const actions: ShrinkWrapAction[] = (msg.actions ?? []).map((a) => ({
+      functionCallName: a.functionCallName,
+      status: a.status,
+      internalMCPServerName: null,
+      params: a.params ?? {},
+      output: a.output ?? null,
+    }));
+
     return {
       type: "agent_message" as const,
       sId,
@@ -124,14 +147,14 @@ export function buildConversationText(
       content: msg.content,
       status: "succeeded",
       configuration: { sId: agentConfigSId, name: "Agent" },
-      actions: [],
+      actions,
       parentAgentMessageId: null,
     };
   });
 
   return formatConversationForShrinkWrap(
     { sId: "conv_eval", title: "Eval conversation", messages: shrinkMessages },
-    { feedbackByMessageId }
+    { feedbackByMessageId, includeActionDetails: true }
   );
 }
 
@@ -147,7 +170,7 @@ export interface MockAgentConfig {
 
 interface BaseTestCase {
   scenarioId: string;
-  expectedToolCalls?: string[];
+  expectedToolCalls?: ToolCallAssertion[];
   judgeCriteria: string;
   agentConfig: MockAgentConfig;
   workspaceContext: WorkspaceContext;
@@ -214,6 +237,33 @@ export interface TestSuite {
 export interface ToolCall {
   name: string;
   arguments: Record<string, unknown>;
+}
+
+export type ToolCallAssertion =
+  | { type: "toolSuggestion"; toolId: string }
+  | { type: "skillSuggestion"; skillId: string }
+  | { type: "promptSuggestion"; targetBlockIds?: string[] }
+  | { type: "noSuggestion" };
+
+export function toolSuggestion(toolId: string): ToolCallAssertion {
+  return { type: "toolSuggestion", toolId };
+}
+
+export function skillSuggestion(skillId: string): ToolCallAssertion {
+  return { type: "skillSuggestion", skillId };
+}
+
+export function promptSuggestion(
+  ...targetBlockIds: string[]
+): ToolCallAssertion {
+  return {
+    type: "promptSuggestion",
+    targetBlockIds: targetBlockIds.length > 0 ? targetBlockIds : undefined,
+  };
+}
+
+export function noSuggestion(): ToolCallAssertion {
+  return { type: "noSuggestion" };
 }
 
 export interface JudgeResult {

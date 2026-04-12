@@ -1,7 +1,6 @@
 import { runPokeWorker } from "@app/poke/temporal/worker";
 import { runAgentLoopWorker } from "@app/temporal/agent_loop/worker";
 import { runAnalyticsWorker } from "@app/temporal/analytics_queue/worker";
-import { runButlerWorker } from "@app/temporal/butler/worker";
 import { runCreditAlertsWorker } from "@app/temporal/credit_alerts/worker";
 import { runDataRetentionWorker } from "@app/temporal/data_retention/worker";
 import { runESIndexationQueueWorker } from "@app/temporal/es_indexation/worker";
@@ -11,8 +10,10 @@ import { runMentionsCountWorker } from "@app/temporal/mentions_count_queue/worke
 import { runMentionsQueueWorker } from "@app/temporal/mentions_queue/worker";
 import { runNotificationsQueueWorker } from "@app/temporal/notifications_queue/worker";
 import { runProductionChecksWorker } from "@app/temporal/production_checks/worker";
+import { runProjectTodoWorker } from "@app/temporal/project_todo/worker";
 import { runUserProjectDigestQueueWorker } from "@app/temporal/project_user_digest_queue/worker";
 import { runReinforcedAgentWorker } from "@app/temporal/reinforced_agent/worker";
+import { runReinforcedSkillsWorker } from "@app/temporal/reinforcement/worker";
 import { runRelocationWorker } from "@app/temporal/relocation/worker";
 import { runRemoteToolsSyncWorker } from "@app/temporal/remote_tools/worker";
 import { runSandboxReaperWorker } from "@app/temporal/sandbox_reaper/worker";
@@ -29,7 +30,7 @@ export type WorkerName =
   | "agent_schedule"
   | "agent_trigger_webhook"
   | "analytics_queue"
-  | "butler"
+  | "project_todo"
   | "credit_alerts"
   | "data_retention"
   | "es_indexation_queue"
@@ -41,6 +42,7 @@ export type WorkerName =
   | "poke"
   | "production_checks"
   | "reinforced_agent"
+  | "reinforcement"
   | "project_user_digest_queue"
   | "relocation"
   | "sandbox_reaper"
@@ -56,7 +58,6 @@ export const workerFunctions: Record<WorkerName, () => Promise<void>> = {
   agent_schedule: runAgentTriggerWorker,
   agent_trigger_webhook: runAgentTriggerWebhookWorker,
   analytics_queue: runAnalyticsWorker,
-  butler: runButlerWorker,
   credit_alerts: runCreditAlertsWorker,
   data_retention: runDataRetentionWorker,
   hard_delete: runHardDeleteWorker,
@@ -67,7 +68,9 @@ export const workerFunctions: Record<WorkerName, () => Promise<void>> = {
   poke: runPokeWorker,
   production_checks: runProductionChecksWorker,
   reinforced_agent: runReinforcedAgentWorker,
+  reinforcement: runReinforcedSkillsWorker,
   project_user_digest_queue: runUserProjectDigestQueueWorker,
+  project_todo: runProjectTodoWorker,
   relocation: runRelocationWorker,
   sandbox_reaper: runSandboxReaperWorker,
   remote_tools_sync: runRemoteToolsSyncWorker,

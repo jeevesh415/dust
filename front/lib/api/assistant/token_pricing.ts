@@ -1,4 +1,3 @@
-import type { RunUsageType } from "@app/lib/resources/run_resource";
 import type {
   ImageModelIdType,
   StaticModelIdType,
@@ -227,6 +226,11 @@ const CURRENT_MODEL_PRICING: Record<StaticModelIdType, PricingEntry> = {
     input: 0.075,
     output: 0.3,
   },
+  "gemini-3.1-flash-lite-preview": {
+    input: 0.25,
+    output: 1.5,
+    cache_read_input_tokens: 0.025,
+  },
   "gemini-2.5-pro": {
     input: 1.25,
     output: 15.0,
@@ -337,6 +341,16 @@ const IMAGE_MODEL_PRICING: Record<string, PricingEntry> = {
   "gemini-3-pro-image-preview": {
     input: 20.0,
     output: 120.0,
+  },
+  // https://ai.google.dev/gemini-api/docs/pricing
+  "gemini-3.1-flash-image-preview": {
+    input: 0.25,
+    output: 60.0,
+  },
+  // https://platform.openai.com/docs/pricing
+  "gpt-image-1.5": {
+    input: 8.0,
+    output: 32.0,
   },
 };
 
@@ -498,6 +512,9 @@ const DEFAULT_PRICING_MODEL_ID: StaticModelIdType = "gpt-4o";
 
 const DEFAULT_PRICING = MODEL_PRICING[DEFAULT_PRICING_MODEL_ID];
 
+// This discount factor applies to OpenAi, Anthropic, Google and Mistral
+const BATCH_DISCOUNT_FACTOR = 0.5;
+
 /**
  * Calculate the cost in micro USD for token usage.
  * Note: promptTokens currently includes cached read and cache write tokens for some providers.
@@ -509,12 +526,14 @@ export function computeTokensCostForUsageInMicroUsd({
   completionTokens,
   cachedTokens,
   cacheCreationTokens,
+  isBatch = false,
 }: {
   modelId: ModelIdType | ImageModelIdType;
   promptTokens: number;
   completionTokens: number;
   cachedTokens: number | null;
   cacheCreationTokens?: number | null;
+  isBatch?: boolean;
 }): number {
   const pricing = MODEL_PRICING[modelId] ?? DEFAULT_PRICING;
 
@@ -529,14 +548,7 @@ export function computeTokensCostForUsageInMicroUsd({
   const cacheWriteDelta = cacheWriteTokens * (cacheWriteRate - pricing.input);
   const outputCost = completionTokens * pricing.output;
 
-  return basePromptCost + cachedReadDelta + cacheWriteDelta + outputCost;
-}
+  const cost = basePromptCost + cachedReadDelta + cacheWriteDelta + outputCost;
 
-export function calculateTokenUsageCostInMicroUsd(
-  usages: RunUsageType[]
-): number {
-  return usages.reduce(
-    (acc, usage) => acc + computeTokensCostForUsageInMicroUsd(usage),
-    0
-  );
+  return isBatch ? Math.round(cost * BATCH_DISCOUNT_FACTOR) : cost;
 }

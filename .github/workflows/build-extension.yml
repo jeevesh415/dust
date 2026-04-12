@@ -18,11 +18,11 @@ jobs:
   tsgo:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Setup Node Dependencies
         uses: ./.github/actions/setup-node-deps
         with:
-          node-version: "22.22.0"
+          node-version: "24.14.0"
           build-sdks: "true"
           build-sparkle: "true"
       - name: Typecheck

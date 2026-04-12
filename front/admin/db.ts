@@ -25,6 +25,7 @@ import { AgentSuggestionModel } from "@app/lib/models/agent/agent_suggestion";
 import {
   AgentMessageFeedbackModel,
   AgentMessageModel,
+  CompactionMessageModel,
   ConversationModel,
   ConversationParticipantModel,
   MentionModel,
@@ -34,6 +35,7 @@ import {
   UserMessageModel,
 } from "@app/lib/models/agent/conversation";
 import { ConversationBranchModel } from "@app/lib/models/agent/conversation_branch";
+import { ConversationForkModel } from "@app/lib/models/agent/conversation_fork";
 import { GroupAgentModel } from "@app/lib/models/agent/group_agent";
 import { TagAgentModel } from "@app/lib/models/agent/tag_agent";
 import { TriggerSubscriberModel } from "@app/lib/models/agent/triggers/trigger_subscriber";
@@ -45,6 +47,7 @@ import { WebhookSourcesViewModel } from "@app/lib/models/agent/triggers/webhook_
 import { DustAppSecretModel } from "@app/lib/models/dust_app_secret";
 import { ExtensionConfigurationModel } from "@app/lib/models/extension";
 import { FeatureFlagModel } from "@app/lib/models/feature_flag";
+import { GlobalFeatureFlagModel } from "@app/lib/models/global_feature_flag";
 import { MembershipInvitationModel } from "@app/lib/models/membership_invitation";
 import { PlanModel, SubscriptionModel } from "@app/lib/models/plan";
 import { ProviderCredentialModel } from "@app/lib/models/provider_credential";
@@ -60,6 +63,7 @@ import {
   ConversationSkillModel,
 } from "@app/lib/models/skill/conversation_skill";
 import { GroupSkillModel } from "@app/lib/models/skill/group_skill";
+import { SkillSuggestionModel } from "@app/lib/models/skill/skill_suggestion";
 import { TagModel } from "@app/lib/models/tags";
 import { AcademyChapterVisitModel } from "@app/lib/resources/storage/models/academy_chapter_visit";
 import { AcademyQuizAttemptModel } from "@app/lib/resources/storage/models/academy_quiz_attempt";
@@ -71,13 +75,14 @@ import {
   ProviderModel,
 } from "@app/lib/resources/storage/models/apps";
 import { ContentFragmentModel } from "@app/lib/resources/storage/models/content_fragment";
-import { ConversationButlerSuggestionModel } from "@app/lib/resources/storage/models/conversation_butler_suggestion";
 import { CreditModel } from "@app/lib/resources/storage/models/credits";
 import { DataSourceModel } from "@app/lib/resources/storage/models/data_source";
 import { DataSourceViewModel } from "@app/lib/resources/storage/models/data_source_view";
 import {
+  ExternalViewerSessionModel,
   FileModel,
   ShareableFileModel,
+  SharingGrantModel,
 } from "@app/lib/resources/storage/models/files";
 import { GroupMembershipModel } from "@app/lib/resources/storage/models/group_memberships";
 import { GroupSpaceModel } from "@app/lib/resources/storage/models/group_spaces";
@@ -95,11 +100,22 @@ import { PluginRunModel } from "@app/lib/resources/storage/models/plugin_runs";
 import { ProgrammaticUsageConfigurationModel } from "@app/lib/resources/storage/models/programmatic_usage_configurations";
 import { ProjectMetadataModel } from "@app/lib/resources/storage/models/project_metadata";
 import {
+  ProjectTodoConversationModel,
+  ProjectTodoModel,
+  ProjectTodoSourceModel,
+} from "@app/lib/resources/storage/models/project_todo";
+import { ProjectTodoStateModel } from "@app/lib/resources/storage/models/project_todo_state";
+import { ProjectTodoTakeawaySourcesModel } from "@app/lib/resources/storage/models/project_todo_takeaway_sources";
+import {
   RunModel,
   RunUsageModel,
 } from "@app/lib/resources/storage/models/runs";
 import { SandboxModel } from "@app/lib/resources/storage/models/sandbox";
 import { SpaceModel } from "@app/lib/resources/storage/models/spaces";
+import {
+  TakeawaySourcesModel,
+  TakeawaysModel,
+} from "@app/lib/resources/storage/models/takeaways";
 import { TemplateModel } from "@app/lib/resources/storage/models/templates";
 import {
   UserMetadataModel,
@@ -115,7 +131,7 @@ import { sendInitDbMessage } from "@app/types/shared/deployment";
 
 /**
  * Loads all Sequelize models, useful for some tests
- * ⚠️ Order matters here.
+ * /!\ Order matters here.
  */
 export function loadAllModels() {
   return [
@@ -137,6 +153,8 @@ export function loadAllModels() {
     KeyModel,
     FileModel,
     ShareableFileModel,
+    SharingGrantModel,
+    ExternalViewerSessionModel,
     DustAppSecretModel,
     GroupSpaceModel,
     WebhookSourceModel,
@@ -178,6 +196,7 @@ export function loadAllModels() {
     AgentMessageModel,
     AgentMessageFeedbackModel,
     ContentFragmentModel,
+    CompactionMessageModel,
     MessageModel,
     MessageReactionModel,
     MentionModel,
@@ -187,6 +206,7 @@ export function loadAllModels() {
     AgentMCPActionOutputItemModel,
     AgentChildAgentConfigurationModel,
     FeatureFlagModel,
+    GlobalFeatureFlagModel,
     KillSwitchModel,
     LabsTranscriptsConfigurationModel,
     LabsTranscriptsHistoryModel,
@@ -203,14 +223,22 @@ export function loadAllModels() {
     AgentMessageSkillModel,
     SkillMCPServerConfigurationModel,
     SkillFileAttachmentModel,
+    SkillSuggestionModel,
     WorkspaceVerificationAttemptModel,
     AgentSuggestionModel,
     UserProjectDigestModel,
     AcademyQuizAttemptModel,
     AcademyChapterVisitModel,
     SandboxModel,
-    ConversationButlerSuggestionModel,
     ConversationBranchModel,
+    ConversationForkModel,
+    ProjectTodoModel,
+    ProjectTodoConversationModel,
+    ProjectTodoSourceModel,
+    ProjectTodoStateModel,
+    TakeawaysModel,
+    TakeawaySourcesModel,
+    ProjectTodoTakeawaySourcesModel,
   ];
 }
 

@@ -169,6 +169,24 @@ export class RunResource extends BaseResource<RunModel> {
     return runs.map((r) => new this(this.model, r.get()));
   }
 
+  static async fetchByDustRunId(
+    auth: Authenticator,
+    { dustRunId }: { dustRunId: string }
+  ): Promise<RunResource | null> {
+    const run = await this.model.findOne({
+      where: {
+        dustRunId,
+        workspaceId: auth.getNonNullableWorkspace().id,
+      },
+    });
+
+    if (!run) {
+      return null;
+    }
+
+    return new this(this.model, run.get());
+  }
+
   static async countByAppAndRunType(
     workspace: LightWorkspaceType,
     { appId, runType }: { appId: ModelId; runType: string | string[] }
@@ -270,6 +288,7 @@ export class RunResource extends BaseResource<RunModel> {
           cachedTokens,
           cacheCreationTokens,
           costMicroUsd,
+          isBatch,
         }) => ({
           runId: this.id,
           workspaceId: this.workspaceId,
@@ -280,6 +299,7 @@ export class RunResource extends BaseResource<RunModel> {
           cachedTokens,
           cacheCreationTokens: cacheCreationTokens ?? null,
           costMicroUsd,
+          isBatch,
         })
       )
     );
@@ -327,7 +347,8 @@ export class RunResource extends BaseResource<RunModel> {
   async recordTokenUsage(
     auth: Authenticator,
     usage: TokenUsage,
-    modelId: ModelIdType
+    modelId: ModelIdType,
+    { isBatch = false }: { isBatch?: boolean } = {}
   ) {
     const modelConfig = getModelConfigByModelId(modelId);
 
@@ -342,6 +363,7 @@ export class RunResource extends BaseResource<RunModel> {
       completionTokens: usage.outputTokens,
       cachedTokens: usage.cachedTokens ?? null,
       cacheCreationTokens: usage.cacheCreationTokens ?? null,
+      isBatch,
     });
 
     return this.recordRunUsage(auth, [
@@ -353,6 +375,7 @@ export class RunResource extends BaseResource<RunModel> {
         promptTokens: usage.inputTokens,
         providerId: modelConfig.providerId,
         costMicroUsd: usageCostMicroUsd,
+        isBatch,
       },
     ]);
   }
@@ -373,6 +396,7 @@ export class RunResource extends BaseResource<RunModel> {
       cachedTokens: usage.cachedTokens,
       cacheCreationTokens: usage.cacheCreationTokens,
       costMicroUsd: usage.costMicroUsd,
+      isBatch: usage.isBatch,
     }));
   }
 }
@@ -395,4 +419,5 @@ export interface RunUsageType {
   // Optional: tokens spent writing to cache (e.g., Anthropic cache creation)
   cacheCreationTokens?: number | null;
   costMicroUsd: number;
+  isBatch: boolean;
 }

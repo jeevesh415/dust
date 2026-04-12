@@ -1,3 +1,4 @@
+import type { AgentMessageWithStreaming } from "@app/components/assistant/conversation/types";
 import { useHashParam } from "@app/hooks/useHashParams";
 import type { ConversationSidePanelType } from "@app/types/conversation_side_panel";
 import {
@@ -15,6 +16,7 @@ type OpenPanelParams =
   | {
       type: "actions";
       messageId: string;
+      actionId?: string;
     }
   | {
       type: "interactive_content";
@@ -37,10 +39,12 @@ interface ConversationSidePanelContextType {
   onPanelClosed: () => void;
   setPanelRef: (ref: ImperativePanelHandle | null) => void;
   panelRef: React.MutableRefObject<ImperativePanelHandle | null>;
+  setVirtuosoMsg: (msg: AgentMessageWithStreaming) => void;
+  virtuosoMsg: AgentMessageWithStreaming | null;
   data: string | undefined;
 }
 
-const ConversationSidePanelContext = React.createContext<
+export const ConversationSidePanelContext = React.createContext<
   ConversationSidePanelContextType | undefined
 >(undefined);
 
@@ -53,6 +57,20 @@ export function useConversationSidePanelContext() {
   }
 
   return context;
+}
+
+export function parseDataAsMessageIdAndActionId(data?: string): {
+  messageId?: string;
+  actionId?: string;
+} {
+  // data can be "messageId" or "messageId@actionId" for single-action view.
+  // TODO: Clean up once inline activity is rolled out -- the single-action view
+  // should fetch only the action it needs, not the full message.
+  const [messageId, actionId] = data?.includes("@")
+    ? data.split("@")
+    : [data, undefined];
+
+  return { messageId, actionId };
 }
 
 interface ConversationSidePanelProviderProps {
@@ -68,7 +86,8 @@ export function ConversationSidePanelProvider({
   );
 
   const panelRef = React.useRef<ImperativePanelHandle | null>(null);
-
+  const [virtuosoMsg, setVirtuosoMsg] =
+    React.useState<AgentMessageWithStreaming | null>(null);
   // biome-ignore lint/correctness/useExhaustiveDependencies: ignored using `--suppress`
   const setPanelRef = useCallback(
     (ref: ImperativePanelHandle | null) => {
@@ -100,16 +119,20 @@ export function ConversationSidePanelProvider({
 
       switch (params.type) {
         case AGENT_ACTIONS_SIDE_PANEL_TYPE: {
+          const newData = params.actionId
+            ? `${params.messageId}@${params.actionId}`
+            : params.messageId;
+
           /**
-           * If the panel is already open for the same messageId,
+           * If the panel is already open for the same data,
            * we close it.
            */
-          if (params.messageId === data) {
+          if (newData === data) {
             closePanel();
             return;
           }
 
-          setData(params.messageId);
+          setData(newData);
           break;
         }
 
@@ -155,9 +178,19 @@ export function ConversationSidePanelProvider({
       onPanelClosed,
       setPanelRef,
       panelRef,
+      setVirtuosoMsg,
+      virtuosoMsg,
       data,
     }),
-    [currentPanel, openPanel, closePanel, onPanelClosed, setPanelRef, data]
+    [
+      currentPanel,
+      openPanel,
+      closePanel,
+      onPanelClosed,
+      setPanelRef,
+      virtuosoMsg,
+      data,
+    ]
   );
 
   return (

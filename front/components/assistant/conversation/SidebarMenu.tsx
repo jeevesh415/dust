@@ -27,22 +27,20 @@ import { useActiveConversationId } from "@app/hooks/useActiveConversationId";
 import { useActiveSpaceId } from "@app/hooks/useActiveSpaceId";
 import { useDeleteConversation } from "@app/hooks/useDeleteConversation";
 import { useHideTriggeredConversations } from "@app/hooks/useHideTriggeredConversations";
-import type { InboxNotification } from "@app/hooks/useInboxNotifications";
-import { useInboxNotifications } from "@app/hooks/useInboxNotifications";
 import { useMarkAllConversationsAsRead } from "@app/hooks/useMarkAllConversationsAsRead";
 import { useMoveConversationToProject } from "@app/hooks/useMoveConversationToProject";
 import { useSendNotification } from "@app/hooks/useNotification";
-import { useNotificationClickHandler } from "@app/hooks/useNotificationClickHandler";
 import { useProjectsSectionCollapsed } from "@app/hooks/useProjectsSectionCollapsed";
 import { useSearchProjects } from "@app/hooks/useSearchProjects";
 import { useYAMLUpload } from "@app/hooks/useYAMLUpload";
-import { useFeatureFlags } from "@app/lib/auth/AuthContext";
+import { useAuth, useFeatureFlags } from "@app/lib/auth/AuthContext";
 import { CONVERSATIONS_UPDATED_EVENT } from "@app/lib/notifications/events";
 import { useAppRouter } from "@app/lib/platform";
 import { SKILL_ICON } from "@app/lib/skill";
 import { getSpaceIcon } from "@app/lib/spaces";
 import { useUnifiedAgentConfigurations } from "@app/lib/swr/assistants";
 import { TRACKING_AREAS, withTracking } from "@app/lib/tracking";
+import { hasHealthyProviders } from "@app/lib/utils/providersHealth";
 import {
   getAgentBuilderRoute,
   getConversationRoute,
@@ -318,13 +316,6 @@ function SearchResults({
           defaultOpen
           action={
             <>
-              <Button
-                size="xmini"
-                icon={ChatBubbleBottomCenterPlusIcon}
-                variant="ghost"
-                tooltip="New Conversation"
-                href={getConversationRoute(owner.sId)}
-              />
               <DropdownMenu modal={false}>
                 <DropdownMenuTrigger asChild>
                   <Button
@@ -338,7 +329,7 @@ function SearchResults({
                     }}
                   />
                 </DropdownMenuTrigger>
-                <DropdownMenuContent>
+                <DropdownMenuContent onFocusOutside={(e) => e.preventDefault()}>
                   <DropdownMenuLabel label="Conversations" />
                   <DropdownMenuItem
                     label={
@@ -409,6 +400,9 @@ export function AgentSidebarMenu({
   const { hasFeature } = useFeatureFlags();
   const moveConversationToProject = useMoveConversationToProject(owner);
 
+  const { providersHealth } = useAuth();
+  const noHealthyProviders = !hasHealthyProviders(providersHealth);
+
   const agentsSearchInputRef = useRef<HTMLInputElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [searchText, setSearchText] = useState("");
@@ -430,12 +424,6 @@ export function AgentSidebarMenu({
   );
 
   const { setSidebarOpen } = useContext(SidebarContext);
-
-  const { notifications: inboxNotifications, markAsRead } =
-    useInboxNotifications();
-
-  const { handleNotificationClick, loadingNotificationId } =
-    useNotificationClickHandler({ owner, markAsRead });
 
   const {
     conversations,
@@ -673,12 +661,26 @@ export function AgentSidebarMenu({
     const projectCountInSummary = summary.length;
     const showCount = isProjectsSectionCollapsed && projectCountInSummary > 0;
 
+    const VISIBLE_PROJECTS = 4;
+    const hiddenSummary = summary.slice(VISIBLE_PROJECTS);
+    const hiddenOverflowCount = hiddenSummary.reduce(
+      (sum, s) => sum + s.unreadConversations.length,
+      0
+    );
+    const hiddenOverflowHasActivity = hiddenSummary.some(
+      (s) =>
+        s.unreadConversations.length > 0 ||
+        s.nonParticipantUnreadConversations.length > 0
+    );
+
     return (
       <NavigationList className="px-2">
         <NavigationListCollapsibleSection
           label={showCount ? `Projects (${projectCountInSummary})` : "Projects"}
           type="collapse"
-          visibleItems={4}
+          visibleItems={VISIBLE_PROJECTS}
+          overflowCount={hiddenOverflowCount}
+          overflowHasActivity={hiddenOverflowHasActivity}
           open={!isProjectsSectionCollapsed}
           onOpenChange={(open) => setProjectsSectionCollapsed(!open)}
           action={
@@ -753,9 +755,6 @@ export function AgentSidebarMenu({
         hasMore={hasMore}
         loadMore={loadMore}
         isLoadingMore={isLoadingMore}
-        inboxNotifications={inboxNotifications}
-        onNotificationClick={handleNotificationClick}
-        loadingNotificationId={loadingNotificationId}
       />
     );
   }, [
@@ -776,9 +775,6 @@ export function AgentSidebarMenu({
     hasMore,
     loadMore,
     isLoadingMore,
-    inboxNotifications,
-    handleNotificationClick,
-    loadingNotificationId,
   ]);
 
   return (
@@ -864,6 +860,7 @@ export function AgentSidebarMenu({
                               <DropdownMenuSubTrigger
                                 icon={PlusIcon}
                                 label="New agent"
+                                disabled={noHealthyProviders}
                               />
                               <DropdownMenuPortal>
                                 <DropdownMenuSubContent className="pointer-events-auto">
@@ -921,6 +918,7 @@ export function AgentSidebarMenu({
                                 <DropdownMenuSubTrigger
                                   icon={PencilSquareIcon}
                                   label="Edit agent"
+                                  disabled={noHealthyProviders}
                                 />
                                 <DropdownMenuPortal>
                                   <DropdownMenuSubContent className="pointer-events-auto">
@@ -1098,17 +1096,10 @@ const ConversationListContainer = ({
 };
 
 interface InboxSectionProps
-  extends Omit<InboxConversationListProps, "dateLabel"> {
-  inboxNotifications: InboxNotification[];
-  onNotificationClick: (notification: InboxNotification) => Promise<void>;
-  loadingNotificationId: string | null;
-}
+  extends Omit<InboxConversationListProps, "dateLabel"> {}
 
 function InboxSection({
   inboxConversations,
-  inboxNotifications,
-  onNotificationClick,
-  loadingNotificationId,
   isMultiSelect,
   isMarkingAllAsRead,
   titleFilter,
@@ -1118,7 +1109,7 @@ function InboxSection({
   activeConversationId,
   owner,
 }: InboxSectionProps) {
-  const totalCount = inboxConversations.length + inboxNotifications.length;
+  const totalCount = inboxConversations.length;
 
   const shouldShowMarkAllAsReadButton =
     totalCount > 0 && titleFilter.length === 0 && !isMultiSelect;
@@ -1144,18 +1135,6 @@ function InboxSection({
         ) : null
       }
     >
-      {inboxNotifications.map((notification) => (
-        <NavigationListItem
-          key={notification.id}
-          status="unread"
-          icon={RobotIcon}
-          label={notification.subject ?? "New notification"}
-          onClick={() => void onNotificationClick(notification)}
-          className={cn(
-            loadingNotificationId === notification.id && "opacity-50"
-          )}
-        />
-      ))}
       {inboxConversations.map((conversation) => (
         <ConversationListItem
           key={conversation.sId}
@@ -1352,9 +1331,6 @@ interface NavigationListWithInboxProps {
   hasMore: boolean;
   loadMore: () => void;
   isLoadingMore: boolean;
-  inboxNotifications: InboxNotification[];
-  onNotificationClick: (notification: InboxNotification) => Promise<void>;
-  loadingNotificationId: string | null;
 }
 
 function NavigationListWithInbox({
@@ -1375,9 +1351,6 @@ function NavigationListWithInbox({
   hasMore,
   loadMore,
   isLoadingMore,
-  inboxNotifications,
-  onNotificationClick,
-  loadingNotificationId,
 }: NavigationListWithInboxProps) {
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const { readConversations, inboxConversations } = useMemo(() => {
@@ -1431,12 +1404,9 @@ function NavigationListWithInbox({
       ref={scrollContainerRef}
       className="dd-privacy-mask h-full w-full overflow-y-auto"
     >
-      {(inboxConversations.length > 0 || inboxNotifications.length > 0) && (
+      {inboxConversations.length > 0 && (
         <InboxSection
           inboxConversations={inboxConversations}
-          inboxNotifications={inboxNotifications}
-          onNotificationClick={onNotificationClick}
-          loadingNotificationId={loadingNotificationId}
           isMultiSelect={isMultiSelect}
           isMarkingAllAsRead={isMarkingAllAsRead}
           titleFilter={titleFilter}
@@ -1454,15 +1424,6 @@ function NavigationListWithInbox({
           defaultOpen
           action={
             <>
-              <Button
-                size="xmini"
-                icon={ChatBubbleBottomCenterPlusIcon}
-                variant="ghost"
-                aria-label="New Conversation"
-                tooltip="New Conversation"
-                href={getConversationRoute(owner.sId)}
-                onClick={handleNewClick}
-              />
               <DropdownMenu modal={false}>
                 <DropdownMenuTrigger asChild>
                   <Button
@@ -1476,7 +1437,7 @@ function NavigationListWithInbox({
                     }}
                   />
                 </DropdownMenuTrigger>
-                <DropdownMenuContent>
+                <DropdownMenuContent onFocusOutside={(e) => e.preventDefault()}>
                   <DropdownMenuLabel label="Conversations" />
                   <DropdownMenuItem
                     label={

@@ -19,11 +19,7 @@ const UserMessageOriginSchema = t.union([
 ]);
 
 export const MessageBaseSchema = t.type({
-  content: t.refinement(
-    t.string,
-    (s): s is string => s.length > 0,
-    "NonEmptyString"
-  ),
+  content: t.string,
   mentions: t.array(t.union([AgentMentionSchema, UserMentionSchema])),
   context: t.intersection([
     t.type({
@@ -229,13 +225,6 @@ export const InternalPostBuilderSuggestionsRequestBodySchema = t.union([
   t.type({
     type: t.literal("emoji"),
     inputs: t.type({ instructions: t.string }),
-  }),
-  t.type({
-    type: t.literal("instructions"),
-    inputs: t.type({
-      current_instructions: t.string,
-      former_suggestions: t.array(t.string),
-    }),
   }),
   t.type({
     type: t.literal("description"),

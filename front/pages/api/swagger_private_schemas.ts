@@ -172,6 +172,7 @@
  *                     - $ref: '#/components/schemas/PrivateUserMessage'
  *                     - $ref: '#/components/schemas/PrivateAgentMessage'
  *                     - $ref: '#/components/schemas/PrivateContentFragment'
+ *                     - $ref: '#/components/schemas/PrivateCompactionMessage'
  *     PrivateUserMessage:
  *       type: object
  *       description: A user message in a conversation.
@@ -408,6 +409,25 @@
  *         completionDurationMs:
  *           type: integer
  *           nullable: true
+ *         activitySteps:
+ *           type: array
+ *           items:
+ *             type: object
+ *             properties:
+ *               type:
+ *                 type: string
+ *                 enum: [thinking, action]
+ *               content:
+ *                 type: string
+ *                 description: Chain of thought text (thinking steps only)
+ *               label:
+ *                 type: string
+ *                 description: Action display label (action steps only)
+ *               id:
+ *                 type: string
+ *               actionId:
+ *                 type: string
+ *                 description: Action string identifier (action steps only)
  *         reactions:
  *           type: array
  *           items:
@@ -507,6 +527,45 @@
  *         nodeDataSourceViewId:
  *           type: string
  *           nullable: true
+ *     PrivateCompactionMessage:
+ *       type: object
+ *       description: A compaction message summarizing earlier conversation content.
+ *       required:
+ *         - type
+ *         - sId
+ *         - status
+ *         - version
+ *         - rank
+ *         - created
+ *       properties:
+ *         type:
+ *           type: string
+ *           enum: [compaction_message]
+ *         id:
+ *           type: integer
+ *         compactionMessageId:
+ *           type: integer
+ *         sId:
+ *           type: string
+ *         created:
+ *           type: integer
+ *         visibility:
+ *           type: string
+ *           enum: [visible, deleted]
+ *         version:
+ *           type: integer
+ *         rank:
+ *           type: integer
+ *         branchId:
+ *           type: string
+ *           nullable: true
+ *         status:
+ *           type: string
+ *           enum: [created, succeeded, failed]
+ *         content:
+ *           type: string
+ *           nullable: true
+ *           description: Compacted summary. Null while status is "created".
  *     PrivateLightAgentConfiguration:
  *       type: object
  *       description: Agent configuration as returned by the private list endpoint.
@@ -960,7 +1019,7 @@
  *           type: string
  *         origin:
  *           type: string
- *           enum: [web, project_kickoff, extension, agent_sidekick, api, cli, cli_programmatic, email, excel, gsheet, make, n8n, powerpoint, raycast, slack, slack_workflow, teams, transcript, triggered_programmatic, triggered, zapier, zendesk, onboarding_conversation, project_butler]
+ *           enum: [web, project_kickoff, extension, agent_sidekick, api, cli, cli_programmatic, email, excel, gsheet, make, n8n, powerpoint, raycast, slack, slack_workflow, teams, transcript, triggered_programmatic, triggered, zapier, zendesk, onboarding_conversation]
  *     PrivateReaction:
  *       type: object
  *       description: A reaction on a message.
@@ -992,10 +1051,9 @@
  *         - $ref: '#/components/schemas/PrivateUserMessageNewEvent'
  *         - $ref: '#/components/schemas/PrivateAgentMessageNewEvent'
  *         - $ref: '#/components/schemas/PrivateAgentMessageDoneEvent'
+ *         - $ref: '#/components/schemas/PrivateCompactionMessageNewEvent'
+ *         - $ref: '#/components/schemas/PrivateCompactionMessageDoneEvent'
  *         - $ref: '#/components/schemas/PrivateConversationTitleEvent'
- *         - $ref: '#/components/schemas/PrivateButlerSuggestionCreatedEvent'
- *         - $ref: '#/components/schemas/PrivateButlerThinkingEvent'
- *         - $ref: '#/components/schemas/PrivateButlerDoneEvent'
  *     PrivateUserMessageNewEvent:
  *       type: object
  *       required: [type, created, messageId, message]
@@ -1042,6 +1100,32 @@
  *         status:
  *           type: string
  *           enum: [success, error]
+ *     PrivateCompactionMessageNewEvent:
+ *       type: object
+ *       required: [type, created, messageId, message]
+ *       properties:
+ *         type:
+ *           type: string
+ *           enum: [compaction_message_new]
+ *         created:
+ *           type: integer
+ *         messageId:
+ *           type: string
+ *         message:
+ *           $ref: '#/components/schemas/PrivateCompactionMessage'
+ *     PrivateCompactionMessageDoneEvent:
+ *       type: object
+ *       required: [type, created, messageId, message]
+ *       properties:
+ *         type:
+ *           type: string
+ *           enum: [compaction_message_done]
+ *         created:
+ *           type: integer
+ *         messageId:
+ *           type: string
+ *         message:
+ *           $ref: '#/components/schemas/PrivateCompactionMessage'
  *     PrivateConversationTitleEvent:
  *       type: object
  *       required: [type, created, title]
@@ -1053,36 +1137,6 @@
  *           type: integer
  *         title:
  *           type: string
- *     PrivateButlerSuggestionCreatedEvent:
- *       type: object
- *       required: [type, created, suggestion]
- *       properties:
- *         type:
- *           type: string
- *           enum: [butler_suggestion_created]
- *         created:
- *           type: integer
- *         suggestion:
- *           type: object
- *           description: Butler suggestion details
- *     PrivateButlerThinkingEvent:
- *       type: object
- *       required: [type, created]
- *       properties:
- *         type:
- *           type: string
- *           enum: [butler_thinking]
- *         created:
- *           type: integer
- *     PrivateButlerDoneEvent:
- *       type: object
- *       required: [type, created]
- *       properties:
- *         type:
- *           type: string
- *           enum: [butler_done]
- *         created:
- *           type: integer
  *     PrivateAgentMessageEvent:
  *       type: object
  *       description: Server-Sent Event for agent message streaming. Discriminated on the `type` field. Each event also includes a `step` integer.
@@ -1090,6 +1144,7 @@
  *         propertyName: type
  *       oneOf:
  *         - $ref: '#/components/schemas/PrivateGenerationTokensEvent'
+ *         - $ref: '#/components/schemas/PrivateToolCallStartedEvent'
  *         - $ref: '#/components/schemas/PrivateAgentActionSuccessEvent'
  *         - $ref: '#/components/schemas/PrivateAgentMessageSuccessEvent'
  *         - $ref: '#/components/schemas/PrivateAgentErrorEvent'
@@ -1125,6 +1180,27 @@
  *           description: Present when classification is opening_delimiter or closing_delimiter
  *         step:
  *           type: integer
+ *     PrivateToolCallStartedEvent:
+ *       type: object
+ *       required: [type, created, configurationId, messageId, toolName]
+ *       properties:
+ *         type:
+ *           type: string
+ *           enum: [tool_call_started]
+ *         created:
+ *           type: integer
+ *         configurationId:
+ *           type: string
+ *         messageId:
+ *           type: string
+ *         toolCallId:
+ *           type: string
+ *         toolCallIndex:
+ *           type: integer
+ *         toolName:
+ *           type: string
+ *         step:
+ *           type: integer
  *     PrivateAgentActionSuccessEvent:
  *       type: object
  *       required: [type, created, configurationId, messageId, action]
@@ -1139,10 +1215,128 @@
  *         messageId:
  *           type: string
  *         action:
- *           type: object
- *           description: The MCP action that completed successfully
+ *           $ref: '#/components/schemas/PrivateAgentMCPAction'
  *         step:
  *           type: integer
+ *     PrivateAgentMCPAction:
+ *       type: object
+ *       description: An MCP action with its output.
+ *       required:
+ *         - id
+ *         - sId
+ *         - createdAt
+ *         - updatedAt
+ *         - agentMessageId
+ *         - toolName
+ *         - functionCallName
+ *         - functionCallId
+ *         - params
+ *         - citationsAllocated
+ *         - status
+ *         - step
+ *         - generatedFiles
+ *         - output
+ *       properties:
+ *         id:
+ *           type: integer
+ *           description: Numeric model identifier
+ *         sId:
+ *           type: string
+ *           description: Unique string identifier
+ *         createdAt:
+ *           type: integer
+ *           description: Unix timestamp of creation
+ *         updatedAt:
+ *           type: integer
+ *           description: Unix timestamp of last update
+ *         agentMessageId:
+ *           type: integer
+ *           description: ID of the parent agent message
+ *         internalMCPServerName:
+ *           type: string
+ *           nullable: true
+ *           description: Name of the internal MCP server, if any
+ *         toolName:
+ *           type: string
+ *           description: Name of the tool
+ *         mcpServerId:
+ *           type: string
+ *           nullable: true
+ *           description: ID of the MCP server, if external
+ *         functionCallName:
+ *           type: string
+ *           description: Name of the function call
+ *         functionCallId:
+ *           type: string
+ *           description: ID of the function call
+ *         params:
+ *           type: object
+ *           description: Parameters passed to the tool
+ *         citationsAllocated:
+ *           type: integer
+ *           description: Number of citations allocated
+ *         status:
+ *           type: string
+ *           enum:
+ *             - succeeded
+ *             - errored
+ *             - denied
+ *             - blocked_authentication_required
+ *             - blocked_file_authorization_required
+ *             - blocked_validation_required
+ *             - blocked_child_action_input_required
+ *             - blocked_user_answer_required
+ *             - ready_allowed_explicitly
+ *             - ready_allowed_implicitly
+ *             - running
+ *           description: Execution status of the tool
+ *         step:
+ *           type: integer
+ *           description: Step number in the agent execution
+ *         executionDurationMs:
+ *           type: integer
+ *           nullable: true
+ *           description: Duration of execution in milliseconds
+ *         displayLabels:
+ *           type: object
+ *           nullable: true
+ *           properties:
+ *             running:
+ *               type: string
+ *             done:
+ *               type: string
+ *         generatedFiles:
+ *           type: array
+ *           items:
+ *             type: object
+ *             properties:
+ *               fileId:
+ *                 type: string
+ *               title:
+ *                 type: string
+ *               contentType:
+ *                 type: string
+ *               snippet:
+ *                 type: string
+ *                 nullable: true
+ *               createdAt:
+ *                 type: integer
+ *               updatedAt:
+ *                 type: integer
+ *               isInProjectContext:
+ *                 type: boolean
+ *               hidden:
+ *                 type: boolean
+ *         output:
+ *           type: array
+ *           nullable: true
+ *           description: Tool call result content
+ *           items:
+ *             type: object
+ *         citations:
+ *           type: object
+ *           nullable: true
+ *           description: Map of citation key to citation object
  *     PrivateAgentMessageSuccessEvent:
  *       type: object
  *       required: [type, created, configurationId, messageId, message, runIds]

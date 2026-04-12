@@ -1,88 +1,18 @@
 import { AgentInstructionDiffExtension } from "@app/components/editor/extensions/agent_builder/AgentInstructionDiffExtension";
-import { HeadingExtension } from "@app/components/editor/extensions/HeadingExtension";
-import {
-  KNOWLEDGE_NODE_TYPE,
-  KnowledgeNode,
-} from "@app/components/editor/extensions/skill_builder/KnowledgeNode";
+import { KNOWLEDGE_NODE_TYPE } from "@app/components/editor/extensions/skill_builder/KnowledgeNode";
 import type { KnowledgeItem } from "@app/components/editor/extensions/skill_builder/KnowledgeNodeView";
 import { SlashCommandExtension } from "@app/components/editor/extensions/skill_builder/SlashCommandExtension";
-import { cn, markdownStyles } from "@dust-tt/sparkle";
+import {
+  buildSkillInstructionsExtensions,
+  INSTRUCTIONS_MAXIMUM_CHARACTER_COUNT,
+} from "@app/lib/editor/build_skill_instructions_extensions";
+import { preprocessMarkdown } from "@app/lib/editor/skill_instructions_preprocessing";
+import { cn } from "@dust-tt/sparkle";
 import { CharacterCount, Placeholder } from "@tiptap/extensions";
-import { Markdown } from "@tiptap/markdown";
 import type { Transaction } from "@tiptap/pm/state";
-import type { Editor, Extensions } from "@tiptap/react";
+import type { Editor } from "@tiptap/react";
 import { EditorContent, useEditor } from "@tiptap/react";
-import { StarterKit } from "@tiptap/starter-kit";
 import { useEffect, useMemo, useRef } from "react";
-
-export const INSTRUCTIONS_MAXIMUM_CHARACTER_COUNT = 120_000;
-
-export function buildSkillInstructionsExtensions(
-  isReadOnly: boolean
-): Extensions {
-  const baseExtensions: Extensions = [
-    Markdown,
-    StarterKit.configure({
-      orderedList: {
-        HTMLAttributes: {
-          class: markdownStyles.orderedList(),
-        },
-      },
-      listItem: {
-        HTMLAttributes: {
-          class: markdownStyles.list(),
-        },
-      },
-      bulletList: {
-        HTMLAttributes: {
-          class: markdownStyles.unorderedList(),
-        },
-      },
-      blockquote: false,
-      horizontalRule: false,
-      strike: false,
-      code: {
-        HTMLAttributes: {
-          class: markdownStyles.codeBlock(),
-        },
-      },
-      codeBlock: {
-        HTMLAttributes: {
-          class: markdownStyles.codeBlock(),
-        },
-      },
-      paragraph: {
-        HTMLAttributes: {
-          class: markdownStyles.paragraph(),
-        },
-      },
-    }),
-    HeadingExtension.configure({
-      levels: [1, 2, 3],
-      HTMLAttributes: {
-        class: "mt-4 mb-3",
-      },
-    }),
-    KnowledgeNode,
-  ];
-
-  if (!isReadOnly) {
-    baseExtensions.push(
-      SlashCommandExtension,
-      AgentInstructionDiffExtension,
-      Placeholder.configure({
-        placeholder: "What does this skill do? How should it behave?",
-        emptyNodeClass:
-          "first:before:text-gray-400 first:before:italic first:before:content-[attr(data-placeholder)] first:before:pointer-events-none first:before:absolute",
-      }),
-      CharacterCount.configure({
-        limit: INSTRUCTIONS_MAXIMUM_CHARACTER_COUNT,
-      })
-    );
-  }
-
-  return baseExtensions;
-}
 
 function useEditorService(editor: Editor | null) {
   return useMemo(() => {
@@ -111,7 +41,7 @@ function useEditorService(editor: Editor | null) {
       setContent(content: string) {
         // Safety check for Safari: ensure editor and docView are available
         if (editor && !editor.isDestroyed) {
-          editor.commands.setContent(content, {
+          editor.commands.setContent(preprocessMarkdown(content), {
             emitUpdate: false,
             contentType: "markdown",
           });
@@ -163,6 +93,19 @@ interface UseSkillInstructionsEditorProps {
   onDelete?: (editor: Editor) => void;
 }
 
+const skillInstructionsEditableExtensions = [
+  SlashCommandExtension,
+  AgentInstructionDiffExtension,
+  Placeholder.configure({
+    placeholder: "What does this skill do? How should it behave?",
+    emptyNodeClass:
+      "first:before:text-gray-400 first:before:italic first:before:content-[attr(data-placeholder)] first:before:pointer-events-none first:before:absolute",
+  }),
+  CharacterCount.configure({
+    limit: INSTRUCTIONS_MAXIMUM_CHARACTER_COUNT,
+  }),
+];
+
 export function useSkillInstructionsEditor({
   content,
   isReadOnly,
@@ -171,7 +114,11 @@ export function useSkillInstructionsEditor({
   onDelete,
 }: UseSkillInstructionsEditorProps) {
   const extensions = useMemo(
-    () => buildSkillInstructionsExtensions(isReadOnly),
+    () =>
+      buildSkillInstructionsExtensions(
+        isReadOnly,
+        skillInstructionsEditableExtensions
+      ),
     [isReadOnly]
   );
 
@@ -204,7 +151,7 @@ export function useSkillInstructionsEditor({
       // This fixes Safari crashes where docView is accessed before render
       requestAnimationFrame(() => {
         if (editor && !editor.isDestroyed) {
-          editor.commands.setContent(content, {
+          editor.commands.setContent(preprocessMarkdown(content), {
             emitUpdate: false,
             contentType: "markdown",
           });

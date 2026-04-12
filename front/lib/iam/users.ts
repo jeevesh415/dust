@@ -14,7 +14,7 @@ import { AgentMemoryModel } from "@app/lib/resources/storage/models/agent_memori
 import { ContentFragmentModel } from "@app/lib/resources/storage/models/content_fragment";
 import { FileModel } from "@app/lib/resources/storage/models/files";
 import { KeyModel } from "@app/lib/resources/storage/models/keys";
-import { generateRandomModelSId } from "@app/lib/resources/string_ids";
+import { generateRandomModelSId } from "@app/lib/resources/string_ids_server";
 import { UserResource } from "@app/lib/resources/user_resource";
 import { guessFirstAndLastNameFromFullName } from "@app/lib/user";
 import logger from "@app/logger/logger";
@@ -298,7 +298,7 @@ export async function mergeUserIdentities({
     {
       where: {
         authorId: secondaryUser.id,
-        workspaceId: workspaceId,
+        workspaceId,
       },
     }
   );
@@ -309,7 +309,7 @@ export async function mergeUserIdentities({
   const userIdOptions = {
     where: {
       userId: secondaryUser.id,
-      workspaceId: workspaceId,
+      workspaceId,
     },
   };
 
@@ -338,7 +338,7 @@ export async function mergeUserIdentities({
   const agentConfigurations = await AgentUserRelationModel.findAll({
     where: {
       userId: primaryUser.id,
-      workspaceId: workspaceId,
+      workspaceId,
     },
     attributes: ["agentConfiguration"],
   });
@@ -346,7 +346,7 @@ export async function mergeUserIdentities({
     where: {
       userId: secondaryUser.id,
       agentConfiguration: agentConfigurations.map((p) => p.agentConfiguration),
-      workspaceId: workspaceId,
+      workspaceId,
     },
   });
   // Migrate agent-user relations from the secondary user to the primary user.

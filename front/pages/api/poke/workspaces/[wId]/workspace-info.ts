@@ -2,7 +2,7 @@
 import { withSessionAuthenticationForPoke } from "@app/lib/api/auth_wrappers";
 import config from "@app/lib/api/config";
 import { getWorkspaceCreationDate } from "@app/lib/api/workspace";
-import { Authenticator } from "@app/lib/auth";
+import { Authenticator, hasFeatureFlag } from "@app/lib/auth";
 import type { SessionWithUser } from "@app/lib/iam/provider";
 import { getStripeSubscription } from "@app/lib/plans/stripe";
 import { ExtensionConfigurationResource } from "@app/lib/resources/extension";
@@ -25,6 +25,8 @@ export type PokeGetWorkspaceInfo = {
   activeSubscription: SubscriptionType;
   baseUrl: string;
   extensionConfig: ExtensionConfigurationType | null;
+  hasDummyFeature: boolean;
+  metronomeCustomerId: string | null;
   programmaticUsageConfig: ProgrammaticUsageConfigurationType | null;
   stripeSubscription: Stripe.Subscription | null;
   subscriptions: SubscriptionType[];
@@ -91,6 +93,11 @@ async function handler(
       const programmaticUsageConfig =
         await ProgrammaticUsageConfigurationResource.fetchByWorkspaceId(auth);
 
+      const hasDummyFeature = await hasFeatureFlag(
+        auth,
+        "dummy_feature_for_flag_testing"
+      );
+
       let stripeSubscription: Stripe.Subscription | null = null;
       if (activeSubscription.stripeSubscriptionId) {
         stripeSubscription = await getStripeSubscription(
@@ -100,6 +107,8 @@ async function handler(
 
       return res.status(200).json({
         activeSubscription,
+        hasDummyFeature,
+        metronomeCustomerId: workspaceResource.metronomeCustomerId ?? null,
         stripeSubscription,
         subscriptions,
         whitelistableFeatures: WHITELISTABLE_FEATURES,

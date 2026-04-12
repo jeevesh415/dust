@@ -5,8 +5,6 @@ import type { JSONSchema7 as JSONSchema } from "json-schema";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 
-export const SALESFORCE_TOOL_NAME = "salesforce" as const;
-
 export const SALESFORCE_TOOLS_METADATA = createToolsRecord({
   execute_read_query: {
     description: "Execute a read query on Salesforce",
@@ -45,6 +43,30 @@ export const SALESFORCE_TOOLS_METADATA = createToolsRecord({
       done: "Describe Salesforce object",
     },
   },
+  create_object: {
+    description: "Create one or more records in Salesforce",
+    schema: {
+      objectName: z
+        .string()
+        .describe("The name of the Salesforce object (e.g., Account, Contact)"),
+      records: z
+        .array(z.object({}).passthrough())
+        .min(1)
+        .describe(
+          "Record(s) to create. Must include all required fields for the object"
+        ),
+      allOrNone: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("If true, all creates must succeed or all fail"),
+    },
+    stake: "medium",
+    displayLabels: {
+      running: "Creating Salesforce records",
+      done: "Create Salesforce records",
+    },
+  },
   update_object: {
     description: "Update one or more records in Salesforce",
     schema: {
@@ -69,7 +91,7 @@ export const SALESFORCE_TOOLS_METADATA = createToolsRecord({
         .default(false)
         .describe("If true, all updates must succeed or all fail"),
     },
-    stake: "high",
+    stake: "medium",
     displayLabels: {
       running: "Updating Salesforce records",
       done: "Update Salesforce records",
@@ -104,6 +126,7 @@ export const SALESFORCE_TOOLS_METADATA = createToolsRecord({
 });
 
 export const SALESFORCE_SERVER = {
+  // biome-ignore lint/plugin/noMcpServerInstructions: existing usage
   serverInfo: {
     name: "salesforce",
     version: "1.0.0",
@@ -114,10 +137,6 @@ export const SALESFORCE_SERVER = {
     },
     icon: "SalesforceLogo",
     documentationUrl: "https://docs.dust.tt/docs/salesforce",
-    // Predates the introduction of the rule, would require extensive work to
-    // improve, already widely adopted.
-
-    // biome-ignore lint/plugin/noMcpServerInstructions: existing usage
     instructions: SALESFORCE_SERVER_INSTRUCTIONS,
   },
   tools: Object.values(SALESFORCE_TOOLS_METADATA).map((t) => ({

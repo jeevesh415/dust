@@ -12,6 +12,7 @@ import type {
 } from "@app/types/assistant/conversation";
 import {
   isAgentMessageType,
+  isCompactionMessageType,
   isUserMessageType,
 } from "@app/types/assistant/conversation";
 import type { ContentFragmentType } from "@app/types/content_fragment";
@@ -121,6 +122,9 @@ export function addBackwardCompatibleConversationFields(
         isArrayOf<MessageType, ContentFragmentType>(c, isContentFragmentType)
       ) {
         return filterOutInteractiveContentFileContentTypes(c);
+      } else if (isCompactionMessageType(c[0])) {
+        // TODO(compaction): expose compaction messages in the public API.
+        return [];
       }
       assertNever(c[0]);
     }),
@@ -158,6 +162,11 @@ export function addBackwardCompatibleAgentMessageFields(
 ): AgentMessagePublicType {
   return {
     ...agentMessage,
+    // Map "gracefully_stopped" to "succeeded" for backward compatibility with the public API.
+    status:
+      agentMessage.status === "gracefully_stopped"
+        ? "succeeded"
+        : agentMessage.status,
     rawContents: getRawContents(agentMessage),
   };
 }

@@ -1,11 +1,23 @@
 import { MCPError } from "@app/lib/actions/mcp_errors";
-import type { ToolHandlerExtra } from "@app/lib/actions/mcp_internal_actions/tool_definition";
+import type {
+  ToolHandlerExtra,
+  ToolHandlerResult,
+} from "@app/lib/actions/mcp_internal_actions/tool_definition";
 import { Authenticator, getFeatureFlags } from "@app/lib/auth";
 import logger from "@app/logger/logger";
 import { isDustWorkspace } from "@app/types/shared/env";
 import type { Result } from "@app/types/shared/result";
 import { Err, Ok } from "@app/types/shared/result";
-import { normalizeError } from "@dust-tt/client/src/error_utils";
+import { normalizeError } from "@app/types/shared/utils/error_utils";
+
+/**
+ * Wraps any serializable data as a successful text content MCP response.
+ */
+export function jsonResponse(data: unknown): ToolHandlerResult {
+  return new Ok([
+    { type: "text" as const, text: JSON.stringify(data, null, 2) },
+  ]);
+}
 
 /**
  * Runs the three security gates required by every poke tool, then emits the
@@ -20,7 +32,7 @@ import { normalizeError } from "@dust-tt/client/src/error_utils";
 export async function enforcePokeSecurityGates(
   { auth }: ToolHandlerExtra,
   toolName: string,
-  targetWorkspaceSId: string
+  targetWorkspaceId: string
 ): Promise<Result<void, MCPError>> {
   const callerWorkspace = auth.getNonNullableWorkspace();
   const callerUser = auth.user();
@@ -53,10 +65,10 @@ export async function enforcePokeSecurityGates(
   logger.info(
     {
       action: "poke_cross_workspace_access",
-      callerUserSId: callerUser?.sId,
+      callerUserId: callerUser?.sId,
       callerUserEmail: callerUser?.email,
-      callerWorkspaceSId: callerWorkspace.sId,
-      targetWorkspaceSId,
+      callerWorkspaceId: callerWorkspace.sId,
+      targetWorkspaceId,
       tool: toolName,
     },
     "Poke MCP: cross-workspace access"
@@ -70,11 +82,11 @@ export async function enforcePokeSecurityGates(
  * error handling. Returns Err(MCPError) if the workspace does not exist.
  */
 export async function getTargetAuth(
-  workspaceSId: string
+  workspaceId: string
 ): Promise<Result<Authenticator, MCPError>> {
   try {
     const targetAuth =
-      await Authenticator.internalAdminForWorkspace(workspaceSId);
+      await Authenticator.internalAdminForWorkspace(workspaceId);
     return new Ok(targetAuth);
   } catch (err) {
     const normalizedErr = normalizeError(err);
@@ -84,7 +96,7 @@ export async function getTargetAuth(
     );
     return new Err(
       new MCPError(
-        `Workspace not found: no workspace with sId "${workspaceSId}" exists.`,
+        `Workspace not found: no workspace with sId "${workspaceId}" exists.`,
         { tracked: false }
       )
     );

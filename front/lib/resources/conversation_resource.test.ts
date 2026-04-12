@@ -1,13 +1,17 @@
 // biome-ignore-all lint/plugin/noRawSql: test file uses raw SQL for setup and verification
 import { loadAllModels } from "@app/admin/db";
-import { destroyConversation } from "@app/lib/api/assistant/conversation/destroy";
 import { Authenticator } from "@app/lib/auth";
 import {
+  AgentMessageModel,
   ConversationModel,
   MessageModel,
   UserMessageModel,
 } from "@app/lib/models/agent/conversation";
-import { ConversationBranchModel } from "@app/lib/models/agent/conversation_branch";
+import {
+  getReinforcementMetadata,
+  REINFORCEMENT_METADATA_KEYS,
+} from "@app/lib/reinforced_agent/types";
+import { getReinforcedSkillsMetadata } from "@app/lib/reinforcement/types";
 import { ConversationBranchResource } from "@app/lib/resources/conversation_branch_resource";
 import { ConversationResource } from "@app/lib/resources/conversation_resource";
 import { GroupResource } from "@app/lib/resources/group_resource";
@@ -18,7 +22,7 @@ import {
 } from "@app/lib/resources/permission_utils";
 import { SpaceResource } from "@app/lib/resources/space_resource";
 import { frontSequelize } from "@app/lib/resources/storage";
-import { generateRandomModelSId } from "@app/lib/resources/string_ids";
+import { generateRandomModelSId } from "@app/lib/resources/string_ids_server";
 import type { UserResource } from "@app/lib/resources/user_resource";
 import { AgentConfigurationFactory } from "@app/tests/utils/AgentConfigurationFactory";
 import { ConversationFactory } from "@app/tests/utils/ConversationFactory";
@@ -32,15 +36,8 @@ import type { LightAgentConfigurationType } from "@app/types/assistant/agent";
 import { GLOBAL_AGENTS_SID } from "@app/types/assistant/assistant";
 import type { ConversationWithoutContentType } from "@app/types/assistant/conversation";
 import type { LightWorkspaceType } from "@app/types/user";
-import {
-  afterEach,
-  assert,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from "vitest";
+import { assert, beforeEach, describe, expect, it, vi } from "vitest";
+import { destroyConversation } from "../api/assistant/conversation/destroy";
 
 vi.mock(import("../../lib/api/redis"), async (importOriginal) => {
   const mod = await importOriginal();
@@ -86,15 +83,65 @@ const dateFromDaysAgo = (days: number) => {
 };
 
 describe("ConversationResource", () => {
+  describe("fetchByModelIds", () => {
+    it("should fetch by model ids within workspace", async () => {
+      const workspace = await WorkspaceFactory.basic();
+      const user = await UserFactory.basic();
+      await MembershipFactory.associate(workspace, user, { role: "user" });
+
+      const auth = await Authenticator.fromUserIdAndWorkspaceId(
+        user.sId,
+        workspace.sId
+      );
+
+      const convo = await ConversationModel.create({
+        workspaceId: workspace.id,
+        sId: generateRandomModelSId(),
+        title: "FetchByModelId test",
+        requestedSpaceIds: [],
+      });
+
+      const fetched = await ConversationResource.fetchByModelIds(auth, [
+        convo.id,
+      ]);
+      expect(fetched.length).toBe(1);
+      expect(fetched[0].id).toBe(convo.id);
+      expect(fetched[0].workspaceId).toBe(workspace.id);
+    });
+
+    it("should not return conversations from another workspace", async () => {
+      const workspaceA = await WorkspaceFactory.basic();
+      const userA = await UserFactory.basic();
+      await MembershipFactory.associate(workspaceA, userA, { role: "user" });
+      const authA = await Authenticator.fromUserIdAndWorkspaceId(
+        userA.sId,
+        workspaceA.sId
+      );
+
+      const workspaceB = await WorkspaceFactory.basic();
+      const userB = await UserFactory.basic();
+      await MembershipFactory.associate(workspaceB, userB, { role: "user" });
+      const convoB = await ConversationModel.create({
+        workspaceId: workspaceB.id,
+        sId: generateRandomModelSId(),
+        title: "FetchByModelId cross-workspace test",
+        requestedSpaceIds: [],
+      });
+
+      const fetched = await ConversationResource.fetchByModelIds(authA, [
+        convoB.id,
+      ]);
+      expect(fetched.length).toBe(0);
+    });
+  });
+
   describe("listAllBeforeDate", () => {
     let auth: Authenticator;
     let convo1Id: string;
-    let convo2Id: string;
     let convo3Id: string;
     let convo4Id: string;
 
     let anotherAuth: Authenticator;
-    let anotherConvoId: string;
 
     beforeEach(async () => {
       const workspace = await WorkspaceFactory.basic();
@@ -110,7 +157,7 @@ describe("ConversationResource", () => {
         messagesCreatedAt: [dateFromDaysAgo(10), dateFromDaysAgo(8)],
         conversationCreatedAt: dateFromDaysAgo(10),
       });
-      const convo2 = await ConversationFactory.create(auth, {
+      const _convo2 = await ConversationFactory.create(auth, {
         agentConfigurationId: agents[1].sId,
         messagesCreatedAt: [dateFromDaysAgo(100), dateFromDaysAgo(1)],
         conversationCreatedAt: dateFromDaysAgo(100),
@@ -127,7 +174,6 @@ describe("ConversationResource", () => {
       });
 
       convo1Id = convo1.sId;
-      convo2Id = convo2.sId;
       convo3Id = convo3.sId;
       convo4Id = convo4.sId;
 
@@ -142,29 +188,10 @@ describe("ConversationResource", () => {
         anotherWorkspace,
         anotherUser
       );
-      const anotherConvo = await ConversationFactory.create(anotherAuth, {
+      await ConversationFactory.create(anotherAuth, {
         agentConfigurationId: anotherAgents[0].sId,
         messagesCreatedAt: [dateFromDaysAgo(800)],
         conversationCreatedAt: dateFromDaysAgo(800),
-      });
-      anotherConvoId = anotherConvo.sId;
-    });
-
-    afterEach(async () => {
-      await destroyConversation(auth, {
-        conversationId: convo1Id,
-      });
-      await destroyConversation(auth, {
-        conversationId: convo2Id,
-      });
-      await destroyConversation(auth, {
-        conversationId: convo3Id,
-      });
-      await destroyConversation(auth, {
-        conversationId: convo4Id,
-      });
-      await destroyConversation(anotherAuth, {
-        conversationId: anotherConvoId,
       });
     });
 
@@ -212,6 +239,350 @@ describe("ConversationResource", () => {
   });
 });
 
+describe("destroyConversation", () => {
+  let auth: Authenticator;
+  let agentConfigurationId: string;
+
+  const getDestroyIdCounts = (calls: unknown[][]) => {
+    return calls.map((call) => {
+      const options = call[0] as { where?: { id?: unknown } };
+      const ids = options.where?.id;
+
+      if (Array.isArray(ids)) {
+        return ids.length;
+      }
+
+      return ids === undefined ? 0 : 1;
+    });
+  };
+
+  beforeEach(async () => {
+    const workspace = await WorkspaceFactory.basic();
+    const user = await UserFactory.basic();
+    auth = await Authenticator.fromUserIdAndWorkspaceId(
+      user.sId,
+      workspace.sId
+    );
+
+    const agents = await setupTestAgents(workspace, user);
+    agentConfigurationId = agents[0].sId;
+  });
+
+  it("should delete batched message resources chunk by chunk", async () => {
+    const conversationType = await ConversationFactory.create(auth, {
+      agentConfigurationId,
+      messagesCreatedAt: Array.from({ length: 30 }, () => new Date()),
+    });
+    const conversation = await ConversationResource.fetchById(
+      auth,
+      conversationType.sId
+    );
+    if (!conversation) {
+      throw new Error("Conversation should exist");
+    }
+
+    const userMessageDestroySpy = vi.spyOn(UserMessageModel, "destroy");
+    const agentMessageDestroySpy = vi.spyOn(AgentMessageModel, "destroy");
+
+    const result = await destroyConversation(auth, { conversation });
+
+    expect(result.isOk()).toBe(true);
+
+    const userMessageDestroyCounts = getDestroyIdCounts(
+      userMessageDestroySpy.mock.calls as unknown[][]
+    );
+    expect(userMessageDestroyCounts).toHaveLength(2);
+    expect(
+      userMessageDestroyCounts.reduce((sum, count) => sum + count, 0)
+    ).toBe(30);
+    expect(Math.max(...userMessageDestroyCounts)).toBeLessThan(30);
+
+    const agentMessageDestroyCounts = getDestroyIdCounts(
+      agentMessageDestroySpy.mock.calls as unknown[][]
+    );
+    expect(agentMessageDestroyCounts).toHaveLength(2);
+    expect(
+      agentMessageDestroyCounts.reduce((sum, count) => sum + count, 0)
+    ).toBe(30);
+    expect(Math.max(...agentMessageDestroyCounts)).toBeLessThan(30);
+  });
+});
+
+describe("listReinforcementConversations", () => {
+  let auth: Authenticator;
+  let anotherAuth: Authenticator;
+
+  beforeEach(async () => {
+    const workspace = await WorkspaceFactory.basic();
+    const user = await UserFactory.basic();
+    await MembershipFactory.associate(workspace, user, { role: "admin" });
+    auth = await Authenticator.fromUserIdAndWorkspaceId(
+      user.sId,
+      workspace.sId
+    );
+
+    const anotherWorkspace = await WorkspaceFactory.basic();
+    const anotherUser = await UserFactory.basic();
+    await MembershipFactory.associate(anotherWorkspace, anotherUser, {
+      role: "admin",
+    });
+    anotherAuth = await Authenticator.fromUserIdAndWorkspaceId(
+      anotherUser.sId,
+      anotherWorkspace.sId
+    );
+  });
+
+  it("should return only conversations with reinforcedAgent metadata for the given agent", async () => {
+    // Create reinforcement conversation for agent-1.
+    const reinforcedConvo1 = await ConversationResource.makeNew(
+      auth,
+      {
+        sId: generateRandomModelSId(),
+        title: "Reinforcement for agent-1",
+        visibility: "test",
+        requestedSpaceIds: [],
+        metadata: getReinforcementMetadata(
+          "reinforced_agent_analyze_conversation",
+          "agent-1"
+        ),
+      },
+      null
+    );
+
+    // Create reinforcement conversation for agent-2 (should be excluded).
+    await ConversationResource.makeNew(
+      auth,
+      {
+        sId: generateRandomModelSId(),
+        title: "Reinforcement for agent-2",
+        visibility: "test",
+        requestedSpaceIds: [],
+        metadata: getReinforcementMetadata(
+          "reinforced_agent_aggregate_suggestions",
+          "agent-2"
+        ),
+      },
+      null
+    );
+
+    // Create a regular (non-reinforcement) conversation (should be excluded).
+    await ConversationResource.makeNew(
+      auth,
+      {
+        sId: generateRandomModelSId(),
+        title: "Regular conversation",
+        visibility: "unlisted",
+        requestedSpaceIds: [],
+        metadata: {},
+      },
+      null
+    );
+
+    // Create reinforcement conversation in another workspace (should be excluded).
+    await ConversationResource.makeNew(
+      anotherAuth,
+      {
+        sId: generateRandomModelSId(),
+        title: "Other workspace reinforcement",
+        visibility: "test",
+        requestedSpaceIds: [],
+        metadata: getReinforcementMetadata(
+          "reinforced_agent_analyze_conversation",
+          "agent-1"
+        ),
+      },
+      null
+    );
+
+    const results = await ConversationResource.listReinforcementConversations(
+      auth,
+      "agent-1"
+    );
+
+    expect(results).toHaveLength(1);
+    expect(results[0].sId).toBe(reinforcedConvo1.sId);
+    expect(results[0].title).toBe("Reinforcement for agent-1");
+    expect(results[0].metadata).toMatchObject({
+      [REINFORCEMENT_METADATA_KEYS.reinforcedAgent]: true,
+      [REINFORCEMENT_METADATA_KEYS.reinforcedAgentConfigurationId]: "agent-1",
+    });
+  });
+});
+
+describe("listSkillReinforcementConversations", () => {
+  let auth: Authenticator;
+  let anotherAuth: Authenticator;
+
+  beforeEach(async () => {
+    const workspace = await WorkspaceFactory.basic();
+    const user = await UserFactory.basic();
+    await MembershipFactory.associate(workspace, user, { role: "admin" });
+    auth = await Authenticator.fromUserIdAndWorkspaceId(
+      user.sId,
+      workspace.sId
+    );
+
+    const anotherWorkspace = await WorkspaceFactory.basic();
+    const anotherUser = await UserFactory.basic();
+    await MembershipFactory.associate(anotherWorkspace, anotherUser, {
+      role: "admin",
+    });
+    anotherAuth = await Authenticator.fromUserIdAndWorkspaceId(
+      anotherUser.sId,
+      anotherWorkspace.sId
+    );
+  });
+
+  it("should return conversations matching the given skill in reinforcedSkillIds", async () => {
+    // Create aggregation conversation for skill-1.
+    const aggregationConvo = await ConversationResource.makeNew(
+      auth,
+      {
+        sId: generateRandomModelSId(),
+        title: "Aggregation for skill-1",
+        visibility: "test",
+        requestedSpaceIds: [],
+        metadata: getReinforcedSkillsMetadata(
+          "reinforcement_aggregate_suggestions",
+          ["skill-1"]
+        ),
+      },
+      null
+    );
+
+    // Create analysis conversation with skill-1 in the array.
+    const analysisConvo = await ConversationResource.makeNew(
+      auth,
+      {
+        sId: generateRandomModelSId(),
+        title: "Analysis with skill-1",
+        visibility: "test",
+        requestedSpaceIds: [],
+        metadata: getReinforcedSkillsMetadata(
+          "reinforcement_analyze_conversation",
+          ["skill-1", "skill-3"]
+        ),
+      },
+      null
+    );
+
+    // Create aggregation conversation for skill-2 (should be excluded).
+    await ConversationResource.makeNew(
+      auth,
+      {
+        sId: generateRandomModelSId(),
+        title: "Aggregation for skill-2",
+        visibility: "test",
+        requestedSpaceIds: [],
+        metadata: getReinforcedSkillsMetadata(
+          "reinforcement_aggregate_suggestions",
+          ["skill-2"]
+        ),
+      },
+      null
+    );
+
+    // Create a regular (non-reinforcement) conversation (should be excluded).
+    await ConversationResource.makeNew(
+      auth,
+      {
+        sId: generateRandomModelSId(),
+        title: "Regular conversation",
+        visibility: "unlisted",
+        requestedSpaceIds: [],
+        metadata: {},
+      },
+      null
+    );
+
+    // Create aggregation conversation in another workspace (should be excluded).
+    await ConversationResource.makeNew(
+      anotherAuth,
+      {
+        sId: generateRandomModelSId(),
+        title: "Other workspace aggregation",
+        visibility: "test",
+        requestedSpaceIds: [],
+        metadata: getReinforcedSkillsMetadata(
+          "reinforcement_aggregate_suggestions",
+          ["skill-1"]
+        ),
+      },
+      null
+    );
+
+    const results =
+      await ConversationResource.listSkillReinforcementConversations(
+        auth,
+        "skill-1"
+      );
+
+    expect(results).toHaveLength(2);
+    const resultSIds = results.map((r) => r.sId).sort();
+    const expectedSIds = [aggregationConvo.sId, analysisConvo.sId].sort();
+    expect(resultSIds).toEqual(expectedSIds);
+  });
+
+  it("should filter conversations by after date when provided", async () => {
+    // Create an old conversation (2 weeks ago).
+    const twoWeeksAgo = new Date();
+    twoWeeksAgo.setDate(twoWeeksAgo.getDate() - 14);
+
+    await ConversationResource.makeNew(
+      auth,
+      {
+        sId: generateRandomModelSId(),
+        title: "Old aggregation",
+        visibility: "test",
+        requestedSpaceIds: [],
+        createdAt: twoWeeksAgo,
+        metadata: getReinforcedSkillsMetadata(
+          "reinforcement_aggregate_suggestions",
+          ["skill-1"]
+        ),
+      },
+      null
+    );
+
+    // Create a recent conversation.
+    const recentConvo = await ConversationResource.makeNew(
+      auth,
+      {
+        sId: generateRandomModelSId(),
+        title: "Recent aggregation",
+        visibility: "test",
+        requestedSpaceIds: [],
+        metadata: getReinforcedSkillsMetadata(
+          "reinforcement_aggregate_suggestions",
+          ["skill-1"]
+        ),
+      },
+      null
+    );
+
+    // Without after filter: both returned.
+    const allResults =
+      await ConversationResource.listSkillReinforcementConversations(
+        auth,
+        "skill-1"
+      );
+    expect(allResults).toHaveLength(2);
+
+    // With after filter (1 week ago): only the recent one.
+    const oneWeekAgo = new Date();
+    oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
+
+    const filteredResults =
+      await ConversationResource.listSkillReinforcementConversations(
+        auth,
+        "skill-1",
+        { after: oneWeekAgo }
+      );
+    expect(filteredResults).toHaveLength(1);
+    expect(filteredResults[0].sId).toBe(recentConvo.sId);
+  });
+});
+
 describe("listConversationWithAgentCreatedBeforeDate", () => {
   let auth: Authenticator;
   let convo1Id: string;
@@ -220,7 +591,6 @@ describe("listConversationWithAgentCreatedBeforeDate", () => {
   let convo4Id: string;
 
   let anotherAuth: Authenticator;
-  let anotherConvoId: string;
 
   let agents: LightAgentConfigurationType[];
 
@@ -267,29 +637,10 @@ describe("listConversationWithAgentCreatedBeforeDate", () => {
       anotherWorkspace.sId
     );
     const anotherAgents = await setupTestAgents(anotherWorkspace, anotherUser);
-    const anotherConvo = await ConversationFactory.create(anotherAuth, {
+    await ConversationFactory.create(anotherAuth, {
       agentConfigurationId: anotherAgents[0].sId,
       messagesCreatedAt: [dateFromDaysAgo(800)],
       conversationCreatedAt: dateFromDaysAgo(10),
-    });
-    anotherConvoId = anotherConvo.sId;
-  });
-
-  afterEach(async () => {
-    await destroyConversation(auth, {
-      conversationId: convo1Id,
-    });
-    await destroyConversation(auth, {
-      conversationId: convo2Id,
-    });
-    await destroyConversation(auth, {
-      conversationId: convo3Id,
-    });
-    await destroyConversation(auth, {
-      conversationId: convo4Id,
-    });
-    await destroyConversation(anotherAuth, {
-      conversationId: anotherConvoId,
     });
   });
 
@@ -302,9 +653,11 @@ describe("listConversationWithAgentCreatedBeforeDate", () => {
           cutoffDate: dateFromDaysAgo(7),
         }
       );
+
+    const conversationIds = conversations.map((c) => c.sId);
     expect(conversations.length).toBe(2);
-    expect(conversations).toContain(convo1Id);
-    expect(conversations).toContain(convo2Id);
+    expect(conversationIds).toContain(convo1Id);
+    expect(conversationIds).toContain(convo2Id);
   });
   it("should return only conversations created before cutoff date and with the valid agent: 1 day ago", async () => {
     const conversationsAgent0 =
@@ -315,10 +668,12 @@ describe("listConversationWithAgentCreatedBeforeDate", () => {
           cutoffDate: dateFromDaysAgo(1),
         }
       );
+
+    const conversationsAgent0Ids = conversationsAgent0.map((c) => c.sId);
     expect(conversationsAgent0.length).toBe(3);
-    expect(conversationsAgent0).toContain(convo1Id);
-    expect(conversationsAgent0).toContain(convo2Id);
-    expect(conversationsAgent0).toContain(convo3Id);
+    expect(conversationsAgent0Ids).toContain(convo1Id);
+    expect(conversationsAgent0Ids).toContain(convo2Id);
+    expect(conversationsAgent0Ids).toContain(convo3Id);
 
     const conversationsAgent1 =
       await ConversationResource.listConversationWithAgentCreatedBeforeDate(
@@ -328,8 +683,10 @@ describe("listConversationWithAgentCreatedBeforeDate", () => {
           cutoffDate: dateFromDaysAgo(1),
         }
       );
+
+    const conversationsAgent1Ids = conversationsAgent1.map((c) => c.sId);
     expect(conversationsAgent1.length).toBe(1);
-    expect(conversationsAgent1).toContain(convo4Id);
+    expect(conversationsAgent1Ids).toContain(convo4Id);
   });
 });
 
@@ -616,16 +973,6 @@ describe("baseFetchWithAuthorization with space-based permissions", () => {
     };
   });
 
-  afterEach(async () => {
-    // Clean up conversations.
-    for (const sId of [
-      ...conversations.accessible,
-      ...conversations.restricted,
-    ]) {
-      await destroyConversation(adminAuth, { conversationId: sId });
-    }
-  });
-
   it("should filter conversations based on user permissions", async () => {
     const userConversations = await ConversationResource.listAll(userAuth);
     const adminConversations = await ConversationResource.listAll(adminAuth);
@@ -720,11 +1067,6 @@ describe("baseFetchWithAuthorization with space-based permissions", () => {
     const conversationIds = allConversations.map((c) => c.sId);
 
     expect(conversationIds).toContain(emptySpaceConvo.sId);
-
-    // Clean up.
-    await destroyConversation(adminAuth, {
-      conversationId: emptySpaceConvo.sId,
-    });
   });
 
   it("should skip permission filtering when dangerouslySkipPermissionFiltering is true", async () => {
@@ -767,26 +1109,21 @@ describe("baseFetchWithAuthorization with space-based permissions", () => {
     });
     const withDeletedIds = withDeleted.map((c) => c.sId);
     expect(withDeletedIds).toContain(deletableConvo.sId);
-
-    // Clean up
-    await destroyConversation(adminAuth, {
-      conversationId: deletableConvo.sId,
-    });
   });
 
   it("should respect limit parameter", async () => {
     // Create multiple conversations
-    const convo1 = await ConversationFactory.create(adminAuth, {
+    await ConversationFactory.create(adminAuth, {
       agentConfigurationId: agents[0].sId,
       requestedSpaceIds: [globalSpace.id],
       messagesCreatedAt: [dateFromDaysAgo(5)],
     });
-    const convo2 = await ConversationFactory.create(adminAuth, {
+    await ConversationFactory.create(adminAuth, {
       agentConfigurationId: agents[0].sId,
       requestedSpaceIds: [globalSpace.id],
       messagesCreatedAt: [dateFromDaysAgo(4)],
     });
-    const convo3 = await ConversationFactory.create(adminAuth, {
+    await ConversationFactory.create(adminAuth, {
       agentConfigurationId: agents[0].sId,
       requestedSpaceIds: [globalSpace.id],
       messagesCreatedAt: [dateFromDaysAgo(3)],
@@ -797,11 +1134,6 @@ describe("baseFetchWithAuthorization with space-based permissions", () => {
     const allConversationsUnlimited =
       await ConversationResource.listAll(adminAuth);
     expect(allConversationsUnlimited.length).toBeGreaterThanOrEqual(5); // At least our test conversations
-
-    // Clean up
-    await destroyConversation(adminAuth, { conversationId: convo1.sId });
-    await destroyConversation(adminAuth, { conversationId: convo2.sId });
-    await destroyConversation(adminAuth, { conversationId: convo3.sId });
   });
 
   it("should return empty array when no conversations exist for workspace", async () => {
@@ -852,12 +1184,6 @@ describe("baseFetchWithAuthorization with space-based permissions", () => {
       await ConversationResource.listAll(refreshedAdminAuth);
     const conversationIds = conversations.map((c) => c.sId);
     expect(conversationIds).toContain(convoWithSpace.sId);
-
-    // Clean up
-    await destroyConversation(refreshedAdminAuth, {
-      conversationId: convoWithSpace.sId,
-    });
-    await adminSpace.delete(refreshedAdminAuth, { hardDelete: false });
   });
 
   it("should handle conversations with multiple space IDs", async () => {
@@ -878,11 +1204,6 @@ describe("baseFetchWithAuthorization with space-based permissions", () => {
 
     // Admin should see it.
     expect(adminConvoIds).toContain(multiSpaceConvo.sId);
-
-    // Clean up.
-    await destroyConversation(adminAuth, {
-      conversationId: multiSpaceConvo.sId,
-    });
   });
 
   it("should filter out conversations referencing deleted spaces", async () => {
@@ -915,11 +1236,6 @@ describe("baseFetchWithAuthorization with space-based permissions", () => {
     allConversations = await ConversationResource.listAll(auth);
     conversationIds = allConversations.map((c) => c.sId);
     expect(conversationIds).not.toContain(tempSpaceConvo.sId);
-
-    // Clean up the conversation.
-    await destroyConversation(auth, {
-      conversationId: tempSpaceConvo.sId,
-    });
   });
 });
 
@@ -971,14 +1287,6 @@ describe("getOptions", () => {
       // Test via countForWorkspace
       const count = await ConversationResource.countForWorkspace(adminAuth);
       expect(count).toBeGreaterThanOrEqual(1);
-
-      // Clean up
-      await destroyConversation(adminAuth, {
-        conversationId: normalConvo.sId,
-      });
-      await destroyConversation(adminAuth, {
-        conversationId: deletedConvo.sId,
-      });
     });
 
     it("should include test conversations by default", async () => {
@@ -1007,14 +1315,6 @@ describe("getOptions", () => {
       const countBefore =
         await ConversationResource.countForWorkspace(adminAuth);
       expect(countBefore).toBeGreaterThanOrEqual(2);
-
-      // Clean up
-      await destroyConversation(adminAuth, {
-        conversationId: normalConvo.sId,
-      });
-      await destroyConversation(adminAuth, {
-        conversationId: testConvo.sId,
-      });
     });
 
     it("should exclude deleted conversations but include test conversations by default", async () => {
@@ -1046,17 +1346,6 @@ describe("getOptions", () => {
       expect(conversationIds).toContain(normalConvo.sId);
       expect(conversationIds).not.toContain(deletedConvo.sId);
       expect(conversationIds).toContain(testConvo.sId);
-
-      // Clean up
-      await destroyConversation(adminAuth, {
-        conversationId: normalConvo.sId,
-      });
-      await destroyConversation(adminAuth, {
-        conversationId: deletedConvo.sId,
-      });
-      await destroyConversation(adminAuth, {
-        conversationId: testConvo.sId,
-      });
     });
   });
 
@@ -1101,14 +1390,6 @@ describe("getOptions", () => {
       );
 
       expect(countWithDeleted).toBeGreaterThan(countWithoutDeleted);
-
-      // Clean up
-      await destroyConversation(adminAuth, {
-        conversationId: normalConvo.sId,
-      });
-      await destroyConversation(adminAuth, {
-        conversationId: deletedConvo.sId,
-      });
     });
 
     it("should include test conversations when only includeDeleted is true", async () => {
@@ -1142,17 +1423,6 @@ describe("getOptions", () => {
       expect(conversationIds).toContain(normalConvo.sId);
       expect(conversationIds).toContain(deletedConvo.sId);
       expect(conversationIds).toContain(testConvo.sId);
-
-      // Clean up
-      await destroyConversation(adminAuth, {
-        conversationId: normalConvo.sId,
-      });
-      await destroyConversation(adminAuth, {
-        conversationId: deletedConvo.sId,
-      });
-      await destroyConversation(adminAuth, {
-        conversationId: testConvo.sId,
-      });
     });
   });
 
@@ -1197,14 +1467,6 @@ describe("getOptions", () => {
       );
 
       expect(countWithoutExclude).toBeGreaterThan(countWithExclude);
-
-      // Clean up
-      await destroyConversation(adminAuth, {
-        conversationId: normalConvo.sId,
-      });
-      await destroyConversation(adminAuth, {
-        conversationId: testConvo.sId,
-      });
     });
 
     it("should still exclude deleted conversations when only excludeTest is true", async () => {
@@ -1238,17 +1500,6 @@ describe("getOptions", () => {
       expect(conversationIds).toContain(normalConvo.sId);
       expect(conversationIds).not.toContain(deletedConvo.sId);
       expect(conversationIds).not.toContain(testConvo.sId);
-
-      // Clean up
-      await destroyConversation(adminAuth, {
-        conversationId: normalConvo.sId,
-      });
-      await destroyConversation(adminAuth, {
-        conversationId: deletedConvo.sId,
-      });
-      await destroyConversation(adminAuth, {
-        conversationId: testConvo.sId,
-      });
     });
   });
 
@@ -1292,17 +1543,6 @@ describe("getOptions", () => {
         excludeTest: true,
       });
       expect(count).toBeGreaterThanOrEqual(2);
-
-      // Clean up
-      await destroyConversation(adminAuth, {
-        conversationId: normalConvo.sId,
-      });
-      await destroyConversation(adminAuth, {
-        conversationId: deletedConvo.sId,
-      });
-      await destroyConversation(adminAuth, {
-        conversationId: testConvo.sId,
-      });
     });
   });
 
@@ -1327,7 +1567,9 @@ describe("getOptions", () => {
       const { frontSequelize } = await import("@app/lib/resources/storage");
 
       await frontSequelize.query(
-        `UPDATE conversations SET "updatedAt" = :updatedAt WHERE id = :id`,
+        `UPDATE conversations
+         SET "updatedAt" = :updatedAt
+         WHERE id = :id`,
         {
           replacements: {
             updatedAt: threeDaysAgo.toISOString(),
@@ -1337,7 +1579,9 @@ describe("getOptions", () => {
       );
 
       await frontSequelize.query(
-        `UPDATE conversations SET "updatedAt" = :updatedAt WHERE id = :id`,
+        `UPDATE conversations
+         SET "updatedAt" = :updatedAt
+         WHERE id = :id`,
         {
           replacements: {
             updatedAt: fiveDaysAgo.toISOString(),
@@ -1361,14 +1605,6 @@ describe("getOptions", () => {
         updatedSince: fourDaysAgoMs,
       });
       expect(count).toBeGreaterThanOrEqual(1);
-
-      // Clean up
-      await destroyConversation(adminAuth, {
-        conversationId: recentConvo.sId,
-      });
-      await destroyConversation(adminAuth, {
-        conversationId: oldConvo.sId,
-      });
     });
 
     it("should include conversations updated exactly at the updatedSince timestamp", async () => {
@@ -1384,7 +1620,9 @@ describe("getOptions", () => {
       const { frontSequelize } = await import("@app/lib/resources/storage");
 
       await frontSequelize.query(
-        `UPDATE conversations SET "updatedAt" = :updatedAt WHERE id = :id`,
+        `UPDATE conversations
+         SET "updatedAt" = :updatedAt
+         WHERE id = :id`,
         {
           replacements: {
             updatedAt: threeDaysAgo.toISOString(),
@@ -1401,11 +1639,6 @@ describe("getOptions", () => {
       const conversationIds = conversations.map((c) => c.sId);
 
       expect(conversationIds).toContain(convo.sId);
-
-      // Clean up
-      await destroyConversation(adminAuth, {
-        conversationId: convo.sId,
-      });
     });
   });
 
@@ -1432,7 +1665,9 @@ describe("getOptions", () => {
       const { frontSequelize } = await import("@app/lib/resources/storage");
 
       await frontSequelize.query(
-        `UPDATE conversations SET "updatedAt" = :updatedAt WHERE id = :id`,
+        `UPDATE conversations
+         SET "updatedAt" = :updatedAt
+         WHERE id = :id`,
         {
           replacements: {
             updatedAt: threeDaysAgo.toISOString(),
@@ -1442,7 +1677,9 @@ describe("getOptions", () => {
       );
 
       await frontSequelize.query(
-        `UPDATE conversations SET "updatedAt" = :updatedAt WHERE id = :id`,
+        `UPDATE conversations
+         SET "updatedAt" = :updatedAt
+         WHERE id = :id`,
         {
           replacements: {
             updatedAt: fiveDaysAgo.toISOString(),
@@ -1477,14 +1714,6 @@ describe("getOptions", () => {
       expect(idsWithDeleted).toContain(recentNormalConvo.sId);
       // oldDeletedConvo was updated 5 days ago, so it won't pass updatedSince filter
       expect(idsWithDeleted).not.toContain(oldDeletedConvo.sId);
-
-      // Clean up
-      await destroyConversation(adminAuth, {
-        conversationId: recentNormalConvo.sId,
-      });
-      await destroyConversation(adminAuth, {
-        conversationId: oldDeletedConvo.sId,
-      });
     });
 
     it("should correctly combine updatedSince with excludeTest", async () => {
@@ -1509,7 +1738,9 @@ describe("getOptions", () => {
       const { frontSequelize } = await import("@app/lib/resources/storage");
 
       await frontSequelize.query(
-        `UPDATE conversations SET "updatedAt" = :updatedAt WHERE id = :id`,
+        `UPDATE conversations
+         SET "updatedAt" = :updatedAt
+         WHERE id = :id`,
         {
           replacements: {
             updatedAt: threeDaysAgo.toISOString(),
@@ -1519,7 +1750,9 @@ describe("getOptions", () => {
       );
 
       await frontSequelize.query(
-        `UPDATE conversations SET "updatedAt" = :updatedAt WHERE id = :id`,
+        `UPDATE conversations
+         SET "updatedAt" = :updatedAt
+         WHERE id = :id`,
         {
           replacements: {
             updatedAt: fiveDaysAgo.toISOString(),
@@ -1555,14 +1788,6 @@ describe("getOptions", () => {
       expect(idsWithExclude).toContain(recentNormalConvo.sId);
       // oldTestConvo was updated 5 days ago, so it won't pass updatedSince filter
       expect(idsWithExclude).not.toContain(oldTestConvo.sId);
-
-      // Clean up
-      await destroyConversation(adminAuth, {
-        conversationId: recentNormalConvo.sId,
-      });
-      await destroyConversation(adminAuth, {
-        conversationId: oldTestConvo.sId,
-      });
     });
 
     it("should correctly combine all options together", async () => {
@@ -1594,7 +1819,9 @@ describe("getOptions", () => {
       const { frontSequelize } = await import("@app/lib/resources/storage");
 
       await frontSequelize.query(
-        `UPDATE conversations SET "updatedAt" = :updatedAt WHERE id = :id`,
+        `UPDATE conversations
+         SET "updatedAt" = :updatedAt
+         WHERE id = :id`,
         {
           replacements: {
             updatedAt: threeDaysAgo.toISOString(),
@@ -1604,7 +1831,9 @@ describe("getOptions", () => {
       );
 
       await frontSequelize.query(
-        `UPDATE conversations SET "updatedAt" = :updatedAt WHERE id = :id`,
+        `UPDATE conversations
+         SET "updatedAt" = :updatedAt
+         WHERE id = :id`,
         {
           replacements: {
             updatedAt: fiveDaysAgo.toISOString(),
@@ -1614,7 +1843,9 @@ describe("getOptions", () => {
       );
 
       await frontSequelize.query(
-        `UPDATE conversations SET "updatedAt" = :updatedAt WHERE id = :id`,
+        `UPDATE conversations
+         SET "updatedAt" = :updatedAt
+         WHERE id = :id`,
         {
           replacements: {
             updatedAt: fiveDaysAgo.toISOString(),
@@ -1644,17 +1875,6 @@ describe("getOptions", () => {
         excludeTest: true,
       });
       expect(count).toBeGreaterThanOrEqual(1);
-
-      // Clean up
-      await destroyConversation(adminAuth, {
-        conversationId: recentNormalConvo.sId,
-      });
-      await destroyConversation(adminAuth, {
-        conversationId: oldDeletedConvo.sId,
-      });
-      await destroyConversation(adminAuth, {
-        conversationId: oldTestConvo.sId,
-      });
     });
   });
 
@@ -1686,14 +1906,6 @@ describe("getOptions", () => {
 
       expect(normalResult).toBe("allowed");
       expect(deletedResult).toBe("conversation_not_found");
-
-      // Clean up
-      await destroyConversation(adminAuth, {
-        conversationId: normalConvo.sId,
-      });
-      await destroyConversation(adminAuth, {
-        conversationId: deletedConvo.sId,
-      });
     });
   });
 });
@@ -1743,12 +1955,6 @@ describe("listPrivateConversationsForUser", () => {
       action: "posted",
       user: userAuth.getNonNullableUser().toJSON(),
     });
-  });
-
-  afterEach(async () => {
-    for (const sId of conversationIds) {
-      await destroyConversation(adminAuth, { conversationId: sId });
-    }
   });
 
   it("should return only conversations user participates in", async () => {
@@ -1823,8 +2029,6 @@ describe("listPrivateConversationsForUser", () => {
     expect(serializedConvs[0].updated).toBeGreaterThan(
       serializedConvs[1].updated!
     );
-
-    await destroyConversation(adminAuth, { conversationId: recentConvo.sId });
   });
 
   it("should handle empty participation list", async () => {
@@ -1865,9 +2069,6 @@ describe("listPrivateConversationsForUser", () => {
     const conversationIds = userConversations.map((c) => c.sId);
     expect(conversationIds).toContain(conversationIds[0]); // original conversation
     expect(conversationIds).not.toContain(testConvo.sId); // test conversation should be filtered out
-
-    // Clean up
-    await destroyConversation(adminAuth, { conversationId: testConvo.sId });
   });
 
   it("should return only private conversations", async () => {
@@ -1902,9 +2103,6 @@ describe("listPrivateConversationsForUser", () => {
     const privateIds = privateConversations.map((c) => c.sId);
     expect(privateIds).toContain(conversationIds[0]); // original private conversation
     expect(privateIds).not.toContain(spaceConvo.sId); // space conversation should be filtered out
-
-    // Clean up
-    await destroyConversation(adminAuth, { conversationId: spaceConvo.sId });
   });
 });
 
@@ -1980,12 +2178,6 @@ describe("listSpaceUnreadConversationsForUser", () => {
     });
   });
 
-  afterEach(async () => {
-    for (const sId of conversationIds) {
-      await destroyConversation(adminAuth, { conversationId: sId });
-    }
-  });
-
   it("should return only conversations user participates in as unreadConversations", async () => {
     const nonParticipantConversation = await ConversationFactory.create(
       adminAuth,
@@ -1997,7 +2189,7 @@ describe("listSpaceUnreadConversationsForUser", () => {
     );
 
     const userConversations =
-      await ConversationResource.listSpaceUnreadConversationsForUser(
+      await ConversationResource.listSpaceUnreadConversationsAndActivityForUser(
         userAuth,
         spaceModelIds
       );
@@ -2025,7 +2217,7 @@ describe("listSpaceUnreadConversationsForUser", () => {
     );
 
     const userConversations =
-      await ConversationResource.listSpaceUnreadConversationsForUser(
+      await ConversationResource.listSpaceUnreadConversationsAndActivityForUser(
         userAuth,
         spaceModelIds
       );
@@ -2057,7 +2249,7 @@ describe("listSpaceUnreadConversationsForUser", () => {
     assert(participation, "Participation not found");
 
     const userConversations =
-      await ConversationResource.listSpaceUnreadConversationsForUser(
+      await ConversationResource.listSpaceUnreadConversationsAndActivityForUser(
         userAuth,
         spaceModelIds
       );
@@ -2097,7 +2289,7 @@ describe("listSpaceUnreadConversationsForUser", () => {
 
     // This method explicitly filters by visibility="unlisted", so test conversations are excluded
     const userConversations =
-      await ConversationResource.listSpaceUnreadConversationsForUser(
+      await ConversationResource.listSpaceUnreadConversationsAndActivityForUser(
         userAuth,
         spaceModelIds
       );
@@ -2107,9 +2299,6 @@ describe("listSpaceUnreadConversationsForUser", () => {
     ].map((c) => c.sId);
     expect(userConversationIds).toContain(conversationIds[0]); // original conversation
     expect(userConversationIds).not.toContain(testConvo.sId); // test conversation should be filtered out
-
-    // Clean up
-    await destroyConversation(adminAuth, { conversationId: testConvo.sId });
   });
 
   it("should return only space conversations", async () => {
@@ -2127,7 +2316,7 @@ describe("listSpaceUnreadConversationsForUser", () => {
     });
 
     const spaceConversations =
-      await ConversationResource.listSpaceUnreadConversationsForUser(
+      await ConversationResource.listSpaceUnreadConversationsAndActivityForUser(
         userAuth,
         spaceModelIds
       );
@@ -2138,9 +2327,6 @@ describe("listSpaceUnreadConversationsForUser", () => {
     ].map((c) => c.sId);
     expect(spaceConversationIds).toContain(conversationIds[0]); // space conversation should be included
     expect(spaceConversationIds).not.toContain(privateConvo.sId); // private conversation should be filtered out
-
-    // Clean up
-    await destroyConversation(adminAuth, { conversationId: privateConvo.sId });
   });
 });
 
@@ -2843,15 +3029,6 @@ describe("Space Handling", () => {
       };
     });
 
-    afterEach(async () => {
-      await destroyConversation(adminAuth, {
-        conversationId: conversations.accessible,
-      });
-      await destroyConversation(adminAuth, {
-        conversationId: conversations.restricted,
-      });
-    });
-
     it("should return 'allowed' when user has access to conversation", async () => {
       const result = await ConversationResource.canAccess(
         userAuth,
@@ -2938,11 +3115,6 @@ describe("Space Handling", () => {
       );
 
       expect(result).toBe("conversation_not_found");
-
-      // Clean up
-      await destroyConversation(anotherAuth, {
-        conversationId: anotherConvo.sId,
-      });
     });
 
     it("should return 'conversation_not_found' when space is deleted", async () => {
@@ -2980,11 +3152,6 @@ describe("Space Handling", () => {
         tempConvo.sId
       );
       expect(result).toBe("conversation_not_found");
-
-      // Clean up
-      await destroyConversation(refreshedAdminAuth, {
-        conversationId: tempConvo.sId,
-      });
     });
 
     it("should handle conversations with multiple space IDs - all spaces must be accessible", async () => {
@@ -3008,11 +3175,6 @@ describe("Space Handling", () => {
         multiSpaceConvo.sId
       );
       expect(adminResult).toBe("allowed");
-
-      // Clean up
-      await destroyConversation(adminAuth, {
-        conversationId: multiSpaceConvo.sId,
-      });
     });
 
     it("should return 'allowed' for conversation with no requested spaces", async () => {
@@ -3028,11 +3190,6 @@ describe("Space Handling", () => {
       );
 
       expect(result).toBe("allowed");
-
-      // Clean up
-      await destroyConversation(adminAuth, {
-        conversationId: emptySpaceConvo.sId,
-      });
     });
   });
 
@@ -3057,12 +3214,6 @@ describe("Space Handling", () => {
       });
 
       conversationIds = [conversation.sId];
-    });
-
-    afterEach(async () => {
-      for (const sId of conversationIds) {
-        await destroyConversation(auth, { conversationId: sId });
-      }
     });
 
     it("should retrieve a user message with the userMessage include", async () => {
@@ -3314,12 +3465,6 @@ describe("Space Handling", () => {
       });
     });
 
-    afterEach(async () => {
-      await destroyConversation(ownerAuth, {
-        conversationId: conversation.sId,
-      });
-    });
-
     it("retrieves a message within the given conversation", async () => {
       const conversationResource = await ConversationResource.fetchById(
         ownerAuth,
@@ -3410,12 +3555,11 @@ describe("Space Handling", () => {
       });
       assert(mainMessage, "No main message found");
 
-      const branch = await ConversationBranchModel.create({
+      const branch = await ConversationBranchResource.makeNew(ownerAuth, {
         state: "open",
         previousMessageId: mainMessage.id,
         conversationId: conversationResource.id,
         userId: ownerUser.id,
-        workspaceId: workspace.id,
       });
 
       const branchUserMessageRow = await UserMessageModel.create({
@@ -3431,11 +3575,6 @@ describe("Space Handling", () => {
         clientSideMCPServerIds: [],
       });
 
-      const branchSId = ConversationBranchResource.modelIdToSId({
-        id: branch.id,
-        workspaceId: workspace.id,
-      });
-
       const branchMessage = await MessageModel.create({
         sId: generateRandomModelSId(),
         rank: 1,
@@ -3444,7 +3583,6 @@ describe("Space Handling", () => {
         userMessageId: branchUserMessageRow.id,
         workspaceId: workspace.id,
         branchId: branch.id,
-        branchSId,
       });
 
       const okResult = await ConversationResource.getMessageByIdInConversation(
@@ -3464,6 +3602,276 @@ describe("Space Handling", () => {
       if (forbiddenResult.isErr()) {
         expect(forbiddenResult.error.message).toBe("Message not found");
       }
+    });
+  });
+
+  describe("getPendingUserMessagesInConversation", () => {
+    let workspace: Awaited<ReturnType<typeof WorkspaceFactory.basic>>;
+    let auth: Authenticator;
+    let conversation: ConversationWithoutContentType;
+    let agents: LightAgentConfigurationType[];
+
+    beforeEach(async () => {
+      workspace = await WorkspaceFactory.basic();
+      const user = await UserFactory.basic();
+      auth = await Authenticator.fromUserIdAndWorkspaceId(
+        user.sId,
+        workspace.sId
+      );
+      agents = await setupTestAgents(workspace, user);
+
+      conversation = await ConversationFactory.create(auth, {
+        agentConfigurationId: agents[0].sId,
+        messagesCreatedAt: [],
+      });
+    });
+
+    async function createPendingUserMessage(
+      conversationModelId: number,
+      rank: number,
+      branchId: number | null = null
+    ) {
+      const user = auth.getNonNullableUser();
+      const userMessageRow = await UserMessageModel.create({
+        userId: user.id,
+        workspaceId: workspace.id,
+        content: `Pending message rank ${rank}`,
+        userContextUsername: "testuser",
+        userContextTimezone: "UTC",
+        userContextFullName: "Test User",
+        userContextEmail: "test@example.com",
+        userContextProfilePictureUrl: null,
+        userContextOrigin: "web",
+        clientSideMCPServerIds: [],
+      });
+
+      return MessageModel.create({
+        sId: generateRandomModelSId(),
+        rank,
+        conversationId: conversationModelId,
+        parentId: null,
+        userMessageId: userMessageRow.id,
+        workspaceId: workspace.id,
+        visibility: "pending",
+        branchId,
+      });
+    }
+
+    it("returns pending messages with null branchId when conversation has no branch", async () => {
+      const conversationResource = await ConversationResource.fetchById(
+        auth,
+        conversation.sId
+      );
+      assert(conversationResource, "Conversation resource not found");
+
+      const msg1 = await createPendingUserMessage(conversationResource.id, 10);
+      const msg2 = await createPendingUserMessage(conversationResource.id, 11);
+
+      const pending =
+        await ConversationResource.getPendingUserMessagesInConversation(auth, {
+          conversation,
+        });
+
+      expect(pending).toHaveLength(2);
+      expect(pending.map((m) => m.id)).toEqual([msg1.id, msg2.id]);
+    });
+
+    it("excludes pending messages that belong to a different branch", async () => {
+      const conversationResource = await ConversationResource.fetchById(
+        auth,
+        conversation.sId
+      );
+      assert(conversationResource, "Conversation resource not found");
+
+      const user = auth.getNonNullableUser();
+
+      // Create a main-thread message to anchor the branch.
+      const anchorUserMessageRow = await UserMessageModel.create({
+        userId: user.id,
+        workspaceId: workspace.id,
+        content: "Anchor message",
+        userContextUsername: "testuser",
+        userContextTimezone: "UTC",
+        userContextFullName: "Test User",
+        userContextEmail: "test@example.com",
+        userContextProfilePictureUrl: null,
+        userContextOrigin: "web",
+        clientSideMCPServerIds: [],
+      });
+      const anchorMessage = await MessageModel.create({
+        sId: generateRandomModelSId(),
+        rank: 0,
+        conversationId: conversationResource.id,
+        parentId: null,
+        userMessageId: anchorUserMessageRow.id,
+        workspaceId: workspace.id,
+      });
+
+      // Create two branches.
+      const branchA = await ConversationBranchResource.makeNew(auth, {
+        state: "open",
+        previousMessageId: anchorMessage.id,
+        conversationId: conversationResource.id,
+        userId: user.id,
+      });
+      const branchB = await ConversationBranchResource.makeNew(auth, {
+        state: "open",
+        previousMessageId: anchorMessage.id,
+        conversationId: conversationResource.id,
+        userId: user.id,
+      });
+
+      // Create a pending message on branchA.
+      const msgOnA = await createPendingUserMessage(
+        conversationResource.id,
+        10,
+        branchA.id
+      );
+      // Create a pending message on branchB.
+      await createPendingUserMessage(conversationResource.id, 11, branchB.id);
+      // Create a pending message with no branch.
+      const msgNoBranch = await createPendingUserMessage(
+        conversationResource.id,
+        12
+      );
+
+      // Query with conversation scoped to branchA.
+      const conversationOnBranchA: ConversationWithoutContentType = {
+        ...conversation,
+        branchId: branchA.sId,
+      };
+
+      const pending =
+        await ConversationResource.getPendingUserMessagesInConversation(auth, {
+          conversation: conversationOnBranchA,
+        });
+
+      // Should include the message on branchA and the one with null branchId,
+      // but NOT the message on branchB.
+      expect(pending).toHaveLength(2);
+      expect(pending.map((m) => m.id)).toEqual([msgOnA.id, msgNoBranch.id]);
+    });
+
+    it("excludes all branched pending messages when conversation has no branch", async () => {
+      const conversationResource = await ConversationResource.fetchById(
+        auth,
+        conversation.sId
+      );
+      assert(conversationResource, "Conversation resource not found");
+
+      const user = auth.getNonNullableUser();
+
+      // Create a main-thread anchor message.
+      const anchorUserMessageRow = await UserMessageModel.create({
+        userId: user.id,
+        workspaceId: workspace.id,
+        content: "Anchor",
+        userContextUsername: "testuser",
+        userContextTimezone: "UTC",
+        userContextFullName: "Test User",
+        userContextEmail: "test@example.com",
+        userContextProfilePictureUrl: null,
+        userContextOrigin: "web",
+        clientSideMCPServerIds: [],
+      });
+      const anchorMessage = await MessageModel.create({
+        sId: generateRandomModelSId(),
+        rank: 0,
+        conversationId: conversationResource.id,
+        parentId: null,
+        userMessageId: anchorUserMessageRow.id,
+        workspaceId: workspace.id,
+      });
+
+      const branch = await ConversationBranchResource.makeNew(auth, {
+        state: "open",
+        previousMessageId: anchorMessage.id,
+        conversationId: conversationResource.id,
+        userId: user.id,
+      });
+
+      // A pending message on the branch.
+      await createPendingUserMessage(conversationResource.id, 10, branch.id);
+      // A pending message with no branch.
+      const msgNoBranch = await createPendingUserMessage(
+        conversationResource.id,
+        11
+      );
+
+      // Query with the main conversation (branchId: null).
+      const pending =
+        await ConversationResource.getPendingUserMessagesInConversation(auth, {
+          conversation,
+        });
+
+      // Only the null-branch message is returned.
+      expect(pending).toHaveLength(1);
+      expect(pending[0].id).toBe(msgNoBranch.id);
+    });
+
+    it("returns pending messages ordered by rank", async () => {
+      const conversationResource = await ConversationResource.fetchById(
+        auth,
+        conversation.sId
+      );
+      assert(conversationResource, "Conversation resource not found");
+
+      const msg3 = await createPendingUserMessage(conversationResource.id, 30);
+      const msg1 = await createPendingUserMessage(conversationResource.id, 10);
+      const msg2 = await createPendingUserMessage(conversationResource.id, 20);
+
+      const pending =
+        await ConversationResource.getPendingUserMessagesInConversation(auth, {
+          conversation,
+        });
+
+      expect(pending.map((m) => m.id)).toEqual([msg1.id, msg2.id, msg3.id]);
+    });
+
+    it("does not return visible or deleted messages", async () => {
+      const conversationResource = await ConversationResource.fetchById(
+        auth,
+        conversation.sId
+      );
+      assert(conversationResource, "Conversation resource not found");
+
+      // Create one pending message.
+      const pendingMsg = await createPendingUserMessage(
+        conversationResource.id,
+        10
+      );
+
+      // Create a visible message (default visibility).
+      const user = auth.getNonNullableUser();
+      const visibleUserMessageRow = await UserMessageModel.create({
+        userId: user.id,
+        workspaceId: workspace.id,
+        content: "Visible message",
+        userContextUsername: "testuser",
+        userContextTimezone: "UTC",
+        userContextFullName: "Test User",
+        userContextEmail: "test@example.com",
+        userContextProfilePictureUrl: null,
+        userContextOrigin: "web",
+        clientSideMCPServerIds: [],
+      });
+      await MessageModel.create({
+        sId: generateRandomModelSId(),
+        rank: 11,
+        conversationId: conversationResource.id,
+        parentId: null,
+        userMessageId: visibleUserMessageRow.id,
+        workspaceId: workspace.id,
+        visibility: "visible",
+      });
+
+      const pending =
+        await ConversationResource.getPendingUserMessagesInConversation(auth, {
+          conversation,
+        });
+
+      expect(pending).toHaveLength(1);
+      expect(pending[0].id).toBe(pendingMsg.id);
     });
   });
 
@@ -3989,12 +4397,11 @@ describe("Space Handling", () => {
       });
 
       // Create a branch from that message
-      const branch = await ConversationBranchModel.create({
+      const branch = await ConversationBranchResource.makeNew(auth, {
         state: "open",
         previousMessageId: mainMessage.id,
         conversationId: conversationResource.id,
         userId: user.id,
-        workspaceId: workspace.id,
       });
 
       // Create a branch user message at the same rank, attached to the branch
@@ -4055,10 +4462,6 @@ describe("markAsActionRequired", () => {
       messagesCreatedAt: [dateFromDaysAgo(5)],
     });
     conversationId = conversation.sId;
-  });
-
-  afterEach(async () => {
-    await destroyConversation(auth, { conversationId });
   });
 
   it("should set actionRequired to true for the user's participant", async () => {
@@ -4258,7 +4661,6 @@ describe("markAsActionRequired", () => {
     let workspace: LightWorkspaceType;
     let space: SpaceResource;
     let agents: LightAgentConfigurationType[];
-    let conversationIds: string[];
 
     beforeEach(async () => {
       const {
@@ -4300,14 +4702,6 @@ describe("markAsActionRequired", () => {
         regularUser.sId,
         workspace.sId
       );
-
-      conversationIds = [];
-    });
-
-    afterEach(async () => {
-      for (const sId of conversationIds) {
-        await destroyConversation(adminAuth, { conversationId: sId });
-      }
     });
 
     it("should return conversations in a space", async () => {
@@ -4324,8 +4718,6 @@ describe("markAsActionRequired", () => {
         messagesCreatedAt: [dateFromDaysAgo(3)],
       });
 
-      conversationIds = [convo1.sId, convo2.sId];
-
       const conversations = await ConversationResource.listConversationsInSpace(
         adminAuth,
         {
@@ -4333,9 +4725,9 @@ describe("markAsActionRequired", () => {
         }
       );
 
-      const conversationSIds = conversations.map((c) => c.sId);
-      expect(conversationSIds).toContain(convo1.sId);
-      expect(conversationSIds).toContain(convo2.sId);
+      const conversationIds = conversations.map((c) => c.sId);
+      expect(conversationIds).toContain(convo1.sId);
+      expect(conversationIds).toContain(convo2.sId);
       expect(conversations.length).toBeGreaterThanOrEqual(2);
     });
 
@@ -4353,8 +4745,6 @@ describe("markAsActionRequired", () => {
         messagesCreatedAt: [dateFromDaysAgo(3)],
       });
 
-      conversationIds = [convo1.sId, convo2.sId];
-
       // Delete one conversation by updating visibility directly
       await ConversationModel.update(
         { visibility: "deleted" },
@@ -4368,9 +4758,9 @@ describe("markAsActionRequired", () => {
         }
       );
 
-      const conversationSIds = conversations.map((c) => c.sId);
-      expect(conversationSIds).toContain(convo1.sId);
-      expect(conversationSIds).not.toContain(convo2.sId);
+      const conversationIds = conversations.map((c) => c.sId);
+      expect(conversationIds).toContain(convo1.sId);
+      expect(conversationIds).not.toContain(convo2.sId);
     });
 
     it("should include deleted conversations when includeDeleted is true", async () => {
@@ -4386,8 +4776,6 @@ describe("markAsActionRequired", () => {
         spaceId: space.id,
         messagesCreatedAt: [dateFromDaysAgo(3)],
       });
-
-      conversationIds = [convo1.sId, convo2.sId];
 
       // Delete one conversation by updating visibility directly
       await ConversationModel.update(
@@ -4405,9 +4793,9 @@ describe("markAsActionRequired", () => {
         }
       );
 
-      const conversationSIds = conversations.map((c) => c.sId);
-      expect(conversationSIds).toContain(convo1.sId);
-      expect(conversationSIds).toContain(convo2.sId);
+      const conversationIds = conversations.map((c) => c.sId);
+      expect(conversationIds).toContain(convo1.sId);
+      expect(conversationIds).toContain(convo2.sId);
     });
 
     it("should filter conversations by updatedSince timestamp", async () => {
@@ -4436,14 +4824,14 @@ describe("markAsActionRequired", () => {
         messagesCreatedAt: [twoDaysAgo],
       });
 
-      conversationIds = [convo1.sId, convo2.sId, convo3.sId];
-
       // Set updatedAt on conversations to match their message creation times
       // Use raw SQL to ensure updatedAt is set correctly without Sequelize auto-updating it
       const { frontSequelize } = await import("@app/lib/resources/storage");
 
       await frontSequelize.query(
-        `UPDATE conversations SET "updatedAt" = :updatedAt WHERE id = :id`,
+        `UPDATE conversations
+         SET "updatedAt" = :updatedAt
+         WHERE id = :id`,
         {
           replacements: {
             updatedAt: sixDaysAgo.toISOString(),
@@ -4453,7 +4841,9 @@ describe("markAsActionRequired", () => {
       );
 
       await frontSequelize.query(
-        `UPDATE conversations SET "updatedAt" = :updatedAt WHERE id = :id`,
+        `UPDATE conversations
+         SET "updatedAt" = :updatedAt
+         WHERE id = :id`,
         {
           replacements: {
             updatedAt: fourDaysAgo.toISOString(),
@@ -4463,7 +4853,9 @@ describe("markAsActionRequired", () => {
       );
 
       await frontSequelize.query(
-        `UPDATE conversations SET "updatedAt" = :updatedAt WHERE id = :id`,
+        `UPDATE conversations
+         SET "updatedAt" = :updatedAt
+         WHERE id = :id`,
         {
           replacements: {
             updatedAt: twoDaysAgo.toISOString(),
@@ -4494,12 +4886,12 @@ describe("markAsActionRequired", () => {
         }
       );
 
-      const conversationSIds = conversations.map((c) => c.sId);
+      const conversationIds = conversations.map((c) => c.sId);
       // Verify convo2 and convo3 are included (updated more recently than 4.5 days ago)
-      expect(conversationSIds).toContain(convo2.sId);
-      expect(conversationSIds).toContain(convo3.sId);
+      expect(conversationIds).toContain(convo2.sId);
+      expect(conversationIds).toContain(convo3.sId);
       // Verify convo1 is excluded (updated before 4.5 days ago)
-      expect(conversationSIds).not.toContain(convo1.sId);
+      expect(conversationIds).not.toContain(convo1.sId);
     });
 
     it("should return empty array for space with no conversations", async () => {
@@ -4541,8 +4933,6 @@ describe("markAsActionRequired", () => {
         messagesCreatedAt: [dateFromDaysAgo(5)],
       });
 
-      conversationIds = [convo.sId];
-
       // Regular user should not see conversation without skip permission filtering
       const conversationsWithoutSkip =
         await ConversationResource.listConversationsInSpace(userAuth, {
@@ -4580,8 +4970,6 @@ describe("markAsActionRequired", () => {
         messagesCreatedAt: [twoDaysAgo],
       });
 
-      conversationIds = [convo1.sId, convo2.sId];
-
       // Set updatedAt on conversations
       // Use fields option to explicitly specify which fields to update
       await ConversationModel.update(
@@ -4614,9 +5002,9 @@ describe("markAsActionRequired", () => {
         }
       );
 
-      const conversationSIds = conversations.map((c) => c.sId);
+      const conversationIds = conversations.map((c) => c.sId);
       // convo2 should be included (updated after threshold, not deleted)
-      expect(conversationSIds).toContain(convo2.sId);
+      expect(conversationIds).toContain(convo2.sId);
       // convo1 should be included (deleted but includeDeleted=true)
       // Note: convo1 was updated 4 days ago, so it won't pass updatedSince filter
       // This test verifies the combination works, even if convo1 is filtered out by updatedSince
@@ -4658,10 +5046,6 @@ describe("ConversationResource.isConversationCreator", () => {
       action: "posted",
       user: auth.getNonNullableUser().toJSON(),
     });
-  });
-
-  afterEach(async () => {
-    await destroyConversation(auth, { conversationId });
   });
 
   it("should return true when user is the creator (first participant)", async () => {
@@ -4810,7 +5194,6 @@ describe("ConversationResource.listConversationsInSpacePaginated", () => {
   let workspace: LightWorkspaceType;
   let space: SpaceResource;
   let agents: LightAgentConfigurationType[];
-  let conversationIds: string[];
 
   const createConvoWithUpdatedAt = async (daysAgo: number) => {
     const convo = await ConversationFactory.create(adminAuth, {
@@ -4821,7 +5204,9 @@ describe("ConversationResource.listConversationsInSpacePaginated", () => {
     });
     const { frontSequelize } = await import("@app/lib/resources/storage");
     await frontSequelize.query(
-      `UPDATE conversations SET "updatedAt" = :updatedAt WHERE id = :id`,
+      `UPDATE conversations
+       SET "updatedAt" = :updatedAt
+       WHERE id = :id`,
       {
         replacements: {
           updatedAt: dateFromDaysAgo(daysAgo).toISOString(),
@@ -4859,22 +5244,12 @@ describe("ConversationResource.listConversationsInSpacePaginated", () => {
       adminUser.sId,
       workspace.sId
     );
-
-    conversationIds = [];
-  });
-
-  afterEach(async () => {
-    for (const sId of conversationIds) {
-      await destroyConversation(adminAuth, { conversationId: sId });
-    }
   });
 
   it("should return first page with hasMore: true when more results exist", async () => {
-    const convo1 = await createConvoWithUpdatedAt(5);
-    const convo2 = await createConvoWithUpdatedAt(3);
-    const convo3 = await createConvoWithUpdatedAt(1);
-
-    conversationIds = [convo1.sId, convo2.sId, convo3.sId];
+    await createConvoWithUpdatedAt(5);
+    await createConvoWithUpdatedAt(3);
+    await createConvoWithUpdatedAt(1);
 
     const result = await ConversationResource.listConversationsInSpacePaginated(
       adminAuth,
@@ -4890,9 +5265,7 @@ describe("ConversationResource.listConversationsInSpacePaginated", () => {
   });
 
   it("should return hasMore: false when no more results", async () => {
-    const convo1 = await createConvoWithUpdatedAt(1);
-
-    conversationIds = [convo1.sId];
+    await createConvoWithUpdatedAt(1);
 
     const result = await ConversationResource.listConversationsInSpacePaginated(
       adminAuth,
@@ -4907,9 +5280,7 @@ describe("ConversationResource.listConversationsInSpacePaginated", () => {
   });
 
   it("should return correct lastValue as timestamp string", async () => {
-    const convo1 = await createConvoWithUpdatedAt(1);
-
-    conversationIds = [convo1.sId];
+    await createConvoWithUpdatedAt(1);
 
     const expectedTimestamp = dateFromDaysAgo(1);
     const result = await ConversationResource.listConversationsInSpacePaginated(
@@ -4934,8 +5305,6 @@ describe("ConversationResource.listConversationsInSpacePaginated", () => {
     const convo2 = await createConvoWithUpdatedAt(3);
     const convo3 = await createConvoWithUpdatedAt(2);
     const convo4 = await createConvoWithUpdatedAt(1);
-
-    conversationIds = [convo1.sId, convo2.sId, convo3.sId, convo4.sId];
 
     // First page (newest first by default)
     const page1 = await ConversationResource.listConversationsInSpacePaginated(
@@ -4971,14 +5340,46 @@ describe("ConversationResource.listConversationsInSpacePaginated", () => {
     expect(page1Sids.some((sId) => page2Sids.includes(sId))).toBe(false);
   });
 
+  it("should apply updatedSince on every page when using lastValue cursor", async () => {
+    const outsideWindow = await createConvoWithUpdatedAt(20);
+    const insideA = await createConvoWithUpdatedAt(5);
+    const insideB = await createConvoWithUpdatedAt(3);
+
+    const daysBack = 10;
+    const cutoffMs = Date.now() - daysBack * 24 * 60 * 60 * 1000;
+
+    const seen = new Set<string>();
+    let lastValue: string | undefined;
+    for (let i = 0; i < 10; i++) {
+      const page = await ConversationResource.listConversationsInSpacePaginated(
+        adminAuth,
+        {
+          spaceId: space.sId,
+          options: { updatedSince: cutoffMs, excludeTest: true },
+          pagination: { limit: 1, lastValue },
+        }
+      );
+
+      for (const c of page.conversations) {
+        seen.add(c.sId);
+      }
+      if (!page.hasMore) {
+        break;
+      }
+      lastValue = page.lastValue ?? undefined;
+    }
+
+    expect(seen.has(insideA.sId)).toBe(true);
+    expect(seen.has(insideB.sId)).toBe(true);
+    expect(seen.has(outsideWindow.sId)).toBe(false);
+  });
+
   it("should iterate through all pages and return all conversations", async () => {
     const convos = [];
     for (let i = 0; i < 5; i++) {
       const convo = await createConvoWithUpdatedAt(5 - i);
       convos.push(convo);
     }
-
-    conversationIds = convos.map((c) => c.sId);
 
     // Collect all conversations through pagination
     const allSids: string[] = [];
@@ -5016,8 +5417,6 @@ describe("ConversationResource.listConversationsInSpacePaginated", () => {
     const convo1 = await createConvoWithUpdatedAt(3);
     const convo2 = await createConvoWithUpdatedAt(1);
 
-    conversationIds = [convo1.sId, convo2.sId];
-
     const result = await ConversationResource.listConversationsInSpacePaginated(
       adminAuth,
       {
@@ -5035,8 +5434,6 @@ describe("ConversationResource.listConversationsInSpacePaginated", () => {
   it("should return oldest first when orderDirection is asc", async () => {
     const convo1 = await createConvoWithUpdatedAt(3);
     const convo2 = await createConvoWithUpdatedAt(1);
-
-    conversationIds = [convo1.sId, convo2.sId];
 
     const result = await ConversationResource.listConversationsInSpacePaginated(
       adminAuth,
@@ -5097,8 +5494,6 @@ describe("ConversationResource.listConversationsInSpacePaginated", () => {
     const convo1 = await createConvoWithUpdatedAt(2);
     const convo2 = await createConvoWithUpdatedAt(1);
 
-    conversationIds = [convo1.sId, convo2.sId];
-
     // Delete one conversation
     await ConversationModel.update(
       { visibility: "deleted" },
@@ -5134,24 +5529,26 @@ const KNOWN_CONVERSATION_RELATED_MODELS = [
   "agent_message_feedback",
   "agent_suggestion",
   "conversation_branch",
+  "conversation_fork",
   "conversation_mcp_server_view",
   "conversation_participant",
   "conversation_skills",
   "data_source",
   "message",
+  "project_todo_conversation",
   "sandbox",
+  "skill_suggestion",
   "user_conversation_reads",
   "user_project_digest",
-  "conversation_butler_suggestion",
 ];
 
 const KNOWN_MESSAGE_RELATED_MODELS = [
   // Tables that have a foreign key to the `message` table.
+  "conversation_branch",
+  "conversation_fork",
   "message",
   "message_reaction",
   "mention",
-  "conversation_butler_suggestion",
-  "conversation_branch",
 ];
 
 describe("ConversationResource cleanup on delete", () => {
@@ -5251,7 +5648,7 @@ describe("ConversationResource cleanup on delete", () => {
       modelsWithMessageFK.sort();
       const knownModels = [...KNOWN_MESSAGE_RELATED_MODELS].sort();
 
-      if (modelsWithMessageFK.length !== knownModels.length) {
+      if (modelsWithMessageFK.length != knownModels.length) {
         const missing = modelsWithMessageFK.filter(
           (m) => !knownModels.includes(m)
         );

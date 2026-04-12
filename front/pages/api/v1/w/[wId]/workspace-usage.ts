@@ -2,22 +2,14 @@ import { withPublicAPIAuthentication } from "@app/lib/api/auth_wrappers";
 import type { Authenticator } from "@app/lib/auth";
 import { getFeatureFlags } from "@app/lib/auth";
 import { getConversationsDataRetention } from "@app/lib/data_retention";
-import {
-  getAssistantsUsageData,
-  getBuildersUsageData,
-  getFeedbackUsageData,
-  getMessageUsageData,
-  getUserUsageData,
-} from "@app/lib/workspace_usage";
+import { fetchUsageData } from "@app/lib/workspace_usage";
 import { getWorkspaceUsageRetentionErrorMessage } from "@app/lib/workspace_usage_retention";
 import { apiError } from "@app/logger/withlogging";
 import type { WithAPIErrorResponse } from "@app/types/error";
 import { assertNever } from "@app/types/shared/utils/assert_never";
-import type { WorkspaceType } from "@app/types/user";
 import type {
   GetWorkspaceUsageRequestType,
   GetWorkspaceUsageResponseType,
-  UsageTableType,
 } from "@dust-tt/client";
 import { GetWorkspaceUsageRequestSchema } from "@dust-tt/client";
 import { parse as parseCSV } from "csv-parse/sync";
@@ -32,7 +24,12 @@ import { fromError } from "zod-validation-error";
  * /api/v1/w/{wId}/workspace-usage:
  *   get:
  *     summary: Get workspace usage data
- *     description: Get usage data for the workspace identified by {wId} in CSV or JSON format.
+ *     deprecated: true
+ *     description: |
+ *       Deprecated: this endpoint will be removed after 2026-06-01.
+ *       Use GET /api/v1/w/{wId}/analytics/export instead.
+ *
+ *       Get usage data for the workspace identified by {wId} in CSV or JSON format.
  *     tags:
  *       - Workspace
  *     security:
@@ -270,63 +267,6 @@ function resolveDates(query: GetWorkspaceUsageRequestType) {
       };
     default:
       assertNever(query);
-  }
-}
-
-async function fetchUsageData({
-  table,
-  start,
-  end,
-  workspace,
-  includeInactive = false,
-}: {
-  table: UsageTableType;
-  start: Date;
-  end: Date;
-  workspace: WorkspaceType;
-  includeInactive?: boolean;
-}): Promise<Partial<Record<UsageTableType, string>>> {
-  switch (table) {
-    case "users":
-      return {
-        users: await getUserUsageData(start, end, workspace, {
-          includeInactive,
-        }),
-      };
-    case "assistant_messages":
-      return {
-        assistant_messages: await getMessageUsageData(start, end, workspace),
-      };
-    case "builders":
-      return { builders: await getBuildersUsageData(start, end, workspace) };
-    case "assistants":
-      return {
-        assistants: await getAssistantsUsageData(start, end, workspace, {
-          includeInactive,
-        }),
-      };
-    case "feedback":
-      return {
-        feedback: await getFeedbackUsageData(start, end, workspace),
-      };
-    case "all":
-      const [users, assistant_messages, builders, assistants, feedback] =
-        await Promise.all([
-          getUserUsageData(start, end, workspace, { includeInactive }),
-          getMessageUsageData(start, end, workspace),
-          getBuildersUsageData(start, end, workspace),
-          getAssistantsUsageData(start, end, workspace, { includeInactive }),
-          getFeedbackUsageData(start, end, workspace),
-        ]);
-      return {
-        users,
-        assistant_messages,
-        builders,
-        assistants,
-        feedback,
-      };
-    default:
-      return {};
   }
 }
 

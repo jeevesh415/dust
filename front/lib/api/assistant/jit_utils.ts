@@ -6,17 +6,11 @@ import type {
 } from "@app/lib/api/assistant/conversation/attachments";
 import {
   getAttachmentFromContentFragment,
-  getAttachmentFromFile,
+  makeFileAttachment,
 } from "@app/lib/api/assistant/conversation/attachments";
 import type { Authenticator } from "@app/lib/auth";
-import { FileResource } from "@app/lib/resources/file_resource";
-import { SpaceResource } from "@app/lib/resources/space_resource";
-import logger from "@app/logger/logger";
 import type { ConversationType } from "@app/types/assistant/conversation";
-import {
-  isAgentMessageType,
-  isProjectConversation,
-} from "@app/types/assistant/conversation";
+import { isAgentMessageType } from "@app/types/assistant/conversation";
 import { isContentFragmentType } from "@app/types/content_fragment";
 // biome-ignore lint/plugin/enforceClientTypesInPublicApi: existing usage
 import { CONTENT_NODE_MIME_TYPES } from "@dust-tt/client";
@@ -25,10 +19,8 @@ export async function listAttachments(
   auth: Authenticator,
   {
     conversation,
-    includeProjectContextFiles = true,
   }: {
     conversation: ConversationType;
-    includeProjectContextFiles?: boolean;
   }
 ): Promise<ConversationAttachmentType[]> {
   // Using a map to avoid duplicated, order matters, project files should override directly attached files as they could have be moved from conversation to project.
@@ -56,7 +48,7 @@ export async function listAttachments(
       for (const f of generatedFiles) {
         attachments.set(
           f.fileId,
-          getAttachmentFromFile({
+          makeFileAttachment({
             fileId: f.fileId,
             source: "agent",
             createdAt: f.createdAt ?? 0,
@@ -65,37 +57,8 @@ export async function listAttachments(
             title: f.title,
             snippet: f.snippet,
             isInProjectContext: f.isInProjectContext ?? false,
+            hideFromUser: f.hidden ?? false,
             creator: agentCreator,
-          })
-        );
-      }
-    }
-  }
-
-  if (isProjectConversation(conversation) && includeProjectContextFiles) {
-    const space = await SpaceResource.fetchById(auth, conversation.spaceId);
-    if (!space) {
-      logger.warn(
-        { conversationId: conversation.sId, spaceId: conversation.spaceId },
-        "Space not found for conversation"
-      );
-    } else {
-      const files = await FileResource.listByProject(auth, {
-        projectId: space.sId,
-      });
-
-      for (const f of files) {
-        attachments.set(
-          f.sId,
-          getAttachmentFromFile({
-            fileId: f.sId,
-            source: null,
-            createdAt: f.createdAt.getTime(),
-            updatedAt: f.updatedAt.getTime(),
-            contentType: f.contentType,
-            title: f.fileName,
-            snippet: f.snippet,
-            isInProjectContext: true,
           })
         );
       }

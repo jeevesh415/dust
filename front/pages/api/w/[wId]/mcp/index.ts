@@ -1,6 +1,7 @@
 /** @ignoreswagger */
 import { isCustomResourceIconType } from "@app/components/resources/resources_icons";
 import { DEFAULT_MCP_SERVER_ICON } from "@app/lib/actions/constants";
+import { isRemoteMCPServerError } from "@app/lib/actions/mcp_errors";
 import { requiresBearerTokenConfiguration } from "@app/lib/actions/mcp_helper";
 import {
   allowsMultipleInstancesOfInternalMCPServerByName,
@@ -28,7 +29,6 @@ import { RemoteMCPServerResource } from "@app/lib/resources/remote_mcp_servers_r
 import { SpaceResource } from "@app/lib/resources/space_resource";
 import logger from "@app/logger/logger";
 import { apiError } from "@app/logger/withlogging";
-import type { WithAPIErrorResponse } from "@app/types/error";
 import { getOverridablePersonalAuthInputs } from "@app/types/oauth/lib";
 import { headersArrayToRecord } from "@app/types/shared/utils/http_headers";
 import { isLeft } from "fp-ts/lib/Either";
@@ -53,6 +53,7 @@ const PostQueryParamsSchema = t.union([
   t.type({
     serverType: t.literal("remote"),
     url: t.string,
+    defaultServerId: t.union([t.number, t.undefined]),
     includeGlobal: t.union([t.boolean, t.undefined]),
     sharedSecret: t.union([t.string, t.undefined]),
     useCase: t.union([
@@ -82,15 +83,21 @@ const PostQueryParamsSchema = t.union([
       t.undefined,
     ]),
     viewName: t.union([t.string, t.undefined]),
+    oauthScope: t.union([t.string, t.undefined]),
   }),
 ]);
+
+type MCPEndpointErrorResponse = {
+  error: { type: string; message: string };
+  isRemoteServerError?: boolean;
+};
 
 async function handler(
   req: NextApiRequest,
   res: NextApiResponse<
-    WithAPIErrorResponse<
-      GetMCPServersResponseBody | CreateMCPServerResponseBody
-    >
+    | GetMCPServersResponseBody
+    | CreateMCPServerResponseBody
+    | MCPEndpointErrorResponse
   >,
   auth: Authenticator
 ): Promise<void> {
@@ -209,20 +216,25 @@ async function handler(
 
           const r = await fetchRemoteServerMetaDataByURL(auth, url, headers);
           if (r.isErr()) {
-            return apiError(req, res, {
-              status_code: 400,
-              api_error: {
+            res.status(400).json({
+              error: {
                 type: "invalid_request_error",
-                message: `Error fetching remote server metadata: ${r.error.message}`,
+                message: r.error.message,
               },
+              isRemoteServerError: isRemoteMCPServerError(r.error),
             });
+            return;
           }
 
           const metadata = r.value;
 
-          const defaultConfig = DEFAULT_REMOTE_MCP_SERVERS.find(
-            (config) => config.url === url
-          );
+          const defaultConfig =
+            DEFAULT_REMOTE_MCP_SERVERS.find((config) => config.url === url) ??
+            (body.defaultServerId !== undefined
+              ? DEFAULT_REMOTE_MCP_SERVERS.find(
+                  (config) => config.id === body.defaultServerId
+                )
+              : undefined);
 
           const name = defaultConfig?.name ?? metadata.name;
           if (name.length > MAX_NAME_LENGTH) {
@@ -418,6 +430,7 @@ async function handler(
               name,
               useCase: body.useCase ?? null,
               viewName,
+              oauthScope: body.oauthScope ?? null,
             });
 
           if (body.connectionId) {

@@ -25,6 +25,7 @@ import { useSidekickMCPServer } from "@app/components/agent_builder/sidekick/use
 import { submitAgentBuilderForm } from "@app/components/agent_builder/submitAgentBuilderForm";
 import {
   getDefaultAgentFormData,
+  getDefaultModel,
   transformAgentConfigurationToFormData,
   transformDuplicateAgentToFormData,
   transformTemplateToFormData,
@@ -48,6 +49,7 @@ import { useAgentConfigurationActions } from "@app/lib/swr/actions";
 import { useEditors } from "@app/lib/swr/agent_editors";
 import { useAgentTriggers } from "@app/lib/swr/agent_triggers";
 import { useSlackChannelsLinkedWithAgent } from "@app/lib/swr/assistants";
+import { useModels } from "@app/lib/swr/models";
 import { useAgentConfigurationSkills } from "@app/lib/swr/skills";
 import { emptyArray, useFetcher } from "@app/lib/swr/swr";
 import { getConversationRoute } from "@app/lib/utils/router";
@@ -147,6 +149,8 @@ export default function AgentBuilder({
     agentConfigurationId: agentConfiguration?.sId ?? null,
   });
 
+  const { models: availableModels } = useModels({ owner });
+
   const { slackChannels: slackChannelsLinkedWithAgent } =
     useSlackChannelsLinkedWithAgent({
       workspaceId: owner.sId,
@@ -154,6 +158,10 @@ export default function AgentBuilder({
     });
 
   const slackProvider = useMemo(() => {
+    if (!isBuilder(owner)) {
+      return null;
+    }
+
     const slackBotProvider = supportedDataSourceViews.find(
       (dsv) => dsv.dataSource.connectorProvider === "slack_bot"
     );
@@ -165,7 +173,7 @@ export default function AgentBuilder({
       (dsv) => dsv.dataSource.connectorProvider === "slack"
     );
     return slackProvider ? "slack" : null;
-  }, [supportedDataSourceViews]);
+  }, [supportedDataSourceViews, owner]);
 
   const processedActions = useMemo(() => {
     return processActionsFromStorage(actions ?? emptyArray());
@@ -235,11 +243,11 @@ export default function AgentBuilder({
     }
 
     if (assistantTemplate) {
-      return transformTemplateToFormData(assistantTemplate, user, owner);
+      return transformTemplateToFormData(assistantTemplate, user);
     }
 
-    return getDefaultAgentFormData({ owner, user });
-  }, [agentConfiguration, duplicateAgentId, assistantTemplate, user, owner]);
+    return getDefaultAgentFormData({ user });
+  }, [agentConfiguration, duplicateAgentId, assistantTemplate, user]);
 
   const form = useForm<AgentBuilderFormData>({
     resolver: zodResolver(agentBuilderFormSchema),
@@ -254,6 +262,8 @@ export default function AgentBuilder({
   useEffect(() => {
     const currentValues = form.getValues();
 
+    const defaultModel = getDefaultModel(availableModels);
+
     form.reset({
       ...currentValues,
       actions: processedActions,
@@ -265,7 +275,9 @@ export default function AgentBuilder({
             editor: user.id,
           }))
         : [],
-      triggersToUpdate: duplicateAgentId ? [] : triggers,
+      triggersToUpdate: duplicateAgentId
+        ? []
+        : triggers.filter((t) => t.editor === user.id),
       triggersToDelete: [],
       agentSettings: {
         ...currentValues.agentSettings,
@@ -277,6 +289,17 @@ export default function AgentBuilder({
             : [user],
         slackChannels: agentSlackChannels,
       },
+      // For new agents, update model settings once available models are loaded.
+      ...(!agentConfiguration && {
+        generationSettings: {
+          ...currentValues.generationSettings,
+          modelSettings: {
+            modelId: defaultModel.modelId,
+            providerId: defaultModel.providerId,
+          },
+          reasoningEffort: defaultModel.defaultReasoningEffort,
+        },
+      }),
     });
   }, [
     triggers,
@@ -293,6 +316,7 @@ export default function AgentBuilder({
     editors,
     agentConfiguration,
     agentSlackChannels,
+    availableModels,
   ]);
 
   const { showDialog, ...dialogProps } = useAwaitableDialog({
@@ -318,11 +342,10 @@ export default function AgentBuilder({
     void removeParamFromRouter(router, "showCreatedDialog");
   }, [agentConfiguration, router, router.query.showCreatedDialog]);
 
-  // Create pending agent on mount for NEW agents only
+  // Create pending agent on mount for NEW agents and DUPLICATES.
   useEffect(() => {
     if (
-      agentConfiguration ||
-      duplicateAgentId ||
+      (agentConfiguration && !duplicateAgentId) ||
       pendingAgentId ||
       hasPendingCreationRef.current
     ) {
@@ -364,7 +387,7 @@ export default function AgentBuilder({
         return;
       }
 
-      // For new agents (not editing or duplicating), use pendingAgentSId as agentConfigurationId
+      // For new agents (not editing or duplicating), use pendingAgentId as agentConfigurationId
       // For duplicating, pass null to create a new agent
       // For editing, pass the existing agent's sId
       const effectiveAgentConfigurationId = duplicateAgentId
@@ -510,7 +533,7 @@ export default function AgentBuilder({
 
   // Only load suggestions when not duplicating an existing agent.
   const suggestionsAgentId = duplicateAgentId
-    ? null
+    ? pendingAgentId
     : (agentConfiguration?.sId ?? pendingAgentId ?? null);
 
   return (
@@ -692,7 +715,11 @@ function AgentBuilderContent({
         rightPanel={
           <SidekickPanelProvider
             targetAgentConfigurationId={
-              agentConfiguration?.sId ?? pendingAgentId ?? null
+              // For duplicates, use the pending agent sId (not the source agent's sId).
+              // Targeting the source would store suggestions against the original agent.
+              isDuplicate
+                ? pendingAgentId
+                : (agentConfiguration?.sId ?? pendingAgentId ?? null)
             }
             targetAgentConfigurationVersion={agentConfiguration?.version ?? 0}
             clientSideMCPServerIds={clientSideMCPServerIds}
@@ -704,7 +731,7 @@ function AgentBuilderContent({
           >
             <ConversationSidePanelProvider>
               <AgentBuilderRightPanel
-                agentConfigurationSId={agentConfiguration?.sId}
+                agentConfigurationId={agentConfiguration?.sId}
               />
             </ConversationSidePanelProvider>
           </SidekickPanelProvider>

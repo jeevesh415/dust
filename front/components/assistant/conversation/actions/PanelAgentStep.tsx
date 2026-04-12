@@ -1,4 +1,9 @@
 import { MCPActionDetails } from "@app/components/actions/mcp/details/MCPActionDetails";
+import { PendingToolCallDetails } from "@app/components/assistant/conversation/actions/PendingToolCallDetails";
+import {
+  getPendingToolCallKey,
+  type PendingToolCall,
+} from "@app/components/assistant/conversation/types";
 import type { AgentMCPActionWithOutputType } from "@app/types/actions";
 import type { ParsedContentItem } from "@app/types/assistant/conversation";
 import type { LightWorkspaceType } from "@app/types/user";
@@ -9,10 +14,16 @@ interface AgentStepProps {
   entries?: ParsedContentItem[];
   reasoningContent?: string;
   isStreaming?: boolean;
+  pendingToolCalls?: PendingToolCall[];
   streamingActions?: AgentMCPActionWithOutputType[];
   streamActionProgress: Map<number, any>;
   owner: LightWorkspaceType;
-  messageStatus: "created" | "succeeded" | "failed" | "cancelled";
+  messageStatus:
+    | "created"
+    | "succeeded"
+    | "failed"
+    | "cancelled"
+    | "gracefully_stopped";
   showSeparator?: boolean;
 }
 
@@ -21,6 +32,7 @@ export function PanelAgentStep({
   entries,
   reasoningContent,
   isStreaming = false,
+  pendingToolCalls = [],
   streamingActions = [],
   streamActionProgress,
   owner,
@@ -75,7 +87,7 @@ export function PanelAgentStep({
         return (
           <div key={`action-${entry.action.id}`}>
             <MCPActionDetails
-              displayContext="sidebar"
+              displayContext="sidebar-all-actions"
               action={entry.action}
               lastNotification={streamProgress ?? null}
               owner={owner}
@@ -97,7 +109,7 @@ export function PanelAgentStep({
             return (
               <div key={`streaming-action-${action.id}`} className="mb-4">
                 <MCPActionDetails
-                  displayContext="sidebar"
+                  displayContext="sidebar-all-actions"
                   action={action}
                   lastNotification={lastNotification}
                   owner={owner}
@@ -108,6 +120,15 @@ export function PanelAgentStep({
           })}
         </div>
       )}
+
+      {pendingToolCalls.map((pendingToolCall, index) => (
+        <div key={getPendingToolCallKey(pendingToolCall, index)}>
+          <PendingToolCallDetails
+            displayContext="sidebar-all-actions"
+            functionCallName={pendingToolCall.toolName}
+          />
+        </div>
+      ))}
     </div>
   );
 }

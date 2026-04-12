@@ -38,11 +38,15 @@ front/
     - Use `npm run lint` to run ESLint
 - Read `runbooks/TEST.md` for all things related to testing.
 
+# Running tests
+- Use `npm run test -- filetotest
+
 # Runbooks
 
 Runbooks for various typical development tasks are located under `runbooks/`:
 
 `ELASTICSEARCH.md`: add a new Elasticsearch index for search in front.
+`NEW_AUDIT_EVENT.md`: add a new audit log event (schema, type, emit call).
 `NEW_LLM.md`: add support for a new provider/model.
 `NEW_MCP_SERVER.md`: add a new MCP server to Dust.
 `NEW_WEBHOOK_SOURCE.md`: add a new webhook source to Dust.

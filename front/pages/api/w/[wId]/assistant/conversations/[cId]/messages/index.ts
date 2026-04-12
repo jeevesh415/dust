@@ -127,6 +127,7 @@ import { fetchConversationMessages } from "@app/lib/api/assistant/messages";
 import { withSessionAuthenticationForWorkspace } from "@app/lib/api/auth_wrappers";
 import { getPaginationParams } from "@app/lib/api/pagination";
 import type { Authenticator } from "@app/lib/auth";
+import { getFeatureFlags } from "@app/lib/auth";
 import { concurrentExecutor } from "@app/lib/utils/async_utils";
 import { getStatsDClient } from "@app/lib/utils/statsd";
 
@@ -290,10 +291,29 @@ async function handler(
         }
       }
 
-      const conversationRes = await getConversation(auth, conversationId);
+      const [conversationRes, featureFlags] = await Promise.all([
+        getConversation(auth, conversationId),
+        getFeatureFlags(auth),
+      ]);
 
       if (conversationRes.isErr()) {
         return apiErrorForConversation(req, res, conversationRes.error);
+      }
+
+      const steeringEnabled = featureFlags.includes("enable_steering");
+
+      if (content.length === 0) {
+        if (!steeringEnabled || mentions.length === 0) {
+          return apiError(req, res, {
+            status_code: 400,
+            api_error: {
+              type: "invalid_request_error",
+              message: steeringEnabled
+                ? "Message content cannot be empty unless at least one mention is provided."
+                : "Message content cannot be empty.",
+            },
+          });
+        }
       }
 
       const conversation = conversationRes.value;
@@ -342,6 +362,7 @@ async function handler(
           clientSideMCPServerIds: context.clientSideMCPServerIds ?? [],
         },
         skipToolsValidation: skipToolsValidation ?? false,
+        steeringEnabled: featureFlags.includes("enable_steering"),
       });
 
       if (messageRes.isErr()) {

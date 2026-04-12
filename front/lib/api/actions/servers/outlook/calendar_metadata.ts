@@ -4,8 +4,6 @@ import type { JSONSchema7 as JSONSchema } from "json-schema";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 
-export const OUTLOOK_CALENDAR_TOOL_NAME = "outlook_calendar" as const;
-
 export const OUTLOOK_CALENDAR_TOOLS_METADATA = createToolsRecord({
   get_user_timezone: {
     description:
@@ -320,7 +318,40 @@ export const OUTLOOK_CALENDAR_SERVER = {
       provider: "microsoft_tools",
       supported_use_cases: ["personal_actions"],
       scope:
-        "Calendars.ReadWrite Calendars.ReadWrite.Shared User.Read MailboxSettings.Read offline_access",
+        "Calendars.ReadWrite.Shared User.Read MailboxSettings.Read offline_access",
+      availableScopes: [
+        {
+          value: "Calendars.ReadWrite",
+          label: "Read & write calendars",
+          description: "Read and modify calendar events.",
+          required: true,
+          impliedBy: "Calendars.ReadWrite.Shared",
+        },
+        {
+          value: "Calendars.ReadWrite.Shared",
+          label: "Read & write shared calendars",
+          description: "Access shared and delegated calendars.",
+          fallbackScope: "Calendars.ReadWrite",
+        },
+        {
+          value: "MailboxSettings.Read",
+          label: "Read mailbox settings",
+          description:
+            "Read user mailbox settings such as timezone and working hours.",
+        },
+        {
+          value: "User.Read",
+          label: "Read user profile",
+          description: "Read basic user profile information.",
+          required: true,
+        },
+        {
+          value: "offline_access",
+          label: "Offline access",
+          description: "Maintain access without requiring re-authentication.",
+          required: true,
+        },
+      ],
     },
     icon: "MicrosoftOutlookLogo",
     documentationUrl: "https://docs.dust.tt/docs/outlook-calendar-tool-setup",

@@ -4,13 +4,17 @@ export const WHITELISTABLE_FEATURES_CONFIG = {
       "Advanced features for Notion workspace management shown to admins",
     stage: "on_demand",
   },
-  analytics_csv_export: {
-    description:
-      "CSV export buttons on analytics Top Agents and Top Users tables",
-    stage: "rolling_out",
-  },
   anthropic_vertex_fallback: {
     description: "Fallback to Vertex Anthropic for some Anthropic models",
+    stage: "dust_only",
+  },
+  ask_user_question_tool: {
+    description:
+      "Enable ask_user_question tool for agents to ask users questions",
+    stage: "dust_only",
+  },
+  audit_logs: {
+    description: "Enable audit log emission via WorkOS",
     stage: "dust_only",
   },
   custom_model_feature: {
@@ -122,10 +126,6 @@ export const WHITELISTABLE_FEATURES_CONFIG = {
       "Salesforce MCP tool (activated by default on most plans, FF to override the plan config)",
     stage: "on_demand",
   },
-  salesforce_tool_write: {
-    description: "Salesforce MCP tool: write operations (update_object)",
-    stage: "on_demand",
-  },
   show_debug_tools: {
     description: "Display debug tools in the interface",
     stage: "dust_only",
@@ -177,11 +177,6 @@ export const WHITELISTABLE_FEATURES_CONFIG = {
       "Enable splitting agent responses into multiple Slack messages for Slack (instead of truncation)",
     stage: "dust_only",
   },
-  slack_native_streaming: {
-    description:
-      "Use Slack's native streaming API for bot responses instead of throttled chat.update loop",
-    stage: "dust_only",
-  },
   slack_bot_mcp: {
     description: "Slack bot MCP server for workspace-level Slack integration",
     stage: "on_demand",
@@ -194,17 +189,18 @@ export const WHITELISTABLE_FEATURES_CONFIG = {
     description: "Luma MCP tool for event management and guest tracking",
     stage: "on_demand",
   },
+  power_bi_mcp: {
+    description: "Power BI MCP tool for querying semantic models and DAX",
+    stage: "on_demand",
+  },
+  netsuite_mcp: {
+    description:
+      "NetSuite MCP tool for querying records and interacting with your NetSuite account",
+    stage: "on_demand",
+  },
   discord_bot: {
     description:
       "Discord bot integration for workspace-level Discord integration",
-    stage: "dust_only",
-  },
-  email_agents: {
-    description: "Enable triggering and interacting with agents via email",
-    stage: "dust_only",
-  },
-  project_butler: {
-    description: "Enable user project digest generation in project spaces",
     stage: "dust_only",
   },
   projects: {
@@ -224,9 +220,8 @@ export const WHITELISTABLE_FEATURES_CONFIG = {
     description: "Enable /run command to directly call tools without LLM",
     stage: "dust_only",
   },
-  conversation_butler: {
-    description:
-      "Enable conversation butler for automated conversation management",
+  project_todo: {
+    description: "Enable project todo tab (todos and what's new digest)",
     stage: "dust_only",
   },
   conversations_slack_notifications: {
@@ -243,22 +238,55 @@ export const WHITELISTABLE_FEATURES_CONFIG = {
     description: "Enable conversation branches",
     stage: "dust_only",
   },
-  reinforced_agents: {
-    description:
-      "Enable reinforced agents: background analysis of conversations to suggest agent improvements",
+  sessions_branching: {
+    description: "Enable sessions branching",
     stage: "dust_only",
   },
-  discover_skills: {
+  reinforced_agents: {
     description:
-      "Enable default skills discovery on global agents (do not enable for customers)",
+      "Enable reinforcement: background analysis of conversations to suggest improvements to skills.",
     stage: "dust_only",
   },
   collapsible_messages: {
     description: "Enable collapsible messages in conversations",
     stage: "dust_only",
   },
+  email_restricted_sharing: {
+    description:
+      "Enable email-restricted sharing for interactive content (Frames)",
+    stage: "dust_only",
+  },
   poke_mcp: {
     description: "Enable the Poke MCP server for cross-workspace data access.",
+    stage: "dust_only",
+  },
+  metronome_billing: {
+    description:
+      "Enable Metronome usage event emission (llm_usage, tool_use) for this workspace.",
+    stage: "dust_only",
+  },
+  gong_tool: {
+    description: "Gong MCP tool for sales conversation analytics",
+    stage: "dust_only",
+  },
+  official_notion_mcp: {
+    description:
+      "Use the official Notion MCP server instead of the internal one",
+    stage: "dust_only",
+  },
+  use_dust_keys: {
+    description:
+      "Force BYOK workspaces to use Dust-managed keys instead of customer-provided keys",
+    // Not really on_demand but we want to be able to enable it for customers
+    stage: "on_demand",
+  },
+  dummy_feature_for_flag_testing: {
+    description: "Dummy feature flag used for testing feature flag behavior",
+    stage: "dust_only",
+  },
+  enable_steering: {
+    description:
+      "Enable steering: pending user messages + graceful stop of running agent loops",
     stage: "dust_only",
   },
 } as const satisfies Record<string, FeatureFlag>;

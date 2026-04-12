@@ -1,11 +1,14 @@
 import type { MCPOAuthUseCase, OAuthProvider } from "@app/types/oauth/lib";
 import { Icon, InformationCircleIcon } from "@dust-tt/sparkle";
 
+import { NetSuiteSetupInstructions } from "./NetSuiteSetupInstructions";
+import { PowerBiSetupInstructions } from "./PowerBiSetupInstructions";
 import { SnowflakeSetupInstructions } from "./SnowflakeSetupInstructions";
 
 interface ProviderSetupInstructionsProps {
   provider: OAuthProvider;
   useCase: MCPOAuthUseCase | null;
+  serverId?: number;
 }
 
 /**
@@ -18,10 +21,19 @@ interface ProviderSetupInstructionsProps {
 export function ProviderSetupInstructions({
   provider,
   useCase,
+  serverId,
 }: ProviderSetupInstructionsProps) {
   switch (provider) {
     case "snowflake":
       return <SnowflakeSetupInstructions useCase={useCase} />;
+    case "mcp_static":
+      if (serverId === 10015) {
+        return <PowerBiSetupInstructions />;
+      }
+      if (serverId === 10017) {
+        return <NetSuiteSetupInstructions />;
+      }
+      return null;
     default:
       return null;
   }

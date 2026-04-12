@@ -12,7 +12,7 @@ import { ConversationViewer } from "@app/components/assistant/conversation/Conve
 import { GenerationContextProvider } from "@app/components/assistant/conversation/GenerationContextProvider";
 import { InputBar } from "@app/components/assistant/conversation/input_bar/InputBar";
 import { useMCPServerViewsContext } from "@app/components/shared/tools_picker/MCPServerViewsContext";
-import { useAuth } from "@app/lib/auth/AuthContext";
+import { useAuth, useFeatureFlags } from "@app/lib/auth/AuthContext";
 import type { DustError } from "@app/lib/error";
 import { isFreeTrialPhonePlan } from "@app/lib/plans/plan_codes";
 import { useWorkspaceActiveSubscription } from "@app/lib/swr/workspaces";
@@ -90,6 +90,9 @@ function PreviewContent({
   isTrialPlan,
   isAdmin,
 }: PreviewContentProps) {
+  const { hasFeature } = useFeatureFlags();
+  const singleAgentInput = hasFeature("enable_steering");
+
   return (
     <>
       <div className={currentPanel ? "hidden" : "flex h-full flex-col"}>
@@ -108,7 +111,9 @@ function PreviewContent({
                 draftAgent: draftAgent ?? undefined,
                 isSubmitting: isSavingDraftAgent,
                 resetConversation,
-                actionsToShow: ["attachment"],
+                actionsToShow: singleAgentInput
+                  ? ["attachment", "agents-list"]
+                  : ["attachment"],
               }}
               key={conversation.sId}
             />
@@ -123,9 +128,10 @@ function PreviewContent({
         </div>
 
         {!conversation && (
-          <div className="mx-4 flex-shrink-0 py-4">
+          <div className="flex-shrink-0 px-5 py-4">
             <InputBar
               isSubmitting={isSavingDraftAgent}
+              isAgentBuilder
               owner={owner}
               user={user}
               onSubmit={createConversation}
@@ -133,10 +139,13 @@ function PreviewContent({
                 draftAgent ? [toRichAgentMentionType(draftAgent)] : []
               }
               draftKey={`agent-${draftAgent?.name}-builder-preview`}
-              actions={["attachment"]}
+              actions={
+                singleAgentInput
+                  ? ["attachment", "agents-list"]
+                  : ["attachment"]
+              }
               disableAutoFocus
               isFloating={false}
-              shouldUseDraft={false}
             />
           </div>
         )}

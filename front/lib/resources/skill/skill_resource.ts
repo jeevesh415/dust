@@ -18,6 +18,7 @@ import {
   ConversationSkillModel,
 } from "@app/lib/models/skill/conversation_skill";
 import { GroupSkillModel } from "@app/lib/models/skill/group_skill";
+import { SkillSuggestionModel } from "@app/lib/models/skill/skill_suggestion";
 import { BaseResource } from "@app/lib/resources/base_resource";
 import { DataSourceViewResource } from "@app/lib/resources/data_source_view_resource";
 import { FileResource } from "@app/lib/resources/file_resource";
@@ -788,6 +789,21 @@ export class SkillResource extends BaseResource<SkillConfigurationModel> {
     return resources[0];
   }
 
+  static async fetchByNames(
+    auth: Authenticator,
+    names: string[]
+  ): Promise<SkillResource[]> {
+    if (names.length === 0) {
+      return [];
+    }
+    return this.baseFetch(auth, {
+      where: {
+        name: names,
+        status: "active",
+      },
+    });
+  }
+
   /**
    * Fetches skills from rows that reference them via customSkillId or globalSkillId.
    */
@@ -985,16 +1001,22 @@ export class SkillResource extends BaseResource<SkillConfigurationModel> {
       globalSpaceOnly,
       onlyCustom,
       isDefault,
+      updatedAfter,
     }: {
       status?: SkillStatus | SkillStatus[];
       limit?: number;
       globalSpaceOnly?: boolean;
       onlyCustom?: boolean;
       isDefault?: boolean;
+      updatedAfter?: Date;
     } = {}
   ): Promise<SkillResource[]> {
     const skills = await this.baseFetch(auth, {
-      where: { status, ...(isDefault !== undefined ? { isDefault } : {}) },
+      where: {
+        status,
+        ...(isDefault !== undefined ? { isDefault } : {}),
+        ...(updatedAfter ? { updatedAt: { [Op.gte]: updatedAfter } } : {}),
+      },
       ...(limit ? { limit } : {}),
       onlyCustom,
     });
@@ -1354,7 +1376,10 @@ export class SkillResource extends BaseResource<SkillConfigurationModel> {
     }
 
     const instructions = def.fetchInstructions
-      ? await def.fetchInstructions(auth, requestedSpaceIds)
+      ? await def.fetchInstructions(auth, {
+          spaceIds: requestedSpaceIds,
+          agentLoopData,
+        })
       : def.instructions;
 
     return new SkillResource(
@@ -1367,6 +1392,7 @@ export class SkillResource extends BaseResource<SkillConfigurationModel> {
         // We fake the id here. We should rely exclusively on sId for global skills.
         id: -1,
         instructions,
+        instructionsHtml: null,
         name: def.name,
         requestedSpaceIds: requestedSpaceModelIds,
         status: "active",
@@ -1389,6 +1415,11 @@ export class SkillResource extends BaseResource<SkillConfigurationModel> {
   }
 
   canWrite(auth: Authenticator): boolean {
+    // API keys with at least builder role can write to any skill.
+    if (auth.isKey() && auth.isBuilder()) {
+      return true;
+    }
+
     if (!this.editorGroup) {
       return false;
     }
@@ -1596,6 +1627,7 @@ export class SkillResource extends BaseResource<SkillConfigurationModel> {
           agentFacingDescription: versionModel.agentFacingDescription,
           userFacingDescription: versionModel.userFacingDescription,
           instructions: versionModel.instructions,
+          instructionsHtml: versionModel.instructionsHtml,
           icon: versionModel.icon,
           requestedSpaceIds: versionModel.requestedSpaceIds,
           extendedSkillId: versionModel.extendedSkillId,
@@ -1622,6 +1654,24 @@ export class SkillResource extends BaseResource<SkillConfigurationModel> {
 
   async listEditors(auth: Authenticator): Promise<UserResource[] | null> {
     return this.editorGroup?.getActiveMembers(auth) ?? null;
+  }
+
+  private async upsertCurrentUserAsEditor(auth: Authenticator): Promise<void> {
+    const user = auth.user();
+    if (!this.editorGroup || !user) {
+      return;
+    }
+
+    if (!this.editorGroup.canWrite(auth)) {
+      return;
+    }
+
+    const isMember = await this.editorGroup.isMember(user);
+    if (!isMember) {
+      await this.editorGroup.dangerouslyAddMember(auth, {
+        user: user.toJSON(),
+      });
+    }
   }
 
   async fetchEditedByUser(auth: Authenticator): Promise<UserResource | null> {
@@ -1800,6 +1850,8 @@ export class SkillResource extends BaseResource<SkillConfigurationModel> {
     if (fileAttachments) {
       await this.setFileAttachments(auth, fileAttachments);
     }
+
+    await this.upsertCurrentUserAsEditor(auth);
   }
 
   /**
@@ -2112,6 +2164,11 @@ export class SkillResource extends BaseResource<SkillConfigurationModel> {
           transaction,
         });
 
+        await SkillSuggestionModel.destroy({
+          where: whereWorkspaceIdAndSkillId,
+          transaction,
+        });
+
         await SkillVersionModel.destroy({
           where: whereWorkspaceIdAndSkillId,
           transaction,
@@ -2321,6 +2378,10 @@ export class SkillResource extends BaseResource<SkillConfigurationModel> {
       where: { workspaceId },
     });
 
+    await SkillSuggestionModel.destroy({
+      where: { workspaceId },
+    });
+
     await SkillVersionModel.destroy({
       where: { workspaceId },
     });
@@ -2350,6 +2411,7 @@ export class SkillResource extends BaseResource<SkillConfigurationModel> {
       userFacingDescription: this.userFacingDescription,
       // We don't want to expose global skills instructions to the front-end.
       instructions: this.globalSId ? null : this.instructions,
+      instructionsHtml: this.globalSId ? null : this.instructionsHtml,
       requestedSpaceIds,
       icon: this.icon ?? null,
       source: this.source,
@@ -2436,6 +2498,7 @@ export class SkillResource extends BaseResource<SkillConfigurationModel> {
       agentFacingDescription: this.agentFacingDescription,
       userFacingDescription: this.userFacingDescription,
       instructions: this.instructions,
+      instructionsHtml: this.instructionsHtml,
       requestedSpaceIds: this.requestedSpaceIds,
       editedBy: this.editedBy,
       mcpServerViewIds,

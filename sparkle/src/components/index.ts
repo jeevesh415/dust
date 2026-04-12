@@ -213,11 +213,14 @@ export {
   SheetPortal,
   SheetTitle,
   SheetTrigger,
+  useSheetViewport,
 } from "./Sheet";
 export type { SidebarLayoutProps, SidebarLayoutRef } from "./SidebarLayout";
 export { SidebarLayout } from "./SidebarLayout";
 export { SliderToggle } from "./SliderToggle";
 export { Spinner } from "./Spinner";
+export type { SpinnerBrandProps } from "./SpinnerBrand";
+export { SpinnerBrand } from "./SpinnerBrand";
 export { FlexSplitButton } from "./SplitButton";
 export { Tabs, TabsContent, TabsList, TabsTrigger } from "./Tabs";
 export { ReadOnlyTextArea, TextArea } from "./TextArea";

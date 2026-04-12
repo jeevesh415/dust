@@ -70,7 +70,7 @@ export async function isSelfHostedImageWithValidContentType(
   return contentType.includes("image");
 }
 
-export async function getAgentSIdFromName(
+export async function getAgentIdFromName(
   auth: Authenticator,
   name: string
 ): Promise<string | null> {
@@ -178,6 +178,8 @@ export async function enrichAgentConfigurations<V extends AgentFetchVariant>(
       ),
       tags: tags.map((t) => t.toJSON()).sort(tagsSorter),
       reinforcement: agent.reinforcement,
+      lastReinforcementAnalysisAt:
+        agent.lastReinforcementAnalysisAt?.toISOString() ?? null,
       canRead: isAuthor || isMember || agent.scope === "visible",
       canEdit: isAuthor || isMember,
     };

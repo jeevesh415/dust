@@ -1,6 +1,5 @@
 import { TOOL_NAME_SEPARATOR } from "@app/lib/actions/constants";
 import { isSearchResultResourceType } from "@app/lib/actions/mcp_internal_actions/output_schemas";
-import { isToolExecutionStatusBlocked } from "@app/lib/actions/statuses";
 import { isLightServerSideMCPToolConfiguration } from "@app/lib/actions/types/guards";
 import { updateAnalyticsFeedback } from "@app/lib/analytics/feedback";
 import {
@@ -26,6 +25,7 @@ import { AgentMCPServerConfigurationResource } from "@app/lib/resources/agent_mc
 import { AgentMessageFeedbackResource } from "@app/lib/resources/agent_message_feedback_resource";
 import { DataSourceViewResource } from "@app/lib/resources/data_source_view_resource";
 import { KeyResource } from "@app/lib/resources/key_resource";
+import { RemoteMCPServerResource } from "@app/lib/resources/remote_mcp_servers_resource";
 import { RunResource } from "@app/lib/resources/run_resource";
 import type { GlobalSkillDefinition } from "@app/lib/resources/skill/global/registry";
 import { GlobalSkillsRegistry } from "@app/lib/resources/skill/global/registry";
@@ -165,33 +165,9 @@ export async function storeAgentAnalytics(
     conversationRow,
     contextOrigin,
   } = params;
-  // Only index agent messages if there are no blocked actions awaiting approval.
   const actions = await AgentMCPActionResource.listByAgentMessageIds(auth, [
     agentAgentMessageRow.id,
   ]);
-
-  const hasBlockedActions = actions.some((action) =>
-    isToolExecutionStatusBlocked(action.status)
-  );
-
-  if (hasBlockedActions) {
-    const blockedStatuses = actions
-      .filter((a) => isToolExecutionStatusBlocked(a.status))
-      .map((a) => a.status);
-
-    logger.info(
-      {
-        workspaceId: auth.getNonNullableWorkspace().sId,
-        conversationId: conversationRow.sId,
-        agentMessageId: agentMessageRow.sId,
-        actionCount: actions.length,
-        blockedStatuses,
-      },
-      "[Analytics] Skipping ingestion due to blocked actions"
-    );
-
-    return;
-  }
 
   // Collect token usage from run data.
   const tokens = await collectTokenUsage(auth, agentAgentMessageRow);
@@ -327,20 +303,40 @@ async function collectToolUsageFromMessage(
     serverConfigs.map((cfg) => [cfg.id.toString(), cfg.sId])
   );
 
-  return actionResources.map((actionResource) => ({
-    step_index: actionResource.stepContent.step,
-    server_name:
-      actionResource.metadata.internalMCPServerName ??
-      actionResource.metadata.mcpServerId ??
-      "unknown",
-    tool_name:
-      actionResource.functionCallName.split(TOOL_NAME_SEPARATOR).pop() ??
-      actionResource.functionCallName,
-    mcp_server_configuration_sid:
-      configIdToSId.get(actionResource.mcpServerConfigurationId) ?? undefined,
-    execution_time_ms: actionResource.executionDurationMs,
-    status: actionResource.status,
-  }));
+  const mcpServerIds = [
+    ...new Set(
+      actionResources.flatMap((a) =>
+        !a.metadata.internalMCPServerName && a.metadata.mcpServerId
+          ? [a.metadata.mcpServerId]
+          : []
+      )
+    ),
+  ];
+  const remoteServerNameMap = await RemoteMCPServerResource.resolveNamesBySIds(
+    auth,
+    mcpServerIds
+  );
+
+  return actionResources.map((actionResource) => {
+    const { internalMCPServerName, mcpServerId } = actionResource.metadata;
+    const serverName =
+      internalMCPServerName ??
+      (mcpServerId && remoteServerNameMap.get(mcpServerId)) ??
+      mcpServerId ??
+      "unknown";
+
+    return {
+      step_index: actionResource.stepContent.step,
+      server_name: serverName,
+      tool_name:
+        actionResource.functionCallName.split(TOOL_NAME_SEPARATOR).pop() ??
+        actionResource.functionCallName,
+      mcp_server_configuration_sid:
+        configIdToSId.get(actionResource.mcpServerConfigurationId) ?? undefined,
+      execution_time_ms: actionResource.executionDurationMs,
+      status: actionResource.status,
+    };
+  });
 }
 
 /**
@@ -469,10 +465,10 @@ async function extractRetrievalDocuments(
   // Fetch MCP server configurations for analytics tracking.
   // Using standalone resource allows independent querying for reporting purposes.
   const [outputItemsByActionId, serverConfigs] = await Promise.all([
-    AgentMCPActionResource.fetchOutputItemsByActionIds(
-      auth,
-      searchActions.map((a) => a.id)
-    ),
+    AgentMCPActionResource.fetchOutputItemsByActionIds(auth, {
+      actionIds: searchActions.map((a) => a.id),
+      ignoreContent: false,
+    }),
     AgentMCPServerConfigurationResource.fetchByModelIds(auth, configModelIds),
   ]);
 

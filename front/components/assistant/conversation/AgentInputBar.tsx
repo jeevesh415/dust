@@ -1,26 +1,28 @@
 import { useBlockedActionsContext } from "@app/components/assistant/conversation/BlockedActionsProvider";
-import { GenerationContext } from "@app/components/assistant/conversation/GenerationContextProvider";
+import { useGenerationContext } from "@app/components/assistant/conversation/GenerationContextProvider";
 import { InputBar } from "@app/components/assistant/conversation/input_bar/InputBar";
 import type {
   VirtuosoMessage,
   VirtuosoMessageListContext,
 } from "@app/components/assistant/conversation/types";
 import {
+  isAgentMessageWithStreaming,
   isHandoverUserMessage,
   isHiddenMessage,
-  isMessageTemporayState,
   isUserMessage,
 } from "@app/components/assistant/conversation/types";
 import { ProjectJoinCTA } from "@app/components/spaces/ProjectJoinCTA";
 import { useCancelMessage, useConversation } from "@app/hooks/conversations";
+import { useFeatureFlags } from "@app/lib/auth/AuthContext";
+import { useUnifiedAgentConfigurations } from "@app/lib/swr/assistants";
 import { useIsMobile } from "@app/lib/swr/useIsMobile";
+import { GLOBAL_AGENTS_SID } from "@app/types/assistant/assistant";
 import {
   isRichAgentMention,
   toRichAgentMentionType,
 } from "@app/types/assistant/mentions";
 import { pluralize } from "@app/types/shared/utils/string_utils";
 import {
-  AnimatedText,
   ArrowDownIcon,
   ArrowUpIcon,
   Button,
@@ -28,14 +30,13 @@ import {
   ContentMessageInline,
   IconButton,
   InformationCircleIcon,
-  SparklesIcon,
   StopIcon,
 } from "@dust-tt/sparkle";
 import {
   useVirtuosoLocation,
   useVirtuosoMethods,
 } from "@virtuoso.dev/message-list";
-import { useContext, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 const MAX_DISTANCE_FOR_SMOOTH_SCROLL = 2048;
 
@@ -46,7 +47,7 @@ export const AgentInputBar = ({
 }) => {
   const [blockedActionIndex, setBlockedActionIndex] = useState<number>(0);
   const [isStopping, setIsStopping] = useState<boolean>(false);
-  const generationContext = useContext(GenerationContext);
+  const generationContext = useGenerationContext();
   const { getBlockedActions, hasPendingValidations, startPulsingAction } =
     useBlockedActionsContext();
 
@@ -60,12 +61,24 @@ export const AgentInputBar = ({
     conversationId: context.conversation?.sId,
   });
 
+  const agentBuilderContext = context.agentBuilderContext;
+
   const isMobile = useIsMobile();
+  const { hasFeature } = useFeatureFlags();
+  const singleAgentInput = hasFeature("enable_steering");
+  const { agentConfigurations } = useUnifiedAgentConfigurations({
+    workspaceId: context.owner.sId,
+  });
+  const accessibleAgentIds = useMemo(
+    () => new Set(agentConfigurations.map((a) => a.sId)),
+    [agentConfigurations]
+  );
   const methods = useVirtuosoMethods<VirtuosoMessage>();
   const { bottomOffset, listOffset, visibleListHeight } = useVirtuosoLocation();
 
-  const lastUserMessage = methods.data
-    .get()
+  const allMessages = methods.data.get();
+
+  const lastUserMessage = allMessages
     .filter(isUserMessage)
     .findLast(
       (m) =>
@@ -74,7 +87,18 @@ export const AgentInputBar = ({
         m.visibility !== "deleted"
     );
 
-  const draftAgent = context.agentBuilderContext?.draftAgent;
+  // Last agent mentioned by anyone in the conversation. Computed outside useMemo so the
+  // result is a stable object reference (same mention object from the message list) that
+  // won't cause unnecessary recomputation of autoMentions when allMessages array ref changes.
+  const lastAgentMentionInConversation = singleAgentInput
+    ? (allMessages
+        .filter(isUserMessage)
+        .filter((m) => !isHandoverUserMessage(m) && m.visibility !== "deleted")
+        .findLast((m) => m.richMentions.some(isRichAgentMention))
+        ?.richMentions.find(isRichAgentMention) ?? null)
+    : null;
+
+  const draftAgent = agentBuilderContext?.draftAgent;
 
   const autoMentions = useMemo(() => {
     // If we are in the agent builder, we show the draft agent as the sticky mention, all the time.
@@ -83,16 +107,63 @@ export const AgentInputBar = ({
       return [toRichAgentMentionType(draftAgent)];
     }
 
-    // We only prefill if there is only agent mentions in user's previous message.
-    const shouldPrefill =
-      lastUserMessage && lastUserMessage.richMentions.every(isRichAgentMention);
+    // In single-agent mode, find the last agent mentioned in the conversation.
+    // First from the current user's messages, then from anyone's messages.
+    if (singleAgentInput) {
+      const currentUserAgentMention =
+        lastUserMessage?.richMentions.find(isRichAgentMention);
+      if (
+        currentUserAgentMention &&
+        accessibleAgentIds.has(currentUserAgentMention.id)
+      ) {
+        return [currentUserAgentMention];
+      }
 
-    if (!shouldPrefill) {
+      // @sidekick is not available in accessibleAgentIds so we need to skip it
+      if (agentBuilderContext) {
+        return lastAgentMentionInConversation
+          ? [lastAgentMentionInConversation]
+          : [];
+      }
+
+      if (
+        lastAgentMentionInConversation &&
+        accessibleAgentIds.has(lastAgentMentionInConversation.id)
+      ) {
+        return [lastAgentMentionInConversation];
+      }
+
+      // Ultimate fallback: select the "dust" agent if available.
+      const dustAgent = agentConfigurations.find(
+        (a) => a.sId === GLOBAL_AGENTS_SID.DUST
+      );
+      if (dustAgent) {
+        return [toRichAgentMentionType(dustAgent)];
+      }
+
       return [];
     }
 
-    return lastUserMessage.richMentions;
-  }, [draftAgent, lastUserMessage]);
+    // Non-steering mode: prefill all mentions if they are all agent mentions.
+    const shouldPrefill =
+      lastUserMessage &&
+      lastUserMessage.richMentions.length > 0 &&
+      lastUserMessage.richMentions.every(isRichAgentMention);
+
+    if (shouldPrefill) {
+      return lastUserMessage.richMentions;
+    }
+
+    return [];
+  }, [
+    draftAgent,
+    lastUserMessage,
+    singleAgentInput,
+    lastAgentMentionInConversation,
+    accessibleAgentIds,
+    agentConfigurations,
+    agentBuilderContext,
+  ]);
 
   // Calculate positions and determine which user messages are navigable.
   const {
@@ -212,14 +283,14 @@ export const AgentInputBar = ({
 
   if (
     context.isProjectMember === false &&
-    context.projectSpaceId &&
+    context.projectId &&
     context.projectSpaceName
   ) {
     return (
-      <div className="relative z-20 mx-auto flex max-h-dvh w-full flex-col py-4 sm:w-full sm:max-w-4xl">
+      <div className="relative z-20 mx-auto flex max-h-dvh w-full flex-col py-4 sm:w-full sm:max-w-conversation">
         <ProjectJoinCTA
           owner={context.owner}
-          spaceId={context.projectSpaceId}
+          spaceId={context.projectId}
           spaceName={context.projectSpaceName}
           isRestricted={context.isProjectRestricted ?? false}
           userName={context.user.fullName}
@@ -234,10 +305,8 @@ export const AgentInputBar = ({
     );
 
   const showStopButton = generatingMessages.length > 0;
-  const showMessageNavigation = !context.agentBuilderContext;
-  const showButlerThinking = context.isButlerThinking;
-  const showNavigationContainer =
-    showStopButton || showMessageNavigation || showButlerThinking;
+  const showMessageNavigation = !agentBuilderContext;
+  const showNavigationContainer = showStopButton || showMessageNavigation;
 
   const getStopButtonLabel = () => {
     if (isStopping) {
@@ -263,7 +332,7 @@ export const AgentInputBar = ({
   return (
     <div
       className={
-        "relative z-20 mx-auto flex max-h-dvh w-full flex-col py-4 sm:w-full sm:max-w-4xl"
+        "relative z-20 mx-auto flex max-h-dvh w-full flex-col py-4 sm:w-full sm:max-w-conversation"
       }
     >
       <div className="flex w-full justify-center gap-2">
@@ -308,22 +377,6 @@ export const AgentInputBar = ({
                 />
               </>
             )}
-            {showButlerThinking && (
-              <>
-                {(showStopButton || showMessageNavigation) && (
-                  <div className="h-4 w-px bg-border dark:bg-border-night" />
-                )}
-                <div className="flex items-center gap-1.5 px-2">
-                  <SparklesIcon className="h-3.5 w-3.5 text-highlight" />
-                  <AnimatedText
-                    variant="highlight"
-                    className="text-xs font-medium"
-                  >
-                    Butler
-                  </AnimatedText>
-                </div>
-              </>
-            )}
           </div>
         )}
       </div>
@@ -352,7 +405,7 @@ export const AgentInputBar = ({
 
                 const blockedActionMessageIndex = methods.data.findIndex(
                   (m) =>
-                    isMessageTemporayState(m) &&
+                    isAgentMessageWithStreaming(m) &&
                     blockedActionTargetMessageId === m.sId
                 );
 
@@ -378,9 +431,10 @@ export const AgentInputBar = ({
         conversation={context.conversation}
         draftKey={context.draftKey}
         disableAutoFocus={isMobile}
-        disableUserMentions={!!context.agentBuilderContext}
-        actions={context.agentBuilderContext?.actionsToShow}
-        isSubmitting={context.agentBuilderContext?.isSubmitting === true}
+        disableUserMentions={!!agentBuilderContext}
+        actions={agentBuilderContext?.actionsToShow}
+        isSubmitting={agentBuilderContext?.isSubmitting === true}
+        isAgentBuilder={!!agentBuilderContext}
       />
     </div>
   );

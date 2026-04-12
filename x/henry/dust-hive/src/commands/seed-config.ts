@@ -16,7 +16,7 @@ export interface SeedUserConfig {
   provider: string | null;
   providerId: string | null;
   imageUrl: string | null;
-  workspaceSId: string;
+  workspaceId: string;
   workspaceName: string;
   extractedAt: string;
   sourceUri: string;
@@ -106,13 +106,13 @@ async function extractUsers(postgresUri: string): Promise<Result<UserRow[], Comm
 
 async function extractWorkspace(
   postgresUri: string,
-  userSId: string
+  userId: string
 ): Promise<Result<{ sId: string; name: string } | null, CommandError>> {
   const query = `
     SELECT w."sId", w.name FROM workspaces w
     JOIN memberships m ON m."workspaceId" = w.id
     JOIN users u ON u.id = m."userId"
-    WHERE u."sId" = '${userSId}' AND m.role = 'admin'
+    WHERE u."sId" = '${userId}' AND m.role = 'admin'
       AND (m."endAt" IS NULL OR m."endAt" > NOW())
     ORDER BY w."createdAt" ASC LIMIT 1;
   `;
@@ -132,7 +132,7 @@ async function extractWorkspace(
 
 function resolveWorkspace(
   result: { sId: string; name: string } | null,
-  userSId: string,
+  userId: string,
   firstName: string
 ): { sId: string; name: string } {
   if (result) {
@@ -140,7 +140,7 @@ function resolveWorkspace(
     return result;
   }
   logger.warn("No workspace found for user, will create a new one during seed");
-  return { sId: `dev-${userSId.slice(0, 6)}`, name: `${firstName}'s Dev Workspace` };
+  return { sId: `dev-${userId.slice(0, 6)}`, name: `${firstName}'s Dev Workspace` };
 }
 
 export async function seedConfigCommand(postgresUri?: string): Promise<Result<void>> {
@@ -213,7 +213,7 @@ export async function seedConfigCommand(postgresUri?: string): Promise<Result<vo
     provider: nullableField(f[7]),
     providerId: nullableField(f[8]),
     imageUrl: nullableField(f[9]),
-    workspaceSId: workspace.sId,
+    workspaceId: workspace.sId,
     workspaceName: workspace.name,
     extractedAt: new Date().toISOString(),
     sourceUri: postgresUri.replace(/:[^:@]+@/, ":***@"),

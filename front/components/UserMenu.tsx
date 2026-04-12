@@ -94,7 +94,7 @@ export function UserMenu({ user, owner, subscription }: UserMenuProps) {
         });
         setTimeout(() => {
           void router.push(
-            `/w/${owner.sId}/conversation/${result.conversationSId}`
+            `/w/${owner.sId}/conversation/${result.conversationId}`
           );
         }, 1000);
       } else {
@@ -181,14 +181,14 @@ export function UserMenu({ user, owner, subscription }: UserMenuProps) {
         <DropdownMenuItem
           label="Dust Chrome Extension"
           icon={ChromeLogo}
-          href="https://chromewebstore.google.com/detail/dust/fnkfcndbgingjcbdhaofkcnhcjpljhdn?authuser=0&hl=fr"
+          href="https://chromewebstore.google.com/detail/dust/fnkfcndbgingjcbdhaofkcnhcjpljhdn"
           target="_blank"
         />
 
         <DropdownMenuLabel label="Account" />
         {subscription?.plan.limits.canUseProduct && (
           <DropdownMenuItem
-            label="Profile"
+            label="Personal Settings"
             icon={UserIcon}
             href={`/w/${owner.sId}/me`}
           />

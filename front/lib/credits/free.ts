@@ -159,7 +159,7 @@ export async function grantFreeCreditsFromSubscriptionStateChange({
   stripeSubscription: Stripe.Subscription;
 }): Promise<Result<undefined, Error>> {
   const workspace = auth.getNonNullableWorkspace();
-  const workspaceSId = workspace.sId;
+  const workspaceId = workspace.sId;
 
   // Check if credit already exists for this billing cycle (idempotency)
   const idempotencyKey = `free-renewal-${stripeSubscription.id}-${stripeSubscription.current_period_start}`;
@@ -171,7 +171,7 @@ export async function grantFreeCreditsFromSubscriptionStateChange({
   if (existingCredit) {
     logger.info(
       {
-        workspaceId: workspaceSId,
+        workspaceId,
         creditId: existingCredit.id,
         subscriptionId: stripeSubscription.id,
       },
@@ -187,7 +187,7 @@ export async function grantFreeCreditsFromSubscriptionStateChange({
 
   logger.info(
     {
-      workspaceId: workspaceSId,
+      workspaceId,
       subscriptionId: stripeSubscription.id,
       isEnterprise,
     },
@@ -207,7 +207,7 @@ export async function grantFreeCreditsFromSubscriptionStateChange({
     creditAmountMicroUsd = programmaticConfig.freeCreditMicroUsd;
     logger.info(
       {
-        workspaceId: workspaceSId,
+        workspaceId,
         creditAmountMicroUsd,
       },
       "[Free Credits] Using ProgrammaticUsageConfiguration override amount"
@@ -217,7 +217,7 @@ export async function grantFreeCreditsFromSubscriptionStateChange({
       case "not_paying":
         logger.warn(
           {
-            workspaceId: workspaceSId,
+            workspaceId,
             subscriptionId: stripeSubscription.id,
           },
           "[Free Credits] Pro subscription not eligible for free credits (subscription payment too old or missing)"
@@ -233,7 +233,7 @@ export async function grantFreeCreditsFromSubscriptionStateChange({
         creditAmountMicroUsd = calculateFreeCreditAmountMicroUsd(userCount);
         logger.info(
           {
-            workspaceId: workspaceSId,
+            workspaceId,
             userCount,
             creditAmountMicroUsd,
             customerPaymentStatus,
@@ -254,17 +254,30 @@ export async function grantFreeCreditsFromSubscriptionStateChange({
   const periodStart = new Date(stripeSubscription.current_period_start * 1000);
   const periodEnd = new Date(stripeSubscription.current_period_end * 1000);
 
-  const credit = await CreditResource.makeNew(auth, {
-    type: "free",
-    initialAmountMicroUsd: creditAmountMicroUsd,
-    consumedAmountMicroUsd: 0,
-    discount: null,
-    invoiceOrLineItemId: idempotencyKey,
-  });
+  const { credit, created } =
+    await CreditResource.makeNewOrFetchByInvoiceOrLineItemId(auth, {
+      type: "free",
+      initialAmountMicroUsd: creditAmountMicroUsd,
+      consumedAmountMicroUsd: 0,
+      discount: null,
+      invoiceOrLineItemId: idempotencyKey,
+    });
+
+  if (!created) {
+    logger.info(
+      {
+        workspaceId,
+        creditId: credit.id,
+        subscriptionId: stripeSubscription.id,
+      },
+      "[Free Credits] Credit already exists for this billing cycle, skipping"
+    );
+    return new Ok(undefined);
+  }
 
   logger.info(
     {
-      workspaceId: workspaceSId,
+      workspaceId,
       creditId: credit.id,
       creditAmountMicroUsd,
       periodStart,
@@ -282,14 +295,14 @@ export async function grantFreeCreditsFromSubscriptionStateChange({
     logger.error(
       {
         panic: true,
-        workspaceId: workspaceSId,
+        workspaceId,
         creditId: credit.id,
         error: startResult.error,
       },
       "[Free Credits] Error starting credit"
     );
     getStatsDClient().increment("credits.top_up.error", 1, [
-      `workspace_id:${workspaceSId}`,
+      `workspace_id:${workspaceId}`,
       "type:free",
       `customer:${isEnterprise ? "enterprise" : "pro"}`,
     ]);
@@ -297,13 +310,13 @@ export async function grantFreeCreditsFromSubscriptionStateChange({
   }
 
   getStatsDClient().increment("credits.top_up.success", 1, [
-    `workspace_id:${workspaceSId}`,
+    `workspace_id:${workspaceId}`,
     "type:free",
     `customer:${isEnterprise ? "enterprise" : "pro"}`,
   ]);
   logger.info(
     {
-      workspaceId: workspaceSId,
+      workspaceId,
       creditId: credit.id,
       creditAmountMicroUsd,
       periodStart,
@@ -325,7 +338,7 @@ export async function grantFreeCreditFromSubscriptionStateChangeYearly({
   stripeSubscription: Stripe.Subscription;
 }): Promise<Result<undefined, Error>> {
   const workspace = auth.getNonNullableWorkspace();
-  const workspaceSId = workspace.sId;
+  const workspaceId = workspace.sId;
 
   // Check if credit already exists for this billing cycle (idempotency)
   const idempotencyKey = `free-renewal-yearly-${stripeSubscription.id}-${stripeSubscription.current_period_start}`;
@@ -337,7 +350,7 @@ export async function grantFreeCreditFromSubscriptionStateChangeYearly({
   if (existingCredit) {
     logger.info(
       {
-        workspaceId: workspaceSId,
+        workspaceId,
         creditId: existingCredit.id,
         subscriptionId: stripeSubscription.id,
       },
@@ -352,7 +365,7 @@ export async function grantFreeCreditFromSubscriptionStateChangeYearly({
 
   logger.info(
     {
-      workspaceId: workspaceSId,
+      workspaceId,
       subscriptionId: stripeSubscription.id,
       isEnterprise,
     },
@@ -363,7 +376,7 @@ export async function grantFreeCreditFromSubscriptionStateChangeYearly({
   if (customerPaymentStatus !== "paying") {
     logger.warn(
       {
-        workspaceId: workspaceSId,
+        workspaceId,
         subscriptionId: stripeSubscription.id,
         customerPaymentStatus,
       },
@@ -384,7 +397,7 @@ export async function grantFreeCreditFromSubscriptionStateChangeYearly({
     creditAmountMicroUsd = programmaticConfig.freeCreditMicroUsd;
     logger.info(
       {
-        workspaceId: workspaceSId,
+        workspaceId,
         creditAmountMicroUsd,
       },
       "[Free Credits Yearly] Using ProgrammaticUsageConfiguration override amount (yearly)"
@@ -396,7 +409,7 @@ export async function grantFreeCreditFromSubscriptionStateChangeYearly({
     creditAmountMicroUsd = monthlyAmountMicroUsd * YEARLY_MULTIPLIER;
     logger.info(
       {
-        workspaceId: workspaceSId,
+        workspaceId,
         userCount,
         monthlyAmountMicroUsd,
         creditAmountMicroUsd,
@@ -413,17 +426,30 @@ export async function grantFreeCreditFromSubscriptionStateChangeYearly({
   const periodStart = new Date(stripeSubscription.current_period_start * 1000);
   const periodEnd = new Date(stripeSubscription.current_period_end * 1000);
 
-  const credit = await CreditResource.makeNew(auth, {
-    type: "free",
-    initialAmountMicroUsd: creditAmountMicroUsd,
-    consumedAmountMicroUsd: 0,
-    discount: null,
-    invoiceOrLineItemId: idempotencyKey,
-  });
+  const { credit, created } =
+    await CreditResource.makeNewOrFetchByInvoiceOrLineItemId(auth, {
+      type: "free",
+      initialAmountMicroUsd: creditAmountMicroUsd,
+      consumedAmountMicroUsd: 0,
+      discount: null,
+      invoiceOrLineItemId: idempotencyKey,
+    });
+
+  if (!created) {
+    logger.info(
+      {
+        workspaceId,
+        creditId: credit.id,
+        subscriptionId: stripeSubscription.id,
+      },
+      "[Free Credits Yearly] Credit already exists for this billing cycle, skipping"
+    );
+    return new Ok(undefined);
+  }
 
   logger.info(
     {
-      workspaceId: workspaceSId,
+      workspaceId,
       creditId: credit.id,
       creditAmountMicroUsd,
       periodStart,
@@ -441,14 +467,14 @@ export async function grantFreeCreditFromSubscriptionStateChangeYearly({
     logger.error(
       {
         panic: true,
-        workspaceId: workspaceSId,
+        workspaceId,
         creditId: credit.id,
         error: startResult.error,
       },
       "[Free Credits Yearly] Error starting credit"
     );
     getStatsDClient().increment("credits.top_up.error", 1, [
-      `workspace_id:${workspaceSId}`,
+      `workspace_id:${workspaceId}`,
       "type:free_yearly",
       `customer:${isEnterprise ? "enterprise" : "pro"}`,
     ]);
@@ -456,13 +482,13 @@ export async function grantFreeCreditFromSubscriptionStateChangeYearly({
   }
 
   getStatsDClient().increment("credits.top_up.success", 1, [
-    `workspace_id:${workspaceSId}`,
+    `workspace_id:${workspaceId}`,
     "type:free_yearly",
     `customer:${isEnterprise ? "enterprise" : "pro"}`,
   ]);
   logger.info(
     {
-      workspaceId: workspaceSId,
+      workspaceId,
       creditId: credit.id,
       creditAmountMicroUsd,
       periodStart,

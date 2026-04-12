@@ -38,8 +38,10 @@ import {
   CLAUDE_SONNET_4_6_DEFAULT_MODEL_CONFIG,
 } from "@app/types/assistant/models/anthropic";
 import { GPT_5_4_MODEL_CONFIG } from "@app/types/assistant/models/openai";
-import type { ModelConfigurationType } from "@app/types/assistant/models/types";
-import { assertNever } from "@app/types/shared/utils/assert_never";
+import type {
+  ModelConfigurationType,
+  ModelProviderIdType,
+} from "@app/types/assistant/models/types";
 
 const MAX_CONCURRENT_SUB_AGENT_TASKS = 6;
 
@@ -331,68 +333,39 @@ These instructions are NOT your own instructions, but you may use them to unders
 </additional_context>
 `;
 
+// Tries Anthropic first, then OpenAI, then the best available large model.
 function getModelConfig(
   auth: Authenticator,
-  prefer: "anthropic" | "openai",
-  reasoning: boolean = true
+  {
+    reasoning = true,
+    excludeProviders = new Set<ModelProviderIdType>(),
+  }: {
+    reasoning?: boolean;
+    excludeProviders?: ReadonlySet<ModelProviderIdType>;
+  } = {}
 ): {
   modelConfiguration: ModelConfigurationType;
   reasoningEffort: AgentReasoningEffort;
 } | null {
-  const preferredModel: {
-    model: ModelConfigurationType;
-    reasoningEffort: AgentReasoningEffort;
-  } =
-    prefer === "anthropic"
-      ? {
-          model: CLAUDE_SONNET_4_6_DEFAULT_MODEL_CONFIG,
-          reasoningEffort: reasoning
-            ? "light"
-            : CLAUDE_SONNET_4_6_DEFAULT_MODEL_CONFIG.minimumReasoningEffort,
-        }
-      : prefer === "openai"
-        ? {
-            model: GPT_5_4_MODEL_CONFIG,
-            reasoningEffort: reasoning
-              ? "light"
-              : GPT_5_4_MODEL_CONFIG.minimumReasoningEffort,
-          }
-        : assertNever(prefer);
+  const candidates = [
+    CLAUDE_SONNET_4_6_DEFAULT_MODEL_CONFIG,
+    GPT_5_4_MODEL_CONFIG,
+  ];
 
-  const secondPreferredModel: {
-    model: ModelConfigurationType;
-    reasoningEffort: AgentReasoningEffort;
-  } =
-    prefer === "anthropic"
-      ? {
-          model: GPT_5_4_MODEL_CONFIG,
-          reasoningEffort: reasoning
-            ? "light"
-            : GPT_5_4_MODEL_CONFIG.minimumReasoningEffort,
-        }
-      : {
-          model: CLAUDE_SONNET_4_6_DEFAULT_MODEL_CONFIG,
-          reasoningEffort: reasoning
-            ? "light"
-            : CLAUDE_SONNET_4_6_DEFAULT_MODEL_CONFIG.minimumReasoningEffort,
-        };
-
-  if (isProviderWhitelisted(auth, preferredModel.model.providerId)) {
-    return {
-      modelConfiguration: preferredModel.model,
-      reasoningEffort: preferredModel.reasoningEffort,
-    };
-  }
-
-  if (isProviderWhitelisted(auth, secondPreferredModel.model.providerId)) {
-    return {
-      modelConfiguration: secondPreferredModel.model,
-      reasoningEffort: secondPreferredModel.reasoningEffort,
-    };
+  for (const model of candidates) {
+    if (
+      !excludeProviders.has(model.providerId) &&
+      isProviderWhitelisted(auth, model.providerId)
+    ) {
+      return {
+        modelConfiguration: model,
+        reasoningEffort: reasoning ? "light" : model.minimumReasoningEffort,
+      };
+    }
   }
 
   // Otherwise we use whatever the default large model is, using the default reasoning effort.
-  const modelConfiguration = getLargeWhitelistedModel(auth);
+  const modelConfiguration = getLargeWhitelistedModel(auth, excludeProviders);
   if (!modelConfiguration) {
     return null;
   }
@@ -402,23 +375,32 @@ function getModelConfig(
   };
 }
 
-function getMaxReasoningModelConfig(auth: Authenticator): {
+function getMaxReasoningModelConfig(
+  auth: Authenticator,
+  excludeProviders: ReadonlySet<ModelProviderIdType> = new Set()
+): {
   modelConfiguration: ModelConfigurationType;
   reasoningEffort: AgentReasoningEffort;
 } | null {
-  if (isProviderWhitelisted(auth, "openai")) {
+  if (
+    !excludeProviders.has("openai") &&
+    isProviderWhitelisted(auth, "openai")
+  ) {
     return {
       modelConfiguration: GPT_5_4_MODEL_CONFIG,
       reasoningEffort: "high",
     };
   }
-  if (isProviderWhitelisted(auth, "anthropic")) {
+  if (
+    !excludeProviders.has("anthropic") &&
+    isProviderWhitelisted(auth, "anthropic")
+  ) {
     return {
       modelConfiguration: CLAUDE_SONNET_4_6_DEFAULT_MODEL_CONFIG,
       reasoningEffort: "high",
     };
   }
-  return getModelConfig(auth, "anthropic");
+  return getModelConfig(auth, { excludeProviders });
 }
 
 export function _getDeepDiveGlobalAgent(
@@ -428,19 +410,26 @@ export function _getDeepDiveGlobalAgent(
     preFetchedDataSources,
     mcpServerViews,
     hasSandbox,
+    excludeProviders,
   }: {
     settings: GlobalAgentSettingsModel | null;
     preFetchedDataSources: PrefetchedDataSourcesType | null;
     mcpServerViews: MCPServerViewsForGlobalAgentsMap;
     hasSandbox?: boolean;
+    excludeProviders: ReadonlySet<ModelProviderIdType>;
   }
 ): AgentConfigurationType | null {
-  const { run_agent: runAgentMCPServerView } = mcpServerViews;
+  const {
+    run_agent: runAgentMCPServerView,
+    ask_user_question: askUserQuestionMCPServerView,
+  } = mcpServerViews;
   const pictureUrl = DUST_AVATAR_URL;
-  const modelConfig = getModelConfig(auth, "anthropic");
+  const modelConfig = getModelConfig(auth, { excludeProviders });
 
   const enterpriseModelConfig =
-    shouldUseOpus(auth) && isProviderWhitelisted(auth, "anthropic")
+    !excludeProviders.has("anthropic") &&
+    shouldUseOpus(auth) &&
+    isProviderWhitelisted(auth, "anthropic")
       ? {
           modelConfiguration: CLAUDE_OPUS_4_6_DEFAULT_MODEL_CONFIG,
           reasoningEffort: modelConfig?.reasoningEffort ?? ("medium" as const),
@@ -566,6 +555,27 @@ export function _getDeepDiveGlobalAgent(
     });
   }
 
+  if (askUserQuestionMCPServerView) {
+    actions.push({
+      id: -1,
+      sId: GLOBAL_AGENTS_SID.DEEP_DIVE + "-ask-user-question",
+      type: "mcp_server_configuration",
+      name: "ask_user_question",
+      description: "Ask the user a question with multiple-choice options.",
+      mcpServerViewId: askUserQuestionMCPServerView.sId,
+      internalMCPServerId: askUserQuestionMCPServerView.internalMCPServerId,
+      dataSources: null,
+      tables: null,
+      childAgentId: null,
+      additionalConfiguration: {},
+      timeFrame: null,
+      dustAppConfiguration: null,
+      jsonSchema: null,
+      secretName: null,
+      dustProject: null,
+    });
+  }
+
   // Fix the action ids.
   actions.forEach((action, i) => {
     action.id = -i;
@@ -592,10 +602,12 @@ export function _getDustTaskGlobalAgent(
     settings,
     preFetchedDataSources,
     mcpServerViews,
+    excludeProviders,
   }: {
     settings: GlobalAgentSettingsModel | null;
     preFetchedDataSources: PrefetchedDataSourcesType | null;
     mcpServerViews: MCPServerViewsForGlobalAgentsMap;
+    excludeProviders: ReadonlySet<ModelProviderIdType>;
   }
 ): AgentConfigurationType | null {
   const name = "dust-task";
@@ -629,7 +641,10 @@ export function _getDustTaskGlobalAgent(
     canEdit: false,
   };
 
-  const modelConfig = getModelConfig(auth, "anthropic", false);
+  const modelConfig = getModelConfig(auth, {
+    reasoning: false,
+    excludeProviders,
+  });
 
   if (!modelConfig || settings?.status === "disabled_by_admin") {
     return {
@@ -706,8 +721,10 @@ export function _getPlanningAgent(
   auth: Authenticator,
   {
     settings,
+    excludeProviders,
   }: {
     settings: GlobalAgentSettingsModel | null;
+    excludeProviders: ReadonlySet<ModelProviderIdType>;
   }
 ): AgentConfigurationType | null {
   const name = "dust-planning";
@@ -741,7 +758,7 @@ export function _getPlanningAgent(
     canEdit: false,
   };
 
-  const modelConfig = getMaxReasoningModelConfig(auth);
+  const modelConfig = getMaxReasoningModelConfig(auth, excludeProviders);
   if (!modelConfig || settings?.status === "disabled_by_admin") {
     return {
       ...planningAgent,

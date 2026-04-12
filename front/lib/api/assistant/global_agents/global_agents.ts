@@ -47,6 +47,7 @@ import {
   _getDustQuickMediumGlobalAgent,
 } from "@app/lib/api/assistant/global_agents/configurations/dust/dust";
 import { _getNoopAgent } from "@app/lib/api/assistant/global_agents/configurations/dust/noop";
+import { _getReinforcementGlobalAgent } from "@app/lib/api/assistant/global_agents/configurations/dust/reinforcement";
 import { _getSidekickGlobalAgent } from "@app/lib/api/assistant/global_agents/configurations/dust/sidekick";
 import { isDeepDiveDisabledByAdmin } from "@app/lib/api/assistant/global_agents/configurations/dust/utils";
 import { _getGeminiProGlobalAgent } from "@app/lib/api/assistant/global_agents/configurations/google";
@@ -92,6 +93,7 @@ import { isProviderWhitelisted } from "@app/lib/assistant";
 import type { Authenticator } from "@app/lib/auth";
 import { getFeatureFlags } from "@app/lib/auth";
 import { GlobalAgentSettingsModel } from "@app/lib/models/agent/agent";
+import { KillSwitchResource } from "@app/lib/resources/kill_switch_resource";
 import type {
   AgentConfigurationType,
   AgentFetchVariant,
@@ -103,6 +105,7 @@ import {
   isGlobalAgentId,
 } from "@app/types/assistant/assistant";
 import { CUSTOM_MODEL_CONFIGS } from "@app/types/assistant/models/custom_models.generated";
+import type { ModelProviderIdType } from "@app/types/assistant/models/types";
 import { isDevelopment } from "@app/types/shared/env";
 
 // Exhaustive map of flags for each global agent. This is used to control which agents inject
@@ -328,6 +331,12 @@ const GLOBAL_AGENT_FLAGS: Record<
     injectsUserContext: true,
     injectsWorkspaceContext: true,
   },
+  [GLOBAL_AGENTS_SID.REINFORCEMENT]: {
+    injectsMemory: false,
+    injectsToolsets: false,
+    injectsUserContext: false,
+    injectsWorkspaceContext: false,
+  },
   [GLOBAL_AGENTS_SID.SLACK]: {
     injectsMemory: false,
     injectsToolsets: false,
@@ -540,6 +549,7 @@ function getGlobalAgent({
   hasDeepDive,
   hasSandbox,
   globalAgentContext,
+  excludeProviders,
 }: {
   auth: Authenticator;
   sId: string | number;
@@ -550,6 +560,7 @@ function getGlobalAgent({
   hasDeepDive: boolean;
   hasSandbox: boolean;
   globalAgentContext?: GlobalAgentContext;
+  excludeProviders: ReadonlySet<ModelProviderIdType>;
 }): AgentConfigurationType | null {
   const settings =
     globalAgentSettings.find((settings) => settings.agentId === sId) ?? null;
@@ -755,6 +766,7 @@ function getGlobalAgent({
         mcpServerViews,
         hasDeepDive,
         globalAgentContext,
+        excludeProviders,
       });
       break;
     case GLOBAL_AGENTS_SID.DUST_HIGH:
@@ -990,6 +1002,7 @@ function getGlobalAgent({
         preFetchedDataSources,
         mcpServerViews,
         hasSandbox,
+        excludeProviders,
       });
       break;
     case GLOBAL_AGENTS_SID.DUST_TASK:
@@ -997,6 +1010,7 @@ function getGlobalAgent({
         settings,
         preFetchedDataSources,
         mcpServerViews,
+        excludeProviders,
       });
       break;
     case GLOBAL_AGENTS_SID.DUST_BROWSER_SUMMARY:
@@ -1005,6 +1019,7 @@ function getGlobalAgent({
     case GLOBAL_AGENTS_SID.DUST_PLANNING:
       agentConfiguration = _getPlanningAgent(auth, {
         settings,
+        excludeProviders,
       });
       break;
     case GLOBAL_AGENTS_SID.SIDEKICK:
@@ -1014,6 +1029,9 @@ function getGlobalAgent({
         mcpServerViews,
         globalAgentContext,
       });
+      break;
+    case GLOBAL_AGENTS_SID.REINFORCEMENT:
+      agentConfiguration = _getReinforcementGlobalAgent();
       break;
     case GLOBAL_AGENTS_SID.NOOP:
       // we want only to have it in development
@@ -1079,18 +1097,28 @@ export async function getGlobalAgents(
     throw new Error("Unexpected `auth` without `plan`.");
   }
 
-  const isDeepDiveDisabled = await isDeepDiveDisabledByAdmin(auth);
+  const [
+    isDeepDiveDisabled,
+    isDustAgentsFallback,
+    preFetchedDataSources,
+    globalAgentSettings,
+    mcpServerViews,
+  ] = await Promise.all([
+    isDeepDiveDisabledByAdmin(auth),
+    KillSwitchResource.isKillSwitchEnabled("global_dust_agents_fallback"),
+    variant === "full"
+      ? getDataSourcesAndWorkspaceIdForGlobalAgents(auth)
+      : null,
+    GlobalAgentSettingsModel.findAll({
+      where: { workspaceId: owner.id },
+    }),
+    getMCPServerViewsForGlobalAgents(auth, variant),
+  ]);
 
-  const [preFetchedDataSources, globalAgentSettings, mcpServerViews] =
-    await Promise.all([
-      variant === "full"
-        ? getDataSourcesAndWorkspaceIdForGlobalAgents(auth)
-        : null,
-      GlobalAgentSettingsModel.findAll({
-        where: { workspaceId: owner.id },
-      }),
-      getMCPServerViewsForGlobalAgents(auth, variant),
-    ]);
+  const excludeProviders: ReadonlySet<ModelProviderIdType> =
+    isDustAgentsFallback
+      ? new Set<ModelProviderIdType>(["anthropic"])
+      : new Set<ModelProviderIdType>();
 
   // If agentIds have been passed we fetch those. Otherwise we fetch them all, removing the retired
   // one (which will remove these models from the list of default agents in the product + list of
@@ -1100,7 +1128,10 @@ export async function getGlobalAgents(
     Object.values(GLOBAL_AGENTS_SID)
       .filter((sId) => !RETIRED_GLOBAL_AGENTS_SID.includes(sId))
       // We only want to fetch sidekick global agents if explicitly requested.
-      .filter((sId) => sId !== GLOBAL_AGENTS_SID.SIDEKICK);
+      .filter((sId) => sId !== GLOBAL_AGENTS_SID.SIDEKICK)
+      // The reinforcement agent is never called directly, it is only used as a
+      // placeholder when building reinforcement conversations.
+      .filter((sId) => sId !== GLOBAL_AGENTS_SID.REINFORCEMENT);
 
   const flags = await getFeatureFlags(auth);
 
@@ -1186,6 +1217,7 @@ export async function getGlobalAgents(
       hasDeepDive: !isDeepDiveDisabled,
       hasSandbox: flags.includes("sandbox_tools"),
       globalAgentContext: options?.globalAgentContext,
+      excludeProviders,
     })
   );
 

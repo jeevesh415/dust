@@ -286,12 +286,14 @@ export function useCreateInternalMCPServer(owner: LightWorkspaceType) {
     sharedSecret,
     customHeaders,
     viewName,
+    oauthScope,
   }: {
     name: string;
     includeGlobal: boolean;
     sharedSecret?: string;
     customHeaders?: Array<{ key: string; value: string }>;
     viewName?: string;
+    oauthScope?: string;
   } & (
     | { oauthConnection: MCPConnectionType; useCase?: never }
     | { oauthConnection?: never; useCase: MCPOAuthUseCase }
@@ -309,6 +311,7 @@ export function useCreateInternalMCPServer(owner: LightWorkspaceType) {
         ...(sharedSecret !== undefined ? { sharedSecret } : {}),
         ...(customHeaders !== undefined ? { customHeaders } : {}),
         ...(viewName !== undefined ? { viewName } : {}),
+        ...(oauthScope !== undefined ? { oauthScope } : {}),
       }),
     });
 
@@ -366,6 +369,20 @@ export function useDiscoverOAuthMetadata(owner: LightWorkspaceType) {
   return { discoverOAuthMetadata };
 }
 
+export class MCPCreateServerError extends Error {
+  readonly isRemoteServerError: boolean;
+  constructor(message: string, isRemoteServerError: boolean) {
+    super(message);
+    this.isRemoteServerError = isRemoteServerError;
+  }
+}
+
+export function isMCPCreateServerError(
+  error: Error
+): error is MCPCreateServerError {
+  return error instanceof MCPCreateServerError;
+}
+
 /**
  * Hook to create a new MCP server from a URL
  */
@@ -381,18 +398,23 @@ export function useCreateRemoteMCPServer(owner: LightWorkspaceType) {
   const createWithURL = useCallback(
     async ({
       url,
+      defaultServerId,
       includeGlobal,
       sharedSecret,
       oauthConnection,
       customHeaders,
     }: {
       url: string;
+      defaultServerId?: number;
       includeGlobal: boolean;
       sharedSecret?: string;
       oauthConnection?: MCPConnectionType;
       customHeaders?: { key: string; value: string }[];
     }): Promise<Result<CreateMCPServerResponseBody, Error>> => {
       const body: any = { url, serverType: "remote", includeGlobal };
+      if (defaultServerId !== undefined) {
+        body.defaultServerId = defaultServerId;
+      }
       if (sharedSecret) {
         body.sharedSecret = sharedSecret;
       }
@@ -413,8 +435,11 @@ export function useCreateRemoteMCPServer(owner: LightWorkspaceType) {
       if (!response.ok) {
         const body = await response.json();
         return new Err(
-          // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
-          new Error(body.error?.message || "Failed to create server")
+          new MCPCreateServerError(
+            // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+            body.error?.message || "Failed to create server",
+            body.isRemoteServerError === true
+          )
         );
       }
       await mutate();

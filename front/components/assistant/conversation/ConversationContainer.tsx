@@ -9,6 +9,7 @@ import { useConversations } from "@app/hooks/conversations";
 import { useActiveConversationId } from "@app/hooks/useActiveConversationId";
 import { useCreateConversationWithMessage } from "@app/hooks/useCreateConversationWithMessage";
 import { useSendNotification } from "@app/hooks/useNotification";
+import { useFeatureFlags } from "@app/lib/auth/AuthContext";
 import { getRandomGreetingForName } from "@app/lib/client/greetings";
 import type { DustError } from "@app/lib/error";
 import { useAppRouter } from "@app/lib/platform";
@@ -59,8 +60,11 @@ export function ConversationContainerVirtuoso({
       : conversationIdFromRouter;
 
   const [planLimitReached, setPlanLimitReached] = useState(false);
+  const { hasFeature } = useFeatureFlags();
+  const singleAgentInput = hasFeature("enable_steering");
 
-  const { setSelectedAgent } = useContext(InputBarContext);
+  const { setSelectedAgent, setSelectedSingleAgent } =
+    useContext(InputBarContext);
 
   const router = useAppRouter();
 
@@ -160,6 +164,10 @@ export function ConversationContainerVirtuoso({
 
   const { startConversationRef } = useWelcomeTourGuide();
 
+  // Forces a full remount of ConversationViewer (Virtuoso list, messages, InputBar)
+  // when switching conversations.
+  const conversationViewerKey = activeConversationId;
+
   const body = (
     <DropzoneContainer
       description="Drag and drop your text files (txt, doc, pdf) and image files (jpg, png) here."
@@ -171,14 +179,14 @@ export function ConversationContainerVirtuoso({
           user={user}
           conversationId={activeConversationId}
           setPlanLimitReached={setPlanLimitReached}
-          key={activeConversationId}
+          key={conversationViewerKey}
           clientSideMCPServerIds={clientSideMCPServerIds}
         />
       ) : (
         <>
           <div
             id="agent-input-header"
-            className="flex h-fit w-full max-w-3xl flex-col justify-end gap-8 py-4 md:min-h-[20vh]"
+            className="flex h-fit w-full max-w-conversation flex-col justify-end gap-8 py-4 md:min-h-[20vh]"
             ref={startConversationRef}
           >
             <Page.Header title={greeting} />
@@ -187,7 +195,7 @@ export function ConversationContainerVirtuoso({
             className={classNames(
               "sticky bottom-0 z-20 flex max-h-dvh w-full",
               "pb-2",
-              "sm:w-full sm:max-w-3xl sm:pb-4"
+              "sm:w-full sm:max-w-conversation sm:pb-4"
             )}
           >
             <InputBar
@@ -200,7 +208,7 @@ export function ConversationContainerVirtuoso({
           </div>
 
           {suggestion && (
-            <div className="w-full max-w-3xl mt-1">
+            <div className="w-full max-w-conversation mt-1">
               <Card
                 variant="highlight"
                 size="md"
@@ -230,7 +238,11 @@ export function ConversationContainerVirtuoso({
           )}
           <AgentBrowserContainer
             onAgentConfigurationClick={(agent) => {
-              setSelectedAgent(toRichAgentMentionType(agent));
+              if (singleAgentInput) {
+                setSelectedSingleAgent(toRichAgentMentionType(agent));
+              } else {
+                setSelectedAgent(toRichAgentMentionType(agent));
+              }
             }}
             owner={owner}
             user={user}

@@ -1,10 +1,14 @@
 /** @ignoreswagger */
+import {
+  buildAuditLogTarget,
+  emitAuditLogEvent,
+  getAuditLogContext,
+} from "@app/lib/api/audit/workos_audit";
 import { withSessionAuthenticationForPoke } from "@app/lib/api/auth_wrappers";
+import { updateMembershipRoleAndTrack } from "@app/lib/api/membership";
 import { getUserForWorkspace } from "@app/lib/api/user";
 import { Authenticator } from "@app/lib/auth";
 import type { SessionWithUser } from "@app/lib/iam/provider";
-import { MembershipResource } from "@app/lib/resources/membership_resource";
-import { ServerSideTracking } from "@app/lib/tracking/server";
 import { apiError } from "@app/logger/withlogging";
 import type { WithAPIErrorResponse } from "@app/types/error";
 import { assertNever } from "@app/types/shared/utils/assert_never";
@@ -70,11 +74,10 @@ async function handler(
         });
       }
 
-      const updateRes = await MembershipResource.updateMembershipRole({
+      const updateRes = await updateMembershipRoleAndTrack({
         user,
         workspace: owner,
         newRole: role,
-        // We allow to re-activate a terminated membership when updating the role here.
         allowTerminated: true,
         author: auth.user()?.toJSON() ?? "no-author",
       });
@@ -110,11 +113,21 @@ async function handler(
       }
 
       if (updateRes.isOk()) {
-        void ServerSideTracking.trackUpdateMembershipRole({
-          user: user.toJSON(),
-          workspace: owner,
-          previousRole: updateRes.value.previousRole,
-          role: updateRes.value.newRole,
+        void emitAuditLogEvent({
+          auth,
+          action: "membership.role_updated",
+          targets: [
+            buildAuditLogTarget("workspace", owner),
+            buildAuditLogTarget("user", {
+              sId: user.sId,
+              name: user.fullName() ?? "unknown",
+            }),
+          ],
+          context: getAuditLogContext(auth, req),
+          metadata: {
+            previousRole: updateRes.value.previousRole,
+            newRole: updateRes.value.newRole,
+          },
         });
       }
       return res.status(200).json({ success: true });

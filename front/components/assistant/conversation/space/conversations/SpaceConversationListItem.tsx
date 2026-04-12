@@ -1,7 +1,12 @@
 import { useAppRouter } from "@app/lib/platform";
 import { getConversationRoute } from "@app/lib/utils/router";
 import type { LightConversationType } from "@app/types/assistant/conversation";
-import { isUserMessageTypeWithContentFragments } from "@app/types/assistant/conversation";
+import {
+  isCompactionMessageType,
+  isLightAgentMessageType,
+  isUserMessageTypeWithContentFragments,
+} from "@app/types/assistant/conversation";
+import { assertNeverAndIgnore } from "@app/types/shared/utils/assert_never";
 import { stripMarkdown } from "@app/types/shared/utils/string_utils";
 import type { WorkspaceType } from "@app/types/user";
 import type { Avatar } from "@dust-tt/sparkle";
@@ -9,7 +14,6 @@ import { ConversationListItem, ReplySection } from "@dust-tt/sparkle";
 import uniqBy from "lodash/uniqBy";
 import moment from "moment";
 import { useMemo } from "react";
-
 import { isHiddenMessage } from "../../types";
 import { isMessageUnread } from "../../utils";
 
@@ -18,21 +22,45 @@ interface SpaceConversationListItemProps {
   owner: WorkspaceType;
 }
 
+function isVisibleMessage(
+  m: LightConversationType["content"][number]
+): boolean {
+  return (
+    m.visibility !== "deleted" &&
+    !(isUserMessageTypeWithContentFragments(m) && isHiddenMessage(m)) &&
+    // Compaction message will possibly be first messages of a conversation (forking) but they are
+    // not "visible" per se. `firstVisibleMessage` should null until a first user message is posted.
+    !isCompactionMessageType(m)
+  );
+}
+
 export function SpaceConversationListItem({
   conversation,
   owner,
 }: SpaceConversationListItemProps) {
   const router = useAppRouter();
-  const firstUserMessage = conversation.content.find(
-    isUserMessageTypeWithContentFragments
-  );
+
+  const validMessages = conversation.content.filter((message) => {
+    if (isCompactionMessageType(message)) {
+      return false;
+    }
+    return (
+      (isUserMessageTypeWithContentFragments(message) &&
+        message.visibility === "visible" &&
+        !isHiddenMessage(message)) ||
+      (!isUserMessageTypeWithContentFragments(message) &&
+        message.status === "succeeded")
+    );
+  });
+
+  const firstVisibleMessage = conversation.content.find(isVisibleMessage);
 
   // Compute the reply section avatars.
   const avatars = useMemo(() => {
     const avatars: Parameters<typeof Avatar.Stack>[0]["avatars"] = [];
     // Lookup the messages in reverse order and collect the users and agents icons
     // Slice to skip the first message as it's not a reply.
-    for (const message of conversation.content.slice(1)) {
+    for (const message of validMessages.slice(1)) {
       if (isUserMessageTypeWithContentFragments(message)) {
         avatars.push({
           isRounded: true,
@@ -40,25 +68,28 @@ export function SpaceConversationListItem({
           visual:
             message.user?.image ?? message.context?.profilePictureUrl ?? "",
         });
-      } else {
+      } else if (isCompactionMessageType(message)) {
+        // Nothing to do unless we want to show that the conversation was compacted.
+      } else if (isLightAgentMessageType(message)) {
         avatars.push({
           isRounded: false,
           name: "@" + (message.configuration.name ?? ""),
           visual: message.configuration.pictureUrl ?? "",
         });
+      } else {
+        assertNeverAndIgnore(message);
       }
     }
     return uniqBy(avatars.reverse(), "visual");
-  }, [conversation.content]);
+  }, [validMessages]);
 
   const countUnreadMessages = useMemo(() => {
-    return conversation.content.filter((message) => {
+    return validMessages.filter((message) => {
       return isMessageUnread(message, conversation.lastReadMs);
     }).length;
-  }, [conversation.content, conversation.lastReadMs]);
+  }, [validMessages, conversation.lastReadMs]);
 
-  // TODO(conversations-groups) Are we sure we want to require a user message?
-  if (!firstUserMessage) {
+  if (!firstVisibleMessage || isCompactionMessageType(firstVisibleMessage)) {
     return null;
   }
 
@@ -70,39 +101,25 @@ export function SpaceConversationListItem({
 
   const time = moment(conversation.updated).fromNow();
 
-  const replyCount = conversation.content.length - 1;
-
-  let firstMessageForDescription: LightConversationType["content"][number] =
-    firstUserMessage;
-  if (isHiddenMessage(firstUserMessage)) {
-    const firstNonHiddenMessage = conversation.content.find((message) => {
-      if (!isUserMessageTypeWithContentFragments(message)) {
-        return true;
-      }
-      return !isHiddenMessage(message);
-    });
-
-    if (firstNonHiddenMessage) {
-      firstMessageForDescription = firstNonHiddenMessage;
-    }
-  }
+  const replyCount = validMessages.length - 1;
 
   let creatorName = "Unknown";
-  let creatorVisual: string | undefined = undefined;
+  let creatorVisual: string | undefined;
 
-  if (isUserMessageTypeWithContentFragments(firstMessageForDescription)) {
+  if (isUserMessageTypeWithContentFragments(firstVisibleMessage)) {
     creatorName =
-      firstMessageForDescription.user?.fullName ??
-      firstMessageForDescription.context?.fullName ??
+      firstVisibleMessage.user?.fullName ??
+      firstVisibleMessage.context?.fullName ??
       "Unknown";
     creatorVisual =
-      firstMessageForDescription.user?.image ??
-      firstMessageForDescription.context?.profilePictureUrl ??
+      firstVisibleMessage.user?.image ??
+      firstVisibleMessage.context?.profilePictureUrl ??
       undefined;
+  } else if (isLightAgentMessageType(firstVisibleMessage)) {
+    creatorName = `@${firstVisibleMessage.configuration.name}`;
+    creatorVisual = firstVisibleMessage.configuration.pictureUrl || undefined;
   } else {
-    creatorName = `@${firstMessageForDescription.configuration.name}`;
-    creatorVisual =
-      firstMessageForDescription.configuration.pictureUrl || undefined;
+    assertNeverAndIgnore(firstVisibleMessage);
   }
 
   return (
@@ -112,7 +129,7 @@ export function SpaceConversationListItem({
         conversation={{
           id: conversation.sId,
           title: conversationLabel,
-          description: stripMarkdown(firstMessageForDescription.content ?? ""),
+          description: stripMarkdown(firstVisibleMessage.content ?? ""),
           updatedAt: new Date(conversation.updated),
         }}
         creator={{

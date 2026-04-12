@@ -11,6 +11,7 @@ import type { ModelStaticWorkspaceAware } from "@app/lib/resources/storage/wrapp
 import {
   batchInvalidateCacheWithRedis,
   cacheWithRedis,
+  invalidateCacheAfterCommit,
   invalidateCacheWithRedis,
 } from "@app/lib/utils/cache";
 import type { KeyType } from "@app/types/key";
@@ -19,7 +20,7 @@ import type { Result } from "@app/types/shared/result";
 import { redactString } from "@app/types/shared/utils/string_utils";
 import type { LightWorkspaceType, RoleType } from "@app/types/user";
 import { formatUserFullName } from "@app/types/user";
-import { hash as blake3 } from "blake3";
+import { blake3 } from "@napi-rs/blake-hash";
 import type { Attributes, CreationAttributes, Transaction } from "sequelize";
 import { Op } from "sequelize";
 import { v4 as uuidv4 } from "uuid";
@@ -52,8 +53,8 @@ export class KeyResource extends BaseResource<KeyModel> {
 
   private user?: UserModel;
 
-  private static readonly keyCacheKeyResolver = (secret: string) =>
-    `key:secret:${Buffer.from(blake3(secret)).toString("hex")}`;
+  static readonly keyCacheKeyResolver = (secret: string) =>
+    `key:secret:${blake3(secret).toString("hex")}`;
 
   private static async _fetchBySecretUncached(
     secret: string
@@ -76,10 +77,9 @@ export class KeyResource extends BaseResource<KeyModel> {
       status: key.status,
       isSystem: key.isSystem,
       role: key.role,
-      scope: key.scope,
       monthlyCapMicroUsd: key.monthlyCapMicroUsd,
       workspaceId: key.workspaceId,
-      groupId: key.groupId,
+      groupIds: key.groupIds,
       userId: key.userId,
       lastUsedAt: key.lastUsedAt?.getTime() ?? null,
       createdAt: key.createdAt.getTime(),
@@ -130,27 +130,28 @@ export class KeyResource extends BaseResource<KeyModel> {
   ): Promise<[affectedCount: number]> {
     const oldSecret = this.secret;
     const result = await super.update(blob, transaction);
-    await KeyResource.invalidateKeyCache(oldSecret);
+    invalidateCacheAfterCommit(transaction, () =>
+      KeyResource.invalidateKeyCache(oldSecret)
+    );
     return result;
   }
 
   static async makeNew(
-    blob: Omit<CreationAttributes<KeyModel>, "secret" | "groupId" | "scope">,
-    group: GroupResource
+    blob: Omit<CreationAttributes<KeyModel>, "secret" | "groupIds">,
+    groups: GroupResource[]
   ) {
     const secret = this.createNewSecret();
     const key = await KeyResource.model.create({
       ...blob,
-      groupId: group.id,
+      groupIds: groups.map((g) => g.id),
       secret,
-      scope: "default",
     });
 
     return new this(KeyResource.model, key.get());
   }
 
   static createNewSecret() {
-    return `${SECRET_KEY_PREFIX}${Buffer.from(blake3(uuidv4())).toString("hex").slice(0, 32)}`;
+    return `${SECRET_KEY_PREFIX}${blake3(uuidv4()).toString("hex").slice(0, 32)}`;
   }
 
   static async fetchSystemKeyForWorkspace(workspace: LightWorkspaceType) {
@@ -274,8 +275,8 @@ export class KeyResource extends BaseResource<KeyModel> {
   ) {
     return this.model.count({
       where: {
-        groupId: {
-          [Op.in]: groups.map((g) => g.id),
+        groupIds: {
+          [Op.overlap]: groups.map((g) => g.id),
         },
         status: "active",
         workspaceId: auth.getNonNullableWorkspace().id,
@@ -325,9 +326,8 @@ export class KeyResource extends BaseResource<KeyModel> {
       name: this.name,
       secret,
       status: this.status,
-      groupId: this.groupId,
+      groupIds: this.groupIds,
       role: this.role,
-      scope: this.scope,
       monthlyCapMicroUsd: this.monthlyCapMicroUsd,
     };
   }

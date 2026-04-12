@@ -354,6 +354,7 @@ module.exports = {
         100: "400px",
         125: "500px",
         150: "600px",
+        conversation: "48rem", // max-w-3xl equivalent, used for conversation content area
       },
       maxHeight: {
         100: "400px",
@@ -472,17 +473,14 @@ module.exports = {
           },
         },
         shake: {
-          "10%, 90%": {
-            transform: "translate3d(-1px, 0, 0)",
+          "0%, 100%": {
+            transform: "translate3d(0, 0, 0)",
           },
-          "20%, 80%": {
-            transform: "translate3d(2px, 0, 0)",
+          "20%, 60%": {
+            transform: "translate3d(-1.5px, 0, 0)",
           },
-          "30%, 50%, 70%": {
-            transform: "translate3d(-2px, 0, 0)",
-          },
-          "40%, 60%": {
-            transform: "translate3d(2px, 0, 0)",
+          "40%, 80%": {
+            transform: "translate3d(1.5px, 0, 0)",
           },
         },
         marquee: {
@@ -505,7 +503,7 @@ module.exports = {
         breathing: "breathing 4s infinite ease-in-out",
         "breathing-scale": "breathing-scale 3s infinite ease-in-out",
         "cursor-blink": "cursor-blink 0.9s infinite;",
-        shake: "shake 0.82s cubic-bezier(.36,.07,.19,.97) both",
+        shake: "shake 0.5s ease-in-out both",
         reload: "reload 1000ms ease-out",
         fadeout: "fadeout 500ms ease-out",
         marquee: "marquee 25s linear infinite",
@@ -1008,7 +1006,7 @@ module.exports = {
     // Avatar bg classes are constructed dynamically.
     {
       pattern:
-        /^bg-(gray|blue|violet|pink|red|orange|golden|lime|emerald)-(100|200|300|400|500|600|700|800)$/,
+        /^(bg|text)-(gray|blue|violet|pink|red|orange|golden|lime|emerald)-(100|200|300|400|500|600|700|800|900)$/,
     },
     // MainNavigation grid rows are constructed dynamically.
     "grid-rows-2",

@@ -1,6 +1,7 @@
 import react from "@vitejs/plugin-react";
 import { createRequire } from "module";
 import path from "path";
+import { visualizer } from "rollup-plugin-visualizer";
 import type { Plugin, PluginOption } from "vite";
 import { defineConfig, loadEnv } from "vite";
 
@@ -76,7 +77,9 @@ function detectServerImportsPlugin(): Plugin {
   // Known exceptions that are tolerated.
   // Each entry should have a comment explaining why it's allowed.
   const ALLOWED = new Set([
-    // string_ids.ts is a utility imported by 139+ files. Needs a broader refactor to split.
+    // string_ids.ts is imported by many SPA files and lives in the server-only resources pattern.
+    // The blake3-dependent functions (generateRandomModelSId, generateSecureSecret) have been
+    // moved to string_ids_server.ts which is not imported from the SPA.
     "front/lib/resources/string_ids.ts",
     // run.ts uses fs/path for Dust app execution. Only imported transitively, never called in SPA.
     "fs",
@@ -261,6 +264,20 @@ export default defineConfig(({ mode }) => {
   const enableReactScan =
     mode === "development" && env.VITE_REACT_SCAN === "true";
 
+  const enableAnalyzer = env.ANALYZE === "true";
+  type AnalyzerTemplate =
+    | "treemap"
+    | "sunburst"
+    | "network"
+    | "raw-data"
+    | "list";
+  const isAnalyzerTemplate = (value: string): value is AnalyzerTemplate =>
+    ["treemap", "sunburst", "network", "raw-data", "list"].includes(value);
+  const templateValue = env.ANALYZE_TEMPLATE ?? "treemap";
+  const analyzerTemplate: AnalyzerTemplate = isAnalyzerTemplate(templateValue)
+    ? templateValue
+    : "treemap";
+
   return {
     cacheDir: path.resolve(__dirname, ".vite"),
     base: basePath,
@@ -272,6 +289,14 @@ export default defineConfig(({ mode }) => {
       organizeMultiEntryOutputPlugin(appDefinition),
       reactScanPlugin(enableReactScan),
       react(),
+      enableAnalyzer &&
+        visualizer({
+          open: true,
+          filename: `dist/${appName}/stats.html`,
+          template: analyzerTemplate,
+          gzipSize: true,
+          brotliSize: true,
+        }),
     ].flat() as PluginOption[],
     define: {
       ...envVarDefines,

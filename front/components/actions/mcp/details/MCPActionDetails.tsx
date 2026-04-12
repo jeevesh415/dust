@@ -12,6 +12,7 @@ import {
   MCPAgentMemoryRecordActionDetails,
   MCPAgentMemoryRetrieveActionDetails,
 } from "@app/components/actions/mcp/details/MCPAgentMemoryActionDetails";
+import { MCPAskUserQuestionActionDetails } from "@app/components/actions/mcp/details/MCPAskUserQuestionActionDetails";
 import { MCPBrowseActionDetails } from "@app/components/actions/mcp/details/MCPBrowseActionDetails";
 import { MCPConversationCatFileDetails } from "@app/components/actions/mcp/details/MCPConversationFilesActionDetails";
 import {
@@ -63,7 +64,7 @@ import {
   isDataSourceFilesystemFindInputType,
   isDataSourceFilesystemListInputType,
   isIncludeInputType,
-  isSearchInputType,
+  isSearchInputTypeWithTags,
   isWebsearchInputType,
 } from "@app/lib/actions/mcp_internal_actions/types";
 import { MCP_SPECIFICATION } from "@app/lib/actions/utils_ui";
@@ -112,7 +113,12 @@ export interface MCPActionDetailsProps {
   action: AgentMCPActionWithOutputType;
   owner: LightWorkspaceType;
   lastNotification: ProgressNotificationContentType | null;
-  messageStatus?: "created" | "succeeded" | "failed" | "cancelled";
+  messageStatus?:
+    | "created"
+    | "succeeded"
+    | "failed"
+    | "cancelled"
+    | "gracefully_stopped";
   displayContext: ActionDetailsDisplayContext;
 }
 
@@ -182,7 +188,9 @@ export function MCPActionDetails({
 
   if (
     internalMCPServerName === "search" ||
-    internalMCPServerName === "data_sources_file_system"
+    internalMCPServerName === "data_sources_file_system" ||
+    (internalMCPServerName === "project_manager" &&
+      toolName === "semantic_search")
   ) {
     switch (toolName) {
       case SEARCH_TOOL_NAME:
@@ -198,7 +206,7 @@ export function MCPActionDetails({
             actionOutput={output}
             visual={MagnifyingGlassIcon}
             query={
-              isSearchInputType(params)
+              isSearchInputTypeWithTags(params)
                 ? makeQueryTextForDataSourceSearch(params)
                 : null
             }
@@ -233,8 +241,10 @@ export function MCPActionDetails({
   }
 
   if (
-    internalMCPServerName === "include_data" &&
-    toolName === INCLUDE_TOOL_NAME
+    (internalMCPServerName === "include_data" &&
+      toolName === INCLUDE_TOOL_NAME) ||
+    (internalMCPServerName === "project_manager" &&
+      toolName === "retrieve_recent_documents")
   ) {
     return (
       <SearchResultDetails
@@ -378,6 +388,10 @@ export function MCPActionDetails({
     return <MCPSandboxActionDetails {...toolOutputDetailsProps} />;
   }
 
+  if (internalMCPServerName === "ask_user_question") {
+    return <MCPAskUserQuestionActionDetails {...toolOutputDetailsProps} />;
+  }
+
   return (
     <GenericActionDetails
       owner={owner}
@@ -413,50 +427,84 @@ export function GenericActionDetails({
     >
       {displayContext !== "conversation" && (
         <div className="dd-privacy-mask flex flex-col gap-4 py-4 pl-6">
-          <Collapsible defaultOpen={false}>
-            <CollapsibleTrigger>
-              <div
-                className={cn(
-                  "text-foreground dark:text-foreground-night",
-                  "flex flex-row items-center gap-x-2"
-                )}
-              >
-                <span className="heading-base">Inputs</span>
+          {displayContext === "sidebar-single-action" ? (
+            <>
+              <div>
+                <span className="font-medium text-foreground dark:text-foreground-night">
+                  Inputs
+                </span>
+                <RenderToolItemMarkdown text={inputs} type="input" />
               </div>
-            </CollapsibleTrigger>
-            <CollapsibleContent>
-              <RenderToolItemMarkdown text={inputs} type="input" />
-            </CollapsibleContent>
-          </Collapsible>
+              {action.output && (
+                <div>
+                  <span className="font-medium text-foreground dark:text-foreground-night">
+                    Output
+                  </span>
+                  <div className="my-2 flex flex-col gap-2">
+                    {action.output
+                      .filter(
+                        (o) => isTextContent(o) || isResourceContentWithText(o)
+                      )
+                      .map((o, index) => (
+                        <RenderToolItemMarkdown
+                          key={index}
+                          text={getOutputText(o)}
+                          type="output"
+                        />
+                      ))}
+                  </div>
+                </div>
+              )}
+            </>
+          ) : (
+            <>
+              <Collapsible defaultOpen={false}>
+                <CollapsibleTrigger>
+                  <div
+                    className={cn(
+                      "text-foreground dark:text-foreground-night",
+                      "flex flex-row items-center gap-x-2"
+                    )}
+                  >
+                    <span className="heading-base">Inputs</span>
+                  </div>
+                </CollapsibleTrigger>
+                <CollapsibleContent>
+                  <RenderToolItemMarkdown text={inputs} type="input" />
+                </CollapsibleContent>
+              </Collapsible>
 
-          {action.output && (
-            <Collapsible defaultOpen={false}>
-              <CollapsibleTrigger>
-                <div
-                  className={cn(
-                    "text-foreground dark:text-foreground-night",
-                    "flex flex-row items-center gap-x-2"
-                  )}
-                >
-                  <span className="heading-base">Output</span>
-                </div>
-              </CollapsibleTrigger>
-              <CollapsibleContent>
-                <div className="flex flex-col gap-2 my-2">
-                  {action.output
-                    .filter(
-                      (o) => isTextContent(o) || isResourceContentWithText(o)
-                    )
-                    .map((o, index) => (
-                      <RenderToolItemMarkdown
-                        key={index}
-                        text={getOutputText(o)}
-                        type="output"
-                      />
-                    ))}
-                </div>
-              </CollapsibleContent>
-            </Collapsible>
+              {action.output && (
+                <Collapsible defaultOpen={false}>
+                  <CollapsibleTrigger>
+                    <div
+                      className={cn(
+                        "text-foreground dark:text-foreground-night",
+                        "flex flex-row items-center gap-x-2"
+                      )}
+                    >
+                      <span className="heading-base">Output</span>
+                    </div>
+                  </CollapsibleTrigger>
+                  <CollapsibleContent>
+                    <div className="my-2 flex flex-col gap-2">
+                      {action.output
+                        .filter(
+                          (o) =>
+                            isTextContent(o) || isResourceContentWithText(o)
+                        )
+                        .map((o, index) => (
+                          <RenderToolItemMarkdown
+                            key={index}
+                            text={getOutputText(o)}
+                            type="output"
+                          />
+                        ))}
+                    </div>
+                  </CollapsibleContent>
+                </Collapsible>
+              )}
+            </>
           )}
 
           {action.generatedFiles.filter((f) => !f.hidden).length > 0 && (
@@ -464,7 +512,7 @@ export function GenericActionDetails({
               <span className="heading-base">Generated Files</span>
               <div className="flex flex-wrap gap-2">
                 {action.generatedFiles
-                  .filter((file) => !file.hidden)
+                  .filter((f) => !f.hidden)
                   .map((file) => {
                     if (isSupportedImageContentType(file.contentType)) {
                       return (

@@ -54,8 +54,17 @@ const WorkspaceWorkOSUpdateBodySchema = t.type({
   workOSOrganizationId: t.union([t.string, t.null]),
 });
 
+// TODO(2026-03-20 FRAME SHARING): Remove once all clients have refreshed.
 const WorkspaceInteractiveContentSharingUpdateBodySchema = t.type({
   allowContentCreationFileSharing: t.boolean,
+});
+
+const WorkspaceSharingPolicyUpdateBodySchema = t.type({
+  sharingPolicy: t.union([
+    t.literal("all_scopes"),
+    t.literal("workspace_only"),
+    t.literal("workspace_and_emails"),
+  ]),
 });
 
 const WorkspaceVoiceTranscriptionUpdateBodySchema = t.type({
@@ -66,6 +75,14 @@ const WorkspaceEmailAgentsUpdateBodySchema = t.type({
   allowEmailAgents: t.boolean,
 });
 
+const WorkspaceAgentReinforcementUpdateBodySchema = t.type({
+  allowReinforcement: t.boolean,
+});
+
+const WorkspaceReinforcementBatchModeUpdateBodySchema = t.type({
+  allowReinforcementBatchMode: t.boolean,
+});
+
 const PostWorkspaceRequestBodySchema = t.union([
   WorkspaceAllowedDomainUpdateBodySchema,
   WorkspaceBatchDomainUpdateBodySchema,
@@ -74,8 +91,11 @@ const PostWorkspaceRequestBodySchema = t.union([
   WorkspaceProvidersUpdateBodySchema,
   WorkspaceWorkOSUpdateBodySchema,
   WorkspaceInteractiveContentSharingUpdateBodySchema,
+  WorkspaceSharingPolicyUpdateBodySchema,
   WorkspaceVoiceTranscriptionUpdateBodySchema,
   WorkspaceEmailAgentsUpdateBodySchema,
+  WorkspaceAgentReinforcementUpdateBodySchema,
+  WorkspaceReinforcementBatchModeUpdateBodySchema,
 ]);
 
 async function handler(
@@ -174,9 +194,22 @@ async function handler(
         await workspace.updateWorkspaceSettings({ metadata: newMetadata });
         owner.metadata = newMetadata;
 
-        // if public sharing is disabled, downgrade share scope of all public files to workspace
+        // if public sharing is disabled, downgrade share scope of all public files
         if (!body.allowContentCreationFileSharing) {
-          await FileResource.revokePublicSharingInWorkspace(auth);
+          await FileResource.revokePublicSharingInWorkspace(auth, {
+            newPolicy: "workspace_and_emails",
+          });
+        }
+      } else if ("sharingPolicy" in body) {
+        await workspace.updateWorkspaceSettings({
+          sharingPolicy: body.sharingPolicy,
+        });
+
+        // If the new policy restricts public sharing, downgrade existing public frames.
+        if (body.sharingPolicy !== "all_scopes") {
+          await FileResource.revokePublicSharingInWorkspace(auth, {
+            newPolicy: body.sharingPolicy,
+          });
         }
       } else if ("allowVoiceTranscription" in body) {
         const previousMetadata = owner.metadata ?? {};
@@ -191,6 +224,22 @@ async function handler(
         const newMetadata = {
           ...previousMetadata,
           allowEmailAgents: body.allowEmailAgents,
+        };
+        await workspace.updateWorkspaceSettings({ metadata: newMetadata });
+        owner.metadata = newMetadata;
+      } else if ("allowReinforcement" in body) {
+        const previousMetadata = owner.metadata ?? {};
+        const newMetadata = {
+          ...previousMetadata,
+          allowReinforcement: body.allowReinforcement,
+        };
+        await workspace.updateWorkspaceSettings({ metadata: newMetadata });
+        owner.metadata = newMetadata;
+      } else if ("allowReinforcementBatchMode" in body) {
+        const previousMetadata = owner.metadata ?? {};
+        const newMetadata = {
+          ...previousMetadata,
+          allowReinforcementBatchMode: body.allowReinforcementBatchMode,
         };
         await workspace.updateWorkspaceSettings({ metadata: newMetadata });
         owner.metadata = newMetadata;

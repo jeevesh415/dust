@@ -8,7 +8,7 @@
  * To regenerate, run: npm run generate:hubspot-forms
  * Requires HUBSPOT_PRIVATE_APP_TOKEN in .env.local
  *
- * Generated at: 2026-01-23T10:06:05.263Z
+ * Generated at: 2026-03-27T09:26:21.429Z
  */
 
 import { z } from "zod";
@@ -65,7 +65,7 @@ export const FIELD_DEFINITIONS = [
     name: "mobilephone",
     label: "Phone Number",
     type: "text",
-    required: false,
+    required: true,
   },
   {
     name: "language",
@@ -104,7 +104,7 @@ export const ContactFormSchema = z.object({
     .string()
     .min(1, "Work Email is required")
     .email("Please enter a valid email address"),
-  mobilephone: z.string().optional(),
+  mobilephone: z.string().min(1, "Phone Number is required"),
   language: z.string().min(1, "Language is required"),
   headquarters_region: z.string().optional(),
   company_headcount_form: z.string().min(1, "Company headcount is required"),

@@ -4,8 +4,6 @@ import type { JSONSchema7 as JSONSchema } from "json-schema";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 
-export const FRONT_TOOL_NAME = "front" as const;
-
 export const FRONT_TOOLS_METADATA = createToolsRecord({
   search_conversations: {
     description:
@@ -131,6 +129,20 @@ export const FRONT_TOOLS_METADATA = createToolsRecord({
       done: "List Front inboxes",
     },
   },
+  get_conversation_drafts: {
+    description:
+      "List all drafts in a conversation. Returns draft IDs and version tokens needed for editing or deleting drafts.",
+    schema: {
+      conversation_id: z
+        .string()
+        .describe("The unique ID of the conversation (e.g., 'cnv_55c8c149')"),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Retrieving Front conversation drafts",
+      done: "Retrieve Front conversation drafts",
+    },
+  },
   create_conversation: {
     description: "Start a new outbound conversation with a customer.",
     schema: {
@@ -166,6 +178,27 @@ export const FRONT_TOOLS_METADATA = createToolsRecord({
     displayLabels: {
       running: "Creating draft on Front",
       done: "Create draft on Front",
+    },
+  },
+  delete_draft: {
+    description:
+      "Delete a draft that is no longer needed. Requires the version token from get_conversation_drafts for optimistic concurrency.",
+    schema: {
+      draft_id: z
+        .string()
+        .describe(
+          "The unique ID of the draft to delete (e.g., 'msg_draft_xyz')"
+        ),
+      version: z
+        .string()
+        .describe(
+          "Optimistic concurrency token from get_conversation_drafts. Required to prevent deleting a draft that has been modified."
+        ),
+    },
+    stake: "high",
+    displayLabels: {
+      running: "Deleting draft on Front",
+      done: "Delete draft on Front",
     },
   },
   add_tags: {

@@ -9,19 +9,20 @@ import logger from "@app/logger/logger";
 import { apiError } from "@app/logger/withlogging";
 import { ConnectorsAPI } from "@app/types/connectors/connectors_api";
 import type { WithAPIErrorResponse } from "@app/types/error";
-import { isLeft } from "fp-ts/lib/Either";
-import * as t from "io-ts";
-import * as reporter from "io-ts-reporters";
 import type { NextApiRequest, NextApiResponse } from "next";
+import { z } from "zod";
 
-export type PatchLinkedSlackChannelsResponseBody = {
-  success: true;
-};
+export const PatchLinkedSlackChannelsResponseBodySchema = z.object({
+  success: z.literal(true),
+});
+export type PatchLinkedSlackChannelsResponseBody = z.infer<
+  typeof PatchLinkedSlackChannelsResponseBodySchema
+>;
 
-export const PatchLinkedSlackChannelsRequestBodySchema = t.type({
-  slack_channel_internal_ids: t.array(t.string),
-  provider: t.union([t.literal("slack"), t.literal("slack_bot")]),
-  auto_respond_without_mention: t.union([t.boolean, t.undefined]),
+export const PatchLinkedSlackChannelsRequestBodySchema = z.object({
+  slack_channel_internal_ids: z.array(z.string()),
+  provider: z.enum(["slack", "slack_bot"]),
+  auto_respond_without_mention: z.boolean().optional(),
 });
 
 async function handler(
@@ -42,12 +43,11 @@ async function handler(
     });
   }
 
-  const bodyValidationResult = PatchLinkedSlackChannelsRequestBodySchema.decode(
-    req.body
-  );
+  const bodyValidationResult =
+    PatchLinkedSlackChannelsRequestBodySchema.safeParse(req.body);
   if (
-    bodyValidationResult._tag === "Right" &&
-    bodyValidationResult.right.auto_respond_without_mention
+    bodyValidationResult.success &&
+    bodyValidationResult.data.auto_respond_without_mention
   ) {
     const featureFlags = await getFeatureFlags(auth);
     if (!featureFlags.includes("slack_enhanced_default_agent")) {
@@ -72,23 +72,22 @@ async function handler(
     });
   }
 
-  const bodyValidation = PatchLinkedSlackChannelsRequestBodySchema.decode(
+  const bodyValidation = PatchLinkedSlackChannelsRequestBodySchema.safeParse(
     req.body
   );
-  if (isLeft(bodyValidation)) {
-    const pathError = reporter.formatValidationErrors(bodyValidation.left);
+  if (!bodyValidation.success) {
     return apiError(req, res, {
       status_code: 400,
       api_error: {
         type: "invalid_request_error",
-        message: `Invalid request body: ${pathError}`,
+        message: `Invalid request body: ${bodyValidation.error.message}`,
       },
     });
   }
 
   const [slackDataSource] = await DataSourceResource.listByConnectorProvider(
     auth,
-    bodyValidation.right.provider,
+    bodyValidation.data.provider,
     { limit: 1 }
   );
 
@@ -108,9 +107,9 @@ async function handler(
     throw new Error("Unreachable code: connectorId is null.");
   }
 
-  const agentConfigurationSid = req.query.aId as string;
+  const agentConfigurationId = req.query.aId as string;
   const agentConfiguration = await getAgentConfiguration(auth, {
-    agentId: agentConfigurationSid,
+    agentId: agentConfigurationId,
     variant: "light",
   });
   if (!agentConfiguration) {
@@ -142,9 +141,8 @@ async function handler(
   const connectorsApiRes = await connectorsAPI.linkSlackChannelsWithAgent({
     connectorId: connectorId.toString(),
     agentConfigurationId: agentConfiguration.sId,
-    slackChannelInternalIds: bodyValidation.right.slack_channel_internal_ids,
-    autoRespondWithoutMention:
-      bodyValidation.right.auto_respond_without_mention,
+    slackChannelInternalIds: bodyValidation.data.slack_channel_internal_ids,
+    autoRespondWithoutMention: bodyValidation.data.auto_respond_without_mention,
   });
 
   if (connectorsApiRes.isErr()) {

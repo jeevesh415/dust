@@ -3,6 +3,7 @@ import type {
   ModelProviderIdType,
 } from "@app/types/assistant/models/types";
 import { ioTsEnum } from "@app/types/shared/utils/iots_utils";
+import { z } from "zod";
 
 /**
  * PROVIDER IDS
@@ -23,6 +24,7 @@ export const MODEL_PROVIDER_IDS = [
 export const BYOK_MODEL_PROVIDER_IDS = [
   "anthropic",
   "openai",
+  "google_ai_studio",
 ] as const satisfies ModelProviderIdType[];
 
 export function getProviderDisplayName(
@@ -57,6 +59,7 @@ export const isModelProviderId = (
   MODEL_PROVIDER_IDS.includes(providerId as ModelProviderIdType);
 export const ModelProviderIdCodec =
   ioTsEnum<(typeof MODEL_PROVIDER_IDS)[number]>(MODEL_PROVIDER_IDS);
+export const ModelProviderIdSchema = z.enum(MODEL_PROVIDER_IDS);
 export const isByokProviderId = (
   providerId: ModelProviderIdType
 ): providerId is ByokModelProviderIdType =>

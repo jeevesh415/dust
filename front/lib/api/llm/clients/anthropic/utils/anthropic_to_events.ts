@@ -117,7 +117,11 @@ function* handleMessageStreamEvent(
      * content_block_stop (marks the end of the content block)
      */
     case "content_block_start":
-      handleContentBlockStart(messageStreamEvent, stateContainer);
+      yield* handleContentBlockStart(
+        messageStreamEvent,
+        stateContainer,
+        metadata
+      );
       break;
     case "content_block_delta":
       yield* handleContentBlockDelta(
@@ -145,10 +149,11 @@ function* handleMessageStreamEvent(
   }
 }
 
-function handleContentBlockStart(
+function* handleContentBlockStart(
   event: Extract<BetaRawMessageStreamEvent, { type: "content_block_start" }>,
-  stateContainer: { state: StreamState }
-): void {
+  stateContainer: { state: StreamState },
+  metadata: LLMClientMetadata
+): Generator<LLMEvent> {
   assert(
     stateContainer.state === null,
     `A content block is already being processed, cannot start a new one at index ${event.index}`
@@ -162,8 +167,8 @@ function handleContentBlockStart(
         accumulator: "",
         accumulatorType: blockType === "text" ? "text" : "reasoning",
       };
-      break;
-    case "tool_use":
+      return;
+    case "tool_use": {
       stateContainer.state = {
         currentBlockIndex: event.index,
         accumulator: "",
@@ -173,10 +178,20 @@ function handleContentBlockStart(
           name: event.content_block.name,
         },
       };
-      break;
+      yield {
+        type: "tool_call_started",
+        content: {
+          id: event.content_block.id,
+          index: event.index,
+          name: event.content_block.name,
+        },
+        metadata,
+      };
+      return;
+    }
     case "redacted_thinking":
       // "Redacted thinking" provides no actionable information, as everything is encrypted
-      break;
+      return;
     case "server_tool_use":
     case "web_search_tool_result":
     case "web_fetch_tool_result":
@@ -189,7 +204,7 @@ function handleContentBlockStart(
     case "container_upload":
     case "compaction":
       // We don't use these Anthropic tools
-      break;
+      return;
     default:
       assertNever(blockType);
   }
@@ -535,7 +550,7 @@ async function succeededMessageToEvents(
   const toolCalls: ToolCallEvent[] = [];
   let reasoningGeneratedEvent: ReasoningGeneratedEvent | undefined = undefined;
 
-  for (const block of message.content) {
+  for (const [index, block] of message.content.entries()) {
     switch (block.type) {
       case "text":
         textBlocks.push(block.text);
@@ -556,6 +571,11 @@ async function succeededMessageToEvents(
           isRecord(block.input)
             ? block.input
             : {};
+        events.push({
+          type: "tool_call_started",
+          content: { id: block.id, index, name: block.name },
+          metadata,
+        });
         const toolCallEvent: ToolCallEvent = {
           type: "tool_call",
           content: { id: block.id, name: block.name, arguments: input },

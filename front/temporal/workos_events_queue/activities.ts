@@ -1,4 +1,11 @@
-import { createAndLogMembership } from "@app/lib/api/signup";
+import {
+  buildAuditLogTarget,
+  emitAuditLogEventDirect,
+} from "@app/lib/api/audit/workos_audit";
+import {
+  createAndTrackMembership,
+  revokeAndTrackMembership,
+} from "@app/lib/api/membership";
 import { createSpaceAndGroup } from "@app/lib/api/spaces";
 import { determineUserRoleFromGroups } from "@app/lib/api/user";
 import { getWorkOS } from "@app/lib/api/workos/client";
@@ -26,7 +33,6 @@ import {
 import { GroupResource } from "@app/lib/resources/group_resource";
 import { MembershipResource } from "@app/lib/resources/membership_resource";
 import { SpaceResource } from "@app/lib/resources/space_resource";
-import { TriggerResource } from "@app/lib/resources/trigger_resource";
 import { UserResource } from "@app/lib/resources/user_resource";
 import { WorkspaceResource } from "@app/lib/resources/workspace_resource";
 import { ServerSideTracking } from "@app/lib/tracking/server";
@@ -380,6 +386,15 @@ async function handleOrganizationDomainVerified(
   eventData: OrganizationDomain
 ) {
   await handleOrganizationDomainEvent(workspace, eventData, "verified");
+
+  void emitAuditLogEventDirect({
+    workspace,
+    action: "domain.verified",
+    actor: { type: "system", id: "workos", name: "WorkOS" },
+    targets: [{ type: "workspace", id: workspace.sId, name: workspace.name }],
+    context: { location: "system" },
+    metadata: { domain: eventData.domain },
+  });
 }
 
 async function handleOrganizationDomainVerificationFailed(
@@ -387,6 +402,15 @@ async function handleOrganizationDomainVerificationFailed(
   eventData: OrganizationDomain
 ) {
   await handleOrganizationDomainEvent(workspace, eventData, "failed");
+
+  void emitAuditLogEventDirect({
+    workspace,
+    action: "domain.verification_failed",
+    actor: { type: "system", id: "workos", name: "WorkOS" },
+    targets: [{ type: "workspace", id: workspace.sId, name: workspace.name }],
+    context: { location: "system" },
+    metadata: { domain: eventData.domain },
+  });
 }
 
 async function handleOrganizationUpdated(
@@ -617,9 +641,36 @@ async function handleGroupUpsert(
   const group = await GroupResource.upsertByWorkOSGroupId(auth, event);
 
   // Auto-create space if workspace setting is enabled
+  let spaceCreated = false;
   if (workspace.metadata?.autoCreateSpaceForProvisionedGroups) {
+    const existingSpaces = await SpaceResource.listForGroups(auth, [group]);
+    const hadSpaceBefore = existingSpaces.length > 0;
     await autoCreateSpaceForProvisionedGroup(auth, group, workspace);
+    if (!hadSpaceBefore) {
+      const spacesAfter = await SpaceResource.listForGroups(auth, [group]);
+      spaceCreated = spacesAfter.length > 0;
+    }
   }
+
+  void emitAuditLogEventDirect({
+    workspace,
+    action: "scim.group_created",
+    actor: {
+      type: "system",
+      id: String(event.directoryId ?? "directory_sync"),
+      name: "Directory Sync",
+    },
+    targets: [
+      buildAuditLogTarget("workspace", workspace),
+      buildAuditLogTarget("group", group),
+    ],
+    context: { location: "system" },
+    metadata: {
+      groupName: group.name,
+      directoryId: String(event.directoryId ?? "unknown"),
+      spaceCreated: String(spaceCreated),
+    },
+  });
 }
 
 async function handleUserAddedToGroup(
@@ -709,7 +760,54 @@ async function handleUserAddedToGroup(
       },
       "Updated membership origin to provisioned based on group sync"
     );
+
+    void emitAuditLogEventDirect({
+      workspace,
+      action: "membership.origin_updated",
+      actor: {
+        type: "system",
+        id: String(event.directoryId ?? "directory_sync"),
+        name: "Directory Sync",
+      },
+      targets: [
+        buildAuditLogTarget("workspace", workspace),
+        buildAuditLogTarget("user", {
+          sId: user.sId,
+          name: user.fullName() ?? "unknown",
+        }),
+      ],
+      context: { location: "system" },
+      metadata: {
+        previousOrigin,
+        newOrigin,
+      },
+    });
   }
+
+  void emitAuditLogEventDirect({
+    workspace,
+    action: "scim.group_user_added",
+    actor: {
+      type: "system",
+      id: String(event.directoryId ?? "directory_sync"),
+      name: "Directory Sync",
+    },
+    targets: [
+      buildAuditLogTarget("workspace", workspace),
+      buildAuditLogTarget("group", group),
+      buildAuditLogTarget("user", {
+        sId: user.sId,
+        name: user.fullName() ?? "unknown",
+      }),
+    ],
+    context: { location: "system" },
+    metadata: {
+      groupName: group.name,
+      userEmail: user.email,
+      directoryId: String(event.user.directoryId ?? "unknown"),
+      roleGranted: "member",
+    },
+  });
 }
 
 async function handleUserRemovedFromGroup(
@@ -778,6 +876,31 @@ async function handleUserRemovedFromGroup(
     user,
     group,
     action: "remove",
+  });
+
+  void emitAuditLogEventDirect({
+    workspace,
+    action: "scim.group_user_removed",
+    actor: {
+      type: "system",
+      id: String(event.directoryId ?? "directory_sync"),
+      name: "Directory Sync",
+    },
+    targets: [
+      buildAuditLogTarget("workspace", workspace),
+      buildAuditLogTarget("group", group),
+      buildAuditLogTarget("user", {
+        sId: user.sId,
+        name: user.fullName() ?? "unknown",
+      }),
+    ],
+    context: { location: "system" },
+    metadata: {
+      groupName: group.name,
+      userEmail: user.email,
+      directoryId: String(event.user.directoryId ?? "unknown"),
+      roleChange: "removed",
+    },
   });
 }
 
@@ -867,20 +990,89 @@ async function handleCreateOrUpdateWorkOSUser(
       },
       "User already has a membership associated to workspace"
     );
-    await membership.updateOrigin({
+    const { previousOrigin, newOrigin } = await membership.updateOrigin({
       user: createdOrUpdatedUser,
       workspace,
       newOrigin: "provisioned",
       author: createdOrUpdatedUser.toJSON(),
     });
+
+    void emitAuditLogEventDirect({
+      workspace,
+      action: "membership.origin_updated",
+      actor: {
+        type: "system",
+        id: String(event.directoryId ?? "directory_sync"),
+        name: "Directory Sync",
+      },
+      targets: [
+        buildAuditLogTarget("workspace", workspace),
+        buildAuditLogTarget("user", {
+          sId: createdOrUpdatedUser.sId,
+          name: createdOrUpdatedUser.fullName() ?? "unknown",
+        }),
+      ],
+      context: { location: "system" },
+      metadata: {
+        previousOrigin,
+        newOrigin,
+      },
+    });
+
+    void emitAuditLogEventDirect({
+      workspace,
+      action: "scim.user_updated",
+      actor: {
+        type: "system",
+        id: String(event.directoryId ?? "directory_sync"),
+        name: "Directory Sync",
+      },
+      targets: [
+        buildAuditLogTarget("workspace", workspace),
+        buildAuditLogTarget("user", {
+          sId: createdOrUpdatedUser.sId,
+          name: createdOrUpdatedUser.fullName() ?? "unknown",
+        }),
+      ],
+      context: { location: "system" },
+      metadata: {
+        directoryId: String(event.directoryId ?? "unknown"),
+        updatedAttributes: JSON.stringify(
+          Object.keys(event.rawAttributes ?? {})
+        ),
+      },
+    });
+
     return;
   }
 
-  await createAndLogMembership({
+  await createAndTrackMembership({
     user: createdOrUpdatedUser,
     workspace,
     role: "user",
     origin: "provisioned",
+  });
+
+  void emitAuditLogEventDirect({
+    workspace,
+    action: "scim.user_provisioned",
+    actor: {
+      type: "system",
+      id: String(event.directoryId ?? "directory_sync"),
+      name: "Directory Sync",
+    },
+    targets: [
+      buildAuditLogTarget("workspace", workspace),
+      buildAuditLogTarget("user", {
+        sId: createdOrUpdatedUser.sId,
+        name: createdOrUpdatedUser.fullName() ?? "unknown",
+      }),
+    ],
+    context: { location: "system" },
+    metadata: {
+      email: createdOrUpdatedUser.email,
+      directoryId: String(event.directoryId ?? "unknown"),
+    },
   });
 }
 
@@ -934,9 +1126,7 @@ async function handleDeleteWorkOSUser(
     }
   }
 
-  const membershipRevokeResult = await MembershipResource.revokeMembership({
-    user,
-    workspace,
+  const membershipRevokeResult = await revokeAndTrackMembership(auth, user, {
     allowLastAdminRevocation: true,
   });
 
@@ -954,25 +1144,28 @@ async function handleDeleteWorkOSUser(
     throw membershipRevokeResult.error;
   }
 
-  const deleteTriggerResult = await TriggerResource.deleteAllForUser(
-    auth,
-    user
-  );
-  if (deleteTriggerResult.isErr()) {
-    logger.error(
-      {
-        workspaceId: workspace.sId,
-        userId: user.sId,
-        error: deleteTriggerResult.error,
-      },
-      "Failed to delete triggers for revoked user"
-    );
-  }
-
-  void ServerSideTracking.trackRevokeMembership({
-    user: user.toJSON(),
+  // Emit SCIM-specific audit event in addition to the generic membership.revoked.
+  void emitAuditLogEventDirect({
     workspace,
-    ...membershipRevokeResult.value,
+    action: "scim.user_deprovisioned",
+    actor: {
+      type: "system",
+      id: String(event.directoryId ?? "directory_sync"),
+      name: "Directory Sync",
+    },
+    targets: [
+      buildAuditLogTarget("workspace", workspace),
+      buildAuditLogTarget("user", {
+        sId: user.sId,
+        name: user.fullName() ?? "unknown",
+      }),
+    ],
+    context: { location: "system" },
+    metadata: {
+      email: user.email,
+      directoryId: String(event.directoryId ?? "unknown"),
+      triggersDeleted: "true",
+    },
   });
 }
 
@@ -996,8 +1189,30 @@ async function handleGroupDelete(
     return;
   }
 
+  const groupSId = group.sId;
+  const groupName = group.name;
+
   const deleteResult = await group.delete(auth);
   if (deleteResult.isErr()) {
     throw deleteResult.error;
   }
+
+  void emitAuditLogEventDirect({
+    workspace,
+    action: "scim.group_deleted",
+    actor: {
+      type: "system",
+      id: String(event.directoryId ?? "directory_sync"),
+      name: "Directory Sync",
+    },
+    targets: [
+      buildAuditLogTarget("workspace", workspace),
+      buildAuditLogTarget("group", { sId: groupSId, name: groupName }),
+    ],
+    context: { location: "system" },
+    metadata: {
+      groupName,
+      directoryId: String(event.directoryId ?? "unknown"),
+    },
+  });
 }

@@ -23,7 +23,8 @@ async function handler(
     req.query.wId as string
   );
 
-  const { agentId, triggerId } = req.query;
+  const { agentId, triggerId, reinforcedAgentId, reinforcedSkillId } =
+    req.query;
 
   if (!auth.isDustSuperUser()) {
     return apiError(req, res, {
@@ -45,9 +46,25 @@ async function handler(
           auth,
           triggerId
         );
+      } else if (isString(reinforcedAgentId)) {
+        conversations =
+          await ConversationResource.listReinforcementConversations(
+            auth,
+            reinforcedAgentId
+          );
+      } else if (isString(reinforcedSkillId)) {
+        const oneWeekAgo = new Date();
+        oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
+
+        conversations =
+          await ConversationResource.listSkillReinforcementConversations(
+            auth,
+            reinforcedSkillId,
+            { after: oneWeekAgo }
+          );
       } else if (isString(agentId)) {
         // Get conversation IDs for this agent
-        const conversationIds =
+        const conversationResources =
           await ConversationResource.listConversationWithAgentCreatedBeforeDate(
             auth,
             {
@@ -55,12 +72,6 @@ async function handler(
               cutoffDate: new Date(), // Current time to get all conversations.
             }
           );
-
-        // Fetch full conversation objects
-        const conversationResources = await ConversationResource.fetchByIds(
-          auth,
-          conversationIds
-        );
 
         conversations = conversationResources.map((c) => {
           return {
@@ -80,6 +91,7 @@ async function handler(
             requestedSpaceIds: c.getRequestedSpaceIdsFromModel(),
             spaceId: c.space?.sId ?? null,
             metadata: c.metadata,
+            branchId: null,
           };
         });
 
@@ -90,7 +102,8 @@ async function handler(
           status_code: 400,
           api_error: {
             type: "invalid_request_error",
-            message: "Either agent ID or trigger ID is required.",
+            message:
+              "Either agent ID, reinforcedAgent ID, reinforcedSkill ID or trigger ID is required.",
           },
         });
       }

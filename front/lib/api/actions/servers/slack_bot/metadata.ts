@@ -4,8 +4,6 @@ import type { JSONSchema7 as JSONSchema } from "json-schema";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 
-export const SLACK_BOT_TOOL_NAME = "slack_bot" as const;
-
 export const SLACK_BOT_TOOLS_METADATA = createToolsRecord({
   post_message: {
     description:
@@ -184,6 +182,7 @@ The search_all parameter should only be set to true if the user explicitly reque
 });
 
 export const SLACK_BOT_SERVER = {
+  // biome-ignore lint/plugin/noMcpServerInstructions: existing usage
   serverInfo: {
     name: "slack_bot",
     version: "1.0.0",
@@ -195,11 +194,7 @@ export const SLACK_BOT_SERVER = {
     },
     icon: "SlackLogo",
     documentationUrl: null,
-    // Predates the introduction of the rule, would require extensive work to
-    // improve, already widely adopted.
-
     instructions:
-      // biome-ignore lint/plugin/noMcpServerInstructions: existing usage
       "The Slack bot must be explicitly added to a channel before it can post messages or read history. " +
       "Direct messages and search operations are not supported. " +
       "When posting a message on Slack, you MUST use Slack-flavored Markdown to format the message. " +

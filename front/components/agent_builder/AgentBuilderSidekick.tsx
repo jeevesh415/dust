@@ -11,7 +11,7 @@ import {
   getSidekickSuggestionPlugin,
   sidekickSuggestionDirective,
 } from "@app/components/markdown/suggestion/SidekickSuggestionDirective";
-import { useAuth } from "@app/lib/auth/AuthContext";
+import { useAuth, useFeatureFlags } from "@app/lib/auth/AuthContext";
 import { isFreeTrialPhonePlan } from "@app/lib/plans/plan_codes";
 import { useWorkspaceActiveSubscription } from "@app/lib/swr/workspaces";
 import type { ConversationWithoutContentType } from "@app/types/assistant/conversation";
@@ -76,15 +76,27 @@ function SidekickContent({
   isAdmin,
   clientSideMCPServerIds,
 }: SidekickContentProps) {
+  const { subscription } = useAuth();
+  const { hasFeature } = useFeatureFlags();
+  const singleAgentInput = hasFeature("enable_steering");
   const agentBuilderContext = useMemo(
     () => ({
       isSubmitting: false,
       resetConversation,
-      actionsToShow: ["attachment", "voice"] satisfies InputBarAction[],
+      actionsToShow: [
+        "attachment",
+        ...(subscription.plan.isByok ? [] : ["voice" as const]),
+        ...(singleAgentInput ? ["agents-list" as const] : []),
+      ] satisfies InputBarAction[],
       clientSideMCPServerIds,
       skipToolsValidation: true,
     }),
-    [resetConversation, clientSideMCPServerIds]
+    [
+      resetConversation,
+      clientSideMCPServerIds,
+      subscription.plan.isByok,
+      singleAgentInput,
+    ]
   );
 
   const additionalMarkdownComponents: Components = useMemo(

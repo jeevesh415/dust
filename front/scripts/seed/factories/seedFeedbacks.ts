@@ -12,8 +12,8 @@ export async function seedFeedbacks(
   for (const feedbackAsset of feedbackAssets) {
     logger.info(
       {
-        conversationSId: feedbackAsset.conversationSId,
-        agentMessageSId: feedbackAsset.agentMessageSId,
+        conversationId: feedbackAsset.conversationId,
+        agentMessageId: feedbackAsset.agentMessageId,
       },
       "Creating feedback"
     );
@@ -22,13 +22,13 @@ export async function seedFeedbacks(
       // Find the conversation (skip permission filtering for seed script)
       const conversation = await ConversationResource.fetchById(
         auth,
-        feedbackAsset.conversationSId,
+        feedbackAsset.conversationId,
         { dangerouslySkipPermissionFiltering: true, includeDeleted: true }
       );
 
       if (!conversation) {
         logger.warn(
-          { conversationSId: feedbackAsset.conversationSId },
+          { conversationId: feedbackAsset.conversationId },
           "Conversation not found for feedback, skipping"
         );
         continue;
@@ -37,12 +37,12 @@ export async function seedFeedbacks(
       // Find the message row
       const messageResult = await conversation.getMessageById(
         auth,
-        feedbackAsset.agentMessageSId
+        feedbackAsset.agentMessageId
       );
 
       if (messageResult.isErr()) {
         logger.warn(
-          { agentMessageSId: feedbackAsset.agentMessageSId },
+          { agentMessageId: feedbackAsset.agentMessageId },
           "Agent message not found for feedback, skipping"
         );
         continue;
@@ -51,7 +51,7 @@ export async function seedFeedbacks(
       const messageRow = messageResult.value;
       if (!messageRow.agentMessageId || !messageRow.agentMessage) {
         logger.warn(
-          { agentMessageSId: feedbackAsset.agentMessageSId },
+          { agentMessageId: feedbackAsset.agentMessageId },
           "Agent message not found for feedback, skipping"
         );
         continue;
@@ -72,7 +72,7 @@ export async function seedFeedbacks(
 
       if (existingFeedback) {
         logger.info(
-          { agentMessageSId: feedbackAsset.agentMessageSId },
+          { agentMessageId: feedbackAsset.agentMessageId },
           "Feedback already exists, skipping"
         );
         continue;
@@ -94,7 +94,7 @@ export async function seedFeedbacks(
 
       logger.info(
         {
-          agentMessageSId: feedbackAsset.agentMessageSId,
+          agentMessageId: feedbackAsset.agentMessageId,
           thumbDirection: feedbackAsset.thumbDirection,
         },
         "Feedback created"

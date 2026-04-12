@@ -2,6 +2,7 @@ import { isToolExecutionStatusFinal } from "@app/lib/actions/statuses";
 import { getRetryPolicyFromToolConfiguration } from "@app/lib/api/mcp";
 import type { Authenticator, AuthenticatorType } from "@app/lib/auth";
 import { getFeatureFlags } from "@app/lib/auth";
+import { DurationRecorder } from "@app/lib/duration_recorder";
 import { AgentMCPActionModel } from "@app/lib/models/agent/actions/mcp";
 import { AgentStepContentModel } from "@app/lib/models/agent/agent_step_content";
 import { ConversationResource } from "@app/lib/resources/conversation_resource";
@@ -104,6 +105,9 @@ async function _runModelAndCreateActionsActivity({
 
   const { auth, ...runAgentData } = runAgentDataRes.value;
   const isRootAgentMessage = !runAgentData.userMessage.agenticMessageData;
+  const durationRecorder = DurationRecorder.create([
+    `workspace:${auth.getNonNullableWorkspace().sId}`,
+  ]);
 
   // Intentionally check at step start (not step end) to early exit if dollar amount too high.
   // This can miss thresholds crossed on the final step.
@@ -229,6 +233,7 @@ async function _runModelAndCreateActionsActivity({
     runIds,
     step,
     functionCallStepContentIds,
+    durationRecorder,
   });
 
   if (!modelResult) {
@@ -241,6 +246,12 @@ async function _runModelAndCreateActionsActivity({
     runId,
     stepContexts,
   } = modelResult;
+
+  // Generation completed (text response, no tool calls) — runModel returns
+  // { actions: [], runId } so we still capture the runId for tracking.
+  if (actions.length === 0) {
+    return { runId, actionBlobs: [] };
+  }
 
   // Enforce a limit on actions per step, reducing by depth (8/8/4/2)
   // to contain cascading fan-out from nested run_agent calls.

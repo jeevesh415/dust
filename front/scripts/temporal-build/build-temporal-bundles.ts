@@ -40,8 +40,8 @@ function getWorkerDirectory(workerName: WorkerName): string | null {
       return path.join(baseDir, "temporal/triggers/webhook");
     case "analytics_queue":
       return path.join(baseDir, "temporal/analytics_queue");
-    case "butler":
-      return path.join(baseDir, "temporal/butler");
+    case "project_todo":
+      return path.join(baseDir, "temporal/project_todo");
     case "credit_alerts":
       return path.join(baseDir, "temporal/credit_alerts");
     case "data_retention":
@@ -82,6 +82,8 @@ function getWorkerDirectory(workerName: WorkerName): string | null {
       return path.join(baseDir, "temporal/workos_events_queue");
     case "reinforced_agent":
       return path.join(baseDir, "temporal/reinforced_agent");
+    case "reinforcement":
+      return path.join(baseDir, "temporal/reinforcement");
     default:
       return assertNever(workerName);
   }

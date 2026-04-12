@@ -1,10 +1,14 @@
 import { MCPError } from "@app/lib/actions/mcp_errors";
+import { getDataSourceURI } from "@app/lib/actions/mcp_internal_actions/input_configuration";
+import type { DataSourcesToolConfigurationType } from "@app/lib/actions/mcp_internal_actions/input_schemas";
 import type {
   ToolDefinition,
   ToolHandlers,
 } from "@app/lib/actions/mcp_internal_actions/tool_definition";
 import { buildTools } from "@app/lib/actions/mcp_internal_actions/tool_definition";
 import type { AgentLoopContextType } from "@app/lib/actions/types";
+import { runIncludeDataRetrieval } from "@app/lib/api/actions/servers/include_data/include_function";
+import { buildProjectSearchDataSources } from "@app/lib/api/actions/servers/project_manager/build_project_search_data_sources";
 import {
   getProjectSpace,
   getWritableProjectContext,
@@ -13,24 +17,76 @@ import {
   withErrorHandling,
 } from "@app/lib/api/actions/servers/project_manager/helpers";
 import { PROJECT_MANAGER_TOOLS_METADATA } from "@app/lib/api/actions/servers/project_manager/metadata";
-import { formatConversationsForDisplay } from "@app/lib/api/actions/servers/project_manager/tools/conversation_formatting";
-import { getConversation } from "@app/lib/api/assistant/conversation/fetch";
+import { searchFunction } from "@app/lib/api/actions/servers/search/tools";
+import {
+  isContentNodeAttachmentType,
+  renderAttachmentXml,
+} from "@app/lib/api/assistant/conversation/attachments";
 import config from "@app/lib/api/config";
-import { upsertProjectContextFile } from "@app/lib/api/projects";
+import {
+  addFileToProject,
+  fetchLatestProjectContextFileContentFragment,
+  fetchProjectDataSourceView,
+  listProjectContextAttachments,
+} from "@app/lib/api/projects";
 import type { Authenticator } from "@app/lib/auth";
-import { ConversationResource } from "@app/lib/resources/conversation_resource";
 import { FileResource } from "@app/lib/resources/file_resource";
 import { ProjectMetadataResource } from "@app/lib/resources/project_metadata_resource";
-import { concurrentExecutor } from "@app/lib/utils/async_utils";
+import type { SpaceResource } from "@app/lib/resources/space_resource";
 import { getProjectRoute } from "@app/lib/utils/router";
 import logger from "@app/logger/logger";
 import {
   contentTypeFromFileName,
   isAllSupportedFileContentType,
-  isSupportedFileContentType,
 } from "@app/types/files";
 import { Err, Ok } from "@app/types/shared/result";
 import { INTERNAL_MIME_TYPES } from "@dust-tt/client";
+
+async function buildProjectRetrieveDataSources(
+  auth: Authenticator,
+  space: SpaceResource
+): Promise<DataSourcesToolConfigurationType> {
+  const owner = auth.getNonNullableWorkspace();
+  const dataSources: DataSourcesToolConfigurationType = [];
+
+  const projectDsViewRes = await fetchProjectDataSourceView(auth, space);
+  if (projectDsViewRes.isOk()) {
+    dataSources.push({
+      uri: getDataSourceURI({
+        workspaceId: owner.sId,
+        dataSourceViewId: projectDsViewRes.value.sId,
+        filter: { parents: null, tags: null },
+      }),
+      mimeType: INTERNAL_MIME_TYPES.TOOL_INPUT.DATA_SOURCE,
+    });
+  }
+
+  const attachments = await listProjectContextAttachments(auth, space);
+  const seenContentNodeKeys = new Set<string>();
+  for (const attachment of attachments) {
+    if (!isContentNodeAttachmentType(attachment)) {
+      continue;
+    }
+    const key = `${attachment.nodeDataSourceViewId}:${attachment.nodeId}`;
+    if (seenContentNodeKeys.has(key)) {
+      continue;
+    }
+    seenContentNodeKeys.add(key);
+    dataSources.push({
+      uri: getDataSourceURI({
+        workspaceId: owner.sId,
+        dataSourceViewId: attachment.nodeDataSourceViewId,
+        filter: {
+          parents: { in: [attachment.nodeId], not: [] },
+          tags: null,
+        },
+      }),
+      mimeType: INTERNAL_MIME_TYPES.TOOL_INPUT.DATA_SOURCE,
+    });
+  }
+
+  return dataSources;
+}
 
 /**
  * Reads content from a source file.
@@ -159,7 +215,11 @@ export function createProjectManagerTools(
           );
         }
 
-        const upsertRes = await upsertProjectContextFile(auth, file);
+        const upsertRes = await addFileToProject(auth, {
+          file,
+          space,
+          sourceConversationId: agentLoopContext?.runContext?.conversation?.sId,
+        });
 
         if (upsertRes.isErr()) {
           logger.warn(
@@ -167,9 +227,9 @@ export function createProjectManagerTools(
               error: upsertRes.error,
               fileId: file.sId,
             },
-            "Failed to upsert file to datasource"
+            "Failed to add file to project (datasource or content fragment)"
           );
-          // Don't fail - file is uploaded, just not indexed yet.
+          // Don't fail - file is uploaded, just not fully indexed yet.
         }
 
         // Adapt the message based on the input
@@ -269,7 +329,11 @@ export function createProjectManagerTools(
         await file.uploadContent(auth, fileContent);
 
         // Re-upsert to datasource to update search index.
-        const upsertRes = await upsertProjectContextFile(auth, file);
+        const upsertRes = await addFileToProject(auth, {
+          file,
+          space,
+          sourceConversationId: agentLoopContext?.runContext?.conversation?.sId,
+        });
 
         if (upsertRes.isErr()) {
           logger.error(
@@ -297,6 +361,58 @@ export function createProjectManagerTools(
           },
         ]);
       }, "Failed to update file");
+    },
+
+    attach_to_conversation: async (params) => {
+      return withErrorHandling(async () => {
+        if (!agentLoopContext?.runContext?.conversation) {
+          return new Err(
+            new MCPError("No conversation context available", {
+              tracked: false,
+            })
+          );
+        }
+
+        const contextRes = await getProjectSpace(auth, {
+          agentLoopContext,
+          dustProject: params.dustProject,
+        });
+        if (contextRes.isErr()) {
+          return contextRes;
+        }
+
+        const { space } = contextRes.value;
+        const { fileId } = params;
+
+        const projectFile = await fetchLatestProjectContextFileContentFragment(
+          auth,
+          space,
+          fileId
+        );
+        if (!projectFile) {
+          return new Err(
+            new MCPError("File not found in this project context", {
+              tracked: false,
+            })
+          );
+        }
+        const { file } = projectFile;
+
+        return new Ok([
+          {
+            type: "resource" as const,
+            resource: {
+              mimeType: INTERNAL_MIME_TYPES.TOOL_OUTPUT.FILE,
+              uri: file.getPublicUrl(auth),
+              fileId: file.sId,
+              title: file.fileName,
+              contentType: file.contentType,
+              snippet: file.snippet,
+              text: `File "${file.fileName}" (${file.sId}) attached to the current conversation.`,
+            },
+          },
+        ]);
+      }, "Failed to attach project file to conversation");
     },
 
     edit_description: async (params) => {
@@ -357,18 +473,7 @@ export function createProjectManagerTools(
           space
         );
 
-        // Fetch files
-        const files = await FileResource.listByProject(auth, {
-          projectId: space.sId,
-        });
-
-        const fileList = files
-          .filter((file) => isSupportedFileContentType(file.contentType))
-          .map((file) => ({
-            fileId: file.sId,
-            fileName: file.fileName,
-            contentType: file.contentType,
-          }));
+        const attachments = await listProjectContextAttachments(auth, space);
 
         // Construct project URL
         const projectPath = getProjectRoute(owner.sId, space.sId);
@@ -382,8 +487,21 @@ export function createProjectManagerTools(
               name: space.name,
               url: projectUrl,
               description: metadata?.description ?? null,
-              fileCount: files.length,
-              files: fileList,
+              context: {
+                count: attachments.length,
+                attachments: attachments
+                  .map((a) =>
+                    renderAttachmentXml({
+                      attachment: a,
+                      content: "",
+                      // When in the project context, the flags might be misleading, version is useless (it's always the latest)
+                      // eg: a csv might have been uploaded in a convo (becoming queryable) but then moved to the project context.
+                      // This will be obsolete once we run query directly in the sandbox.
+                      hideFlagsAndVersion: true,
+                    })
+                  )
+                  .join("\n"),
+              },
             },
             message: "Successfully retrieved project information",
           })
@@ -391,8 +509,16 @@ export function createProjectManagerTools(
       }, "Failed to get project information");
     },
 
-    list_unread: async (params) => {
+    retrieve_recent_documents: async (params) => {
       return withErrorHandling(async () => {
+        if (!agentLoopContext) {
+          return new Err(
+            new MCPError("No conversation context available", {
+              tracked: false,
+            })
+          );
+        }
+
         const contextRes = await getProjectSpace(auth, {
           agentLoopContext,
           dustProject: params.dustProject,
@@ -402,65 +528,69 @@ export function createProjectManagerTools(
         }
 
         const { space } = contextRes.value;
-        const { daysBack = 30, limit = 20 } = params;
+        const dataSources = await buildProjectRetrieveDataSources(auth, space);
 
-        // Calculate the cutoff date for the time window
-        const cutoffDate = new Date();
-        cutoffDate.setDate(cutoffDate.getDate() - daysBack);
-
-        // List conversations in the project space updated since cutoff
-        const spaceConversations =
-          await ConversationResource.listConversationsInSpace(auth, {
-            spaceId: space.sId,
-            options: {
-              updatedSince: cutoffDate.getTime(),
-              excludeTest: true,
-            },
-          });
-
-        // Fetch full conversations with content
-        const conversationResults = await concurrentExecutor(
-          spaceConversations,
-          async (c) => getConversation(auth, c.sId, false),
-          { concurrency: 10 }
-        );
-
-        // Extract successful conversations
-        const conversationsFull = conversationResults
-          .filter((r) => r.isOk())
-          .map((r) => r.value);
-
-        // Filter for unread conversations based on the unread flag, and apply limit
-        const unreadConversations = conversationsFull.filter((c) => c.unread);
-
-        // Apply limit
-        const limitedConversations = unreadConversations.slice(0, limit);
-
-        if (limitedConversations.length === 0) {
-          return new Ok([
-            {
-              type: "text" as const,
-              text: `No unread conversations found in project "${space.name}" from the last ${daysBack} days.`,
-            },
-          ]);
+        if (dataSources.length === 0) {
+          return new Err(
+            new MCPError(
+              "No project data source or project context nodes available to retrieve from.",
+              { tracked: false }
+            )
+          );
         }
 
-        const formattedConversations = formatConversationsForDisplay(
-          limitedConversations,
-          auth.getNonNullableWorkspace().sId
+        return runIncludeDataRetrieval(auth, agentLoopContext, {
+          timeFrame: params.timeFrame,
+          dataSources,
+        });
+      }, "Failed to retrieve recent project documents");
+    },
+
+    semantic_search: async (params) => {
+      return withErrorHandling(async () => {
+        if (!agentLoopContext?.runContext) {
+          return new Err(
+            new MCPError("No conversation context available", {
+              tracked: false,
+            })
+          );
+        }
+
+        const scope = params.searchScope ?? "all";
+        const contextRes = await getProjectSpace(auth, {
+          agentLoopContext,
+          dustProject: params.dustProject,
+        });
+        if (contextRes.isErr()) {
+          return contextRes;
+        }
+
+        const { space } = contextRes.value;
+        const dataSources = await buildProjectSearchDataSources(
+          auth,
+          space,
+          scope
         );
 
-        return new Ok(
-          makeSuccessResponse({
-            success: true,
-            count: limitedConversations.length,
-            total: unreadConversations.length,
-            daysBack,
-            conversations: formattedConversations,
-            message: `Found ${limitedConversations.length} unread conversation(s) in project "${space.name}"${unreadConversations.length > limit ? ` (showing first ${limit} of ${unreadConversations.length})` : ""}.`,
-          })
-        );
-      }, "Failed to search unread conversations");
+        if (dataSources.length === 0) {
+          return new Err(
+            new MCPError(
+              scope === "conversations"
+                ? "No project data source available to search conversations, or the project connector is not linked (required to scope transcript documents)."
+                : "No project data sources available to search for this scope.",
+              { tracked: false }
+            )
+          );
+        }
+
+        return searchFunction(auth, {
+          query: params.query,
+          relativeTimeFrame: params.relativeTimeFrame ?? "all",
+          dataSources,
+          nodeIds: params.nodeIds,
+          agentLoopContext,
+        });
+      }, "Failed to search project");
     },
   };
 

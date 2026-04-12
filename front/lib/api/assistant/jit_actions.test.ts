@@ -1,7 +1,4 @@
-import {
-  DEFAULT_CONVERSATION_QUERY_TABLES_ACTION_NAME,
-  DEFAULT_PROJECT_MANAGEMENT_SERVER_NAME,
-} from "@app/lib/actions/constants";
+import { DEFAULT_CONVERSATION_QUERY_TABLES_ACTION_NAME } from "@app/lib/actions/constants";
 import {
   CONVERSATION_FILES_SERVER_NAME,
   CONVERSATION_LIST_FILES_ACTION_NAME,
@@ -90,6 +87,7 @@ describe("getJITServers", () => {
           isSearchable: true,
           isQueryable: true,
           isInProjectContext: false,
+          hidden: false,
           creator: null,
         },
       ];
@@ -160,25 +158,21 @@ describe("getJITServers", () => {
   });
 
   describe("projects feature", () => {
-    it("should include project search server when feature flag is enabled and project context exists", async () => {
-      // Enable projects feature flag.
-      await FeatureFlagFactory.basic("projects", workspace);
+    it("should not include legacy project_context_and_conversations JIT server (search is on project_manager)", async () => {
+      await FeatureFlagFactory.basic(auth, "projects");
       await MCPServerViewResource.ensureAllAutoToolsAreCreated(auth);
 
-      const projectDatasourceView = await DataSourceViewFactory.fromConnector(
+      await DataSourceViewFactory.fromConnector(
         workspace,
         conversationsSpace,
         "dust_project",
         auth.user()
       );
 
-      // Use a conversation with spaceId when checking for datasource view
       const conversationWithSpace = {
         ...conversation,
         spaceId: conversationsSpace.sId,
       };
-
-      expect(projectDatasourceView).toBeDefined();
 
       const { servers: jitServers } = await getJITServers(auth, {
         agentConfiguration: agentConfig,
@@ -186,42 +180,14 @@ describe("getJITServers", () => {
         attachments: [],
       });
 
-      const projectSearchServer = jitServers.find(
-        (server) => server.name === DEFAULT_PROJECT_MANAGEMENT_SERVER_NAME
-      );
-
-      // The project search server should be present with proper configuration.
-      expect(projectSearchServer).toBeDefined();
-      expect(projectSearchServer?.description).toBe(
-        "Semantic search over the project context and conversations."
-      );
-      expect(projectSearchServer?.dataSources).toBeDefined();
-      // The datasource configuration should include the project context datasource.
-      if (projectSearchServer?.dataSources) {
-        expect(projectSearchServer.dataSources.length).toBeGreaterThan(0);
-        expect(projectSearchServer.dataSources[0].dataSourceViewId).toBe(
-          projectDatasourceView!.sId
-        );
-      }
-    });
-
-    it("should not include project search server when feature flag is disabled", async () => {
-      const { servers: jitServers } = await getJITServers(auth, {
-        agentConfiguration: agentConfig,
-        conversation,
-        attachments: [],
-      });
-
-      const projectSearchServer = jitServers.find(
-        (server) => server.name === DEFAULT_PROJECT_MANAGEMENT_SERVER_NAME
-      );
-
-      expect(projectSearchServer).toBeUndefined();
+      expect(
+        jitServers.find((s) => s.name === "project_context_and_conversations")
+      ).toBeUndefined();
     });
 
     it("should include project_manager server when feature flag is enabled and conversation is in a project", async () => {
       // Enable projects feature flag.
-      await FeatureFlagFactory.basic("projects", workspace);
+      await FeatureFlagFactory.basic(auth, "projects");
       await MCPServerViewResource.ensureAllAutoToolsAreCreated(auth);
 
       const { servers: jitServers } = await getJITServers(auth, {
@@ -264,7 +230,7 @@ describe("getJITServers", () => {
 
     it("should not include project_manager server when conversation is not in a project", async () => {
       // Enable projects feature flag.
-      await FeatureFlagFactory.basic("projects", workspace);
+      await FeatureFlagFactory.basic(auth, "projects");
 
       const { servers: jitServers } = await getJITServers(auth, {
         agentConfiguration: agentConfig,
@@ -347,6 +313,7 @@ describe("getJITServers", () => {
           isSearchable: true,
           isQueryable: true,
           isInProjectContext: false,
+          hidden: false,
           creator: null,
         },
       ];
@@ -401,6 +368,7 @@ describe("getJITServers", () => {
           isSearchable: true,
           isQueryable: false,
           isInProjectContext: false,
+          hidden: false,
           creator: null,
         },
       ];
@@ -451,6 +419,7 @@ describe("getJITServers", () => {
           isSearchable: true,
           isQueryable: false,
           isInProjectContext: false,
+          hidden: false,
           creator: null,
         },
       ];
@@ -492,6 +461,7 @@ describe("getJITServers", () => {
           isSearchable: false,
           isQueryable: true,
           isInProjectContext: false,
+          hidden: false,
           creator: null,
         },
       ];
@@ -536,6 +506,7 @@ describe("getJITServers", () => {
           isSearchable: false,
           isQueryable: true,
           isInProjectContext: false,
+          hidden: false,
           creator: null,
         },
       ];
@@ -588,6 +559,7 @@ describe("getJITServers", () => {
           isSearchable: true,
           isQueryable: true,
           isInProjectContext: false,
+          hidden: false,
           creator: null,
         },
       ];
@@ -668,6 +640,7 @@ describe("getJITServers", () => {
           isSearchable: true,
           isQueryable: true,
           isInProjectContext: false,
+          hidden: false,
           creator: null,
         },
       ];

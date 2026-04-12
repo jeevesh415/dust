@@ -1,3 +1,4 @@
+import { contentsToActivitySteps } from "@app/lib/api/assistant/activity_steps";
 import { getLightAgentMessageFromAgentMessage } from "@app/lib/api/assistant/citations";
 import { getAgentConfigurations } from "@app/lib/api/assistant/configuration/agent";
 import { getMessagesReactions } from "@app/lib/api/assistant/reaction";
@@ -25,16 +26,18 @@ import type {
 } from "@app/types/assistant/agent_message_content";
 import type {
   AgentMessageType,
+  CompactionMessageType,
   LegacyLightMessageType,
   LightAgentMessageType,
   LightMessageType,
   MessageType,
   RichMentionWithStatus,
   UserMessageType,
-  UserMessageTypeWithContentFragments,
+  UserMessageTypeWithoutMentions,
 } from "@app/types/assistant/conversation";
 import {
   ConversationError,
+  isCompactionMessageType,
   isUserMessageType,
 } from "@app/types/assistant/conversation";
 import {
@@ -47,9 +50,11 @@ import { isContentFragmentType } from "@app/types/content_fragment";
 import type { ModelId } from "@app/types/shared/model_id";
 import type { Result } from "@app/types/shared/result";
 import { Err, Ok } from "@app/types/shared/result";
+import { assertNever } from "@app/types/shared/utils/assert_never";
 import { removeNulls } from "@app/types/shared/utils/general";
 import type { UserType } from "@app/types/user";
 import assert from "assert";
+import type { Transaction } from "sequelize";
 
 export function getCompletionDuration(
   created: number,
@@ -175,6 +180,82 @@ function interleaveConditionalNewlines(parts: string[]): string[] {
   return out;
 }
 
+/**
+ * Render base user message fields from a MessageModel (with userMessage
+ * eager-loaded). No DB calls — uses only data on the models.
+ */
+function renderUserMessage(
+  message: MessageModel,
+  linkedUser: UserType | undefined
+): UserMessageTypeWithoutMentions {
+  if (!message.userMessage) {
+    throw new Error(
+      "Unreachable: renderUserMessage called on non-user message"
+    );
+  }
+  const userMessage = message.userMessage;
+
+  if (linkedUser && linkedUser.id !== userMessage.userId) {
+    throw new Error(
+      `linkedUser.id (${linkedUser.id}) does not match userMessage.userId (${userMessage.userId})`
+    );
+  }
+
+  let username = userMessage.userContextUsername;
+  let fullName = userMessage.userContextFullName;
+  let email = userMessage.userContextEmail;
+  let profilePictureUrl = userMessage.userContextProfilePictureUrl;
+
+  if (userMessage.userId !== null && !userMessage.agenticMessageType) {
+    if (linkedUser) {
+      username = linkedUser.username;
+      fullName = linkedUser.fullName;
+      email = linkedUser.email;
+      profilePictureUrl = linkedUser.image;
+    } else {
+      logger.warn(
+        {
+          messageId: message.sId,
+          userId: userMessage.userId,
+        },
+        "User not found for user message while it should have been fetched before. Falling back to user context."
+      );
+    }
+  }
+
+  return {
+    id: message.id,
+    sId: message.sId,
+    type: "user_message",
+    visibility: message.visibility,
+    version: message.version,
+    rank: message.rank,
+    branchId: message.getBranchId(),
+    created: message.createdAt.getTime(),
+    user: linkedUser ?? null,
+    content: userMessage.content,
+    context: {
+      username,
+      timezone: userMessage.userContextTimezone,
+      fullName,
+      email,
+      profilePictureUrl,
+      origin: userMessage.userContextOrigin,
+      clientSideMCPServerIds: userMessage.clientSideMCPServerIds,
+      lastTriggerRunAt:
+        userMessage.userContextLastTriggerRunAt?.getTime() ?? null,
+    },
+    agenticMessageData:
+      userMessage.agenticMessageType && userMessage.agenticOriginMessageId
+        ? {
+            type: userMessage.agenticMessageType,
+            originMessageId: userMessage.agenticOriginMessageId,
+          }
+        : undefined,
+    reactions: [],
+  };
+}
+
 async function batchRenderUserMessages(
   auth: Authenticator,
   messages: MessageModel[]
@@ -199,7 +280,7 @@ async function batchRenderUserMessages(
     ),
   ];
 
-  const agentConfigurationSIds = [
+  const agentConfigurationIds = [
     ...new Set(
       removeNulls([...mentionRows.map((m) => m.agentConfigurationId)])
     ),
@@ -207,9 +288,9 @@ async function batchRenderUserMessages(
 
   const [users, agentConfigurations] = await Promise.all([
     userIds.length > 0 ? UserResource.fetchByModelIds(userIds) : [],
-    agentConfigurationSIds.length > 0
+    agentConfigurationIds.length > 0
       ? getAgentConfigurations(auth, {
-          agentIds: agentConfigurationSIds,
+          agentIds: agentConfigurationIds,
           variant: "extra_light",
         })
       : [],
@@ -225,13 +306,12 @@ async function batchRenderUserMessages(
   });
 
   return userMessages.map((message) => {
-    if (!message.userMessage) {
-      throw new Error(
-        "Unreachable: batchRenderUserMessages has been filtered on user messages"
-      );
-    }
-    const userMessage = message.userMessage;
-    const user = userMessage.userId ? usersById.get(userMessage.userId) : null;
+    const base = renderUserMessage(
+      message,
+      message.userMessage?.userId
+        ? usersById.get(message.userMessage.userId)
+        : undefined
+    );
 
     const richMentions = getRichMentionsWithStatusForMessage(
       message.id,
@@ -239,72 +319,57 @@ async function batchRenderUserMessages(
       usersById,
       agentConfigurationsById
     );
-    let username = userMessage.userContextUsername;
-    let fullName = userMessage.userContextFullName;
-    let email = userMessage.userContextEmail;
-    let profilePictureUrl = userMessage.userContextProfilePictureUrl;
 
-    // We have a linked user and this is not an agentic message, so we can override the user context with the latest user data.
-    if (userMessage.userId !== null && !userMessage.agenticMessageType) {
-      const user = usersById.get(userMessage.userId);
-      if (user) {
-        username = user.username;
-        fullName = user.fullName;
-        email = user.email;
-        profilePictureUrl = user.image;
-      } else {
-        logger.warn(
-          {
-            workspaceId: auth.getNonNullableWorkspace().sId,
-            conversationSId: message.sId,
-            userId: userMessage.userId,
-          },
-          "User not found for user message while it should have been fetched before. Falling back to user context."
-        );
-      }
-    }
-
-    const mentions = richMentions.map(toMentionType);
     return {
-      id: message.id,
-      sId: message.sId,
-      type: "user_message",
-      visibility: message.visibility,
-      version: message.version,
-      rank: message.rank,
-      branchId: message.branchSId,
-      created: message.createdAt.getTime(),
-      user: user ?? null,
-      mentions,
+      ...base,
+      mentions: richMentions.map(toMentionType),
       richMentions,
-      content: userMessage.content,
-      context: {
-        username,
-        timezone: userMessage.userContextTimezone,
-        fullName,
-        email,
-        profilePictureUrl,
-        origin: userMessage.userContextOrigin,
-        clientSideMCPServerIds: userMessage.clientSideMCPServerIds,
-        lastTriggerRunAt:
-          userMessage.userContextLastTriggerRunAt?.getTime() ?? null,
-      },
-      agenticMessageData:
-        userMessage.agenticMessageType && userMessage.agenticOriginMessageId
-          ? {
-              type: userMessage.agenticMessageType,
-              originMessageId: userMessage.agenticOriginMessageId,
-            }
-          : undefined,
       reactions: reactionsByMessageId[message.id] ?? [],
     } satisfies UserMessageType;
   });
 }
 
+/**
+ * Render user messages without mentions or reactions.
+ * No DB calls beyond the provided transaction — safe to use inside an advisory lock.
+ */
+export async function batchRenderUserMessagesWithoutMentions(
+  auth: Authenticator,
+  {
+    messages,
+    transaction,
+  }: { messages: MessageModel[]; transaction: Transaction }
+): Promise<UserMessageTypeWithoutMentions[]> {
+  const userMessages = messages.filter(
+    (m) => m.userMessage !== null && m.userMessage !== undefined
+  );
+
+  const userIds = [
+    ...new Set(removeNulls(userMessages.map((m) => m.userMessage?.userId))),
+  ];
+
+  const users =
+    userIds.length > 0
+      ? await UserResource.fetchByModelIds(userIds, { transaction })
+      : [];
+
+  const usersById = new Map(users.map((u) => [u.id, u.toJSON()]));
+
+  return userMessages.map((message) =>
+    renderUserMessage(
+      message,
+      message.userMessage?.userId
+        ? usersById.get(message.userMessage.userId)
+        : undefined
+    )
+  );
+}
+
 async function batchRenderAgentMessages<V extends RenderMessageVariant>(
   auth: Authenticator,
   messages: MessageModel[],
-  viewType: V
+  viewType: V,
+  messagesWithToolOutputContent: Set<ModelId> | null = null
 ): Promise<
   Result<
     V extends "full" ? AgentMessageType[] : LightAgentMessageType[],
@@ -369,18 +434,55 @@ async function batchRenderAgentMessages<V extends RenderMessageVariant>(
     );
   }
 
-  const agentMCPActions = await AgentMCPActionResource.fetchByStepContents(
+  const allAgentMCPActions = await AgentMCPActionResource.fetchByStepContents(
     auth,
     {
       stepContents,
       latestVersionsOnly: true,
     }
   );
-  const actionsWithOutputs =
-    await AgentMCPActionResource.enrichActionsWithOutputItems(
-      auth,
-      agentMCPActions
-    );
+
+  let agentMCPActionsWithContent: AgentMCPActionResource[] = [];
+  let agentMCPActionsWithoutContent: AgentMCPActionResource[] = [];
+
+  for (const action of allAgentMCPActions) {
+    // Light messages always exclude content for all actions.
+    // Otherwise, for full messages, we only include content for the actions that are in the optional outputItemContentOnlyForMessageIds.
+    if (
+      viewType === "light" ||
+      (messagesWithToolOutputContent &&
+        !messagesWithToolOutputContent.has(action.agentMessageId))
+    ) {
+      agentMCPActionsWithoutContent.push(action);
+    } else {
+      agentMCPActionsWithContent.push(action);
+    }
+  }
+
+  const [actionsWithOutputs, actionsWithoutOutputs] = await Promise.all([
+    AgentMCPActionResource.enrichActionsWithOutputItems(auth, {
+      actions: agentMCPActionsWithContent,
+      ignoreContent: false,
+    }),
+    AgentMCPActionResource.enrichActionsWithOutputItems(auth, {
+      actions: agentMCPActionsWithoutContent,
+      ignoreContent: true,
+    }),
+  ]);
+
+  const actionsByAgentMessageId: Record<
+    number,
+    AgentMCPActionWithOutputType[]
+  > = [...actionsWithOutputs, ...actionsWithoutOutputs].reduce(
+    (acc, a) => {
+      if (!acc[a.agentMessageId]) {
+        acc[a.agentMessageId] = [];
+      }
+      acc[a.agentMessageId].push(a);
+      return acc;
+    },
+    {} as Record<number, AgentMCPActionWithOutputType[]>
+  );
 
   const stepContentsByMessageId: Record<string, AgentStepContentResource[]> =
     stepContents.reduce(
@@ -413,9 +515,9 @@ async function batchRenderAgentMessages<V extends RenderMessageVariant>(
       }
       const agentMessage = message.agentMessage;
 
-      const actions = actionsWithOutputs
-        .filter((a) => a.agentMessageId === agentMessage.id)
-        .sort((a, b) => a.step - b.step);
+      const actions = (actionsByAgentMessageId[agentMessage.id] ?? []).sort(
+        (a, b) => a.step - b.step
+      );
 
       const agentConfiguration = agentConfigurationsById.get(
         agentMessage.agentConfigurationId
@@ -424,7 +526,7 @@ async function batchRenderAgentMessages<V extends RenderMessageVariant>(
         logger.error(
           {
             workspaceId: auth.getNonNullableWorkspace().sId,
-            conversationSId: message.sId,
+            messageId: message.sId,
             agentMessageId: agentMessage.id,
             agentConfigurationId: agentMessage.agentConfigurationId,
             agentConfigurations,
@@ -542,7 +644,7 @@ async function batchRenderAgentMessages<V extends RenderMessageVariant>(
         logger.error(
           {
             workspaceId: auth.getNonNullableWorkspace().sId,
-            conversationSId: message.sId,
+            messageId: message.sId,
             agentMessageId: agentMessage.id,
           },
           "Couldn't find parent message for agent message."
@@ -582,7 +684,7 @@ async function batchRenderAgentMessages<V extends RenderMessageVariant>(
         visibility: message.visibility,
         version: message.version,
         rank: message.rank,
-        branchId: message.branchSId,
+        branchId: message.getBranchId(),
         parentMessageId: parentMessage.sId,
         parentAgentMessageId: parentAgentMessage?.sId ?? null,
         status: agentMessage.status,
@@ -607,7 +709,17 @@ async function batchRenderAgentMessages<V extends RenderMessageVariant>(
       if (viewType === "full") {
         return new Ok(m);
       } else {
-        return new Ok(getLightAgentMessageFromAgentMessage(m));
+        const activitySteps = await contentsToActivitySteps(
+          agentStepContents,
+          actions,
+          agentConfiguration,
+          message.sId
+        );
+
+        return new Ok({
+          ...getLightAgentMessageFromAgentMessage(m),
+          activitySteps,
+        });
       }
     })
   );
@@ -637,13 +749,43 @@ async function batchRenderContentFragment(
   });
 }
 
+async function batchRenderCompactionMessages(
+  _auth: Authenticator,
+  messages: MessageModel[]
+): Promise<CompactionMessageType[]> {
+  const compactionMessages = messages.filter((m) => !!m.compactionMessage);
+
+  return compactionMessages.map((m) => {
+    if (!m.compactionMessage) {
+      throw new Error(
+        "Unreachable: batchRenderCompactionMessages has been filtered on compaction message"
+      );
+    }
+    const compactionMessage = m.compactionMessage;
+    return {
+      type: "compaction_message" as const,
+      id: m.id,
+      compactionMessageId: compactionMessage.id,
+      sId: m.sId,
+      created: m.createdAt.getTime(),
+      visibility: m.visibility,
+      version: m.version,
+      rank: m.rank,
+      branchId: m.getBranchId(),
+      status: compactionMessage.status,
+      content: compactionMessage.content,
+    };
+  });
+}
+
 type RenderMessageVariant = "legacy-light" | "full" | "light";
 
 export async function batchRenderMessages<V extends RenderMessageVariant>(
   auth: Authenticator,
   conversation: ConversationResource,
   messages: MessageModel[],
-  viewType: V
+  viewType: V,
+  messagesWithToolOutputContent: Set<ModelId> | null = null
 ): Promise<
   Result<
     V extends "full"
@@ -656,11 +798,18 @@ export async function batchRenderMessages<V extends RenderMessageVariant>(
     ConversationError
   >
 > {
-  const [userMessages, agentMessagesRes, contentFragments] = await Promise.all([
-    batchRenderUserMessages(auth, messages),
-    batchRenderAgentMessages(auth, messages, viewType),
-    batchRenderContentFragment(auth, conversation.sId, messages),
-  ]);
+  const [userMessages, agentMessagesRes, contentFragments, compactionMessages] =
+    await Promise.all([
+      batchRenderUserMessages(auth, messages),
+      batchRenderAgentMessages(
+        auth,
+        messages,
+        viewType,
+        messagesWithToolOutputContent
+      ),
+      batchRenderContentFragment(auth, conversation.sId, messages),
+      batchRenderCompactionMessages(auth, messages),
+    ]);
 
   if (agentMessagesRes.isErr()) {
     return agentMessagesRes;
@@ -672,6 +821,7 @@ export async function batchRenderMessages<V extends RenderMessageVariant>(
     ...userMessages,
     ...agentMessages,
     ...contentFragments,
+    ...compactionMessages,
   ].sort((a, b) => a.rank - b.rank || a.version - b.version);
 
   if (viewType === "light") {
@@ -683,10 +833,10 @@ export async function batchRenderMessages<V extends RenderMessageVariant>(
       if (isContentFragmentType(message)) {
         tempContentFragments.push(message); // Collect content fragments.
       } else {
-        let messageWithContentFragments: UserMessageTypeWithContentFragments;
+        // let messageWithContentFragments: UserMessageTypeWithContentFragments;
         if (isUserMessageType(message)) {
           // Attach collected content fragments to the user message.
-          messageWithContentFragments = {
+          const messageWithContentFragments = {
             ...message,
             contentFragments: tempContentFragments,
           };
@@ -694,9 +844,13 @@ export async function batchRenderMessages<V extends RenderMessageVariant>(
 
           // Start a new group for user messages.
           output.push(messageWithContentFragments);
-        } else {
+        } else if (message.type === "agent_message") {
           // I know this is safe because we are in the light view.
           output.push(message as LightAgentMessageType);
+        } else if (isCompactionMessageType(message)) {
+          output.push(message);
+        } else {
+          assertNever(message);
         }
       }
     });

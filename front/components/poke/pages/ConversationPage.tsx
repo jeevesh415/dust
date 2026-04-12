@@ -6,7 +6,10 @@ import { classNames } from "@app/lib/utils";
 import { usePokeConversation } from "@app/poke/swr";
 import { usePokeAgentConfigurations } from "@app/poke/swr/agent_configurations";
 import { usePokeConversationConfig } from "@app/poke/swr/conversation_config";
-import type { UserMessageType } from "@app/types/assistant/conversation";
+import type {
+  CompactionMessageType,
+  UserMessageType,
+} from "@app/types/assistant/conversation";
 import type { ContentFragmentType } from "@app/types/content_fragment";
 import { isFileContentFragment } from "@app/types/content_fragment";
 import type { PokeAgentMessageType } from "@app/types/poke";
@@ -278,7 +281,7 @@ const ContentFragmentView = ({ message }: ContentFragmentViewProps) => {
     <div className="w-full text-sm">
       <div className="font-bold">[content_fragment] {message.title}</div>
       <div className="text-sm text-muted-foreground dark:text-muted-foreground-night">
-        date : {new Date(message.created).toLocaleString()}
+        date : {new Date(message.created).toLocaleString()} {" • "}
         version :{message.version} {" • "}
         textBytes :{isFileContentFragment(message) ? message.textBytes : "N/A"}
       </div>
@@ -304,6 +307,33 @@ const ContentFragmentView = ({ message }: ContentFragmentViewProps) => {
     </div>
   );
 };
+
+interface CompactionMessageViewProps {
+  message: CompactionMessageType;
+}
+
+const CompactionMessageView = ({ message }: CompactionMessageViewProps) => {
+  return (
+    <div className="w-full text-sm">
+      <div className="font-bold">[compaction]</div>
+      <div className="text-sm text-muted-foreground dark:text-muted-foreground-night">
+        date : {new Date(message.created).toLocaleString()} {" • "}
+        version :{message.version}
+      </div>
+      <Markdown content={message.content || ""} />
+    </div>
+  );
+};
+
+const ONE_HOUR_MS = 60 * 60 * 1000;
+
+function getDatadogSandboxLogsUrl(conversationId: string): string {
+  const nowMs = Date.now();
+  const fromMs = nowMs - ONE_HOUR_MS;
+  const query = `service:sandbox-runner @conversation_id:${conversationId}`;
+
+  return `https://app.datadoghq.eu/logs?query=${encodeURIComponent(query)}&cols=service,@timestamp_utc&from_ts=${fromMs}&to_ts=${nowMs}&live=true`;
+}
 
 export function ConversationPage() {
   const owner = useWorkspace();
@@ -456,6 +486,13 @@ export function ConversationPage() {
             <Button
               href={`https://cloud.temporal.io/namespaces/${temporalWorkspace}/workflows?query=%60conversationId%60%3D"${conversationId}"`}
               label="Temporal Workflows"
+              variant="primary"
+              size="xs"
+              target="_blank"
+            />
+            <Button
+              href={getDatadogSandboxLogsUrl(conversationId)}
+              label="Sandbox Logs"
               variant="primary"
               size="xs"
               target="_blank"
@@ -616,6 +653,14 @@ export function ConversationPage() {
                       case "content_fragment": {
                         return (
                           <ContentFragmentView
+                            message={m}
+                            key={`message-${i}-${j}`}
+                          />
+                        );
+                      }
+                      case "compaction_message": {
+                        return (
+                          <CompactionMessageView
                             message={m}
                             key={`message-${i}-${j}`}
                           />

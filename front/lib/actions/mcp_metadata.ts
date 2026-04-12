@@ -12,7 +12,10 @@ import {
   MCPServerPersonalAuthenticationRequiredError,
   MCPServerRequiresAdminAuthenticationError,
 } from "@app/lib/actions/mcp_authentication";
-import { MCPServerNotFoundError } from "@app/lib/actions/mcp_errors";
+import {
+  MCPServerNotFoundError,
+  RemoteMCPServerError,
+} from "@app/lib/actions/mcp_errors";
 import {
   getServerTypeAndIdFromSId,
   isMcpTimeoutError,
@@ -52,6 +55,7 @@ import type { Result } from "@app/types/shared/result";
 import { Err, Ok } from "@app/types/shared/result";
 import { assertNever } from "@app/types/shared/utils/assert_never";
 import { normalizeError } from "@app/types/shared/utils/error_utils";
+import { safeParseJSON } from "@app/types/shared/utils/json_utils";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { SSEClientTransportOptions } from "@modelcontextprotocol/sdk/client/sse.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
@@ -62,8 +66,32 @@ import type { OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js";
 import type { FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { McpError, type Tool } from "@modelcontextprotocol/sdk/types.js";
 import type { JSONSchema7 as JSONSchema } from "json-schema";
+import { z } from "zod";
 
 const DEFAULT_MCP_CLIENT_CONNECT_TIMEOUT_MS = 25_000;
+
+const JsonRpcErrorSchema = z.object({
+  jsonrpc: z.string(),
+  error: z.object({
+    message: z.string(),
+  }),
+});
+
+function extractMCPErrorMessage(errorMessage: string): string {
+  const jsonMatch = errorMessage.match(/\{[\s\S]*"jsonrpc"[\s\S]*\}/);
+  if (!jsonMatch) {
+    return errorMessage;
+  }
+  const parseResult = safeParseJSON(jsonMatch[0]);
+  if (parseResult.isErr()) {
+    return errorMessage;
+  }
+  const rpcResult = JsonRpcErrorSchema.safeParse(parseResult.value);
+  if (!rpcResult.success) {
+    return errorMessage;
+  }
+  return rpcResult.data.error.message;
+}
 
 // Short timeout: the Redis round-trip is near-instant when the browser
 // is connected. If it takes longer than 5s the browser is likely
@@ -81,6 +109,9 @@ interface ConnectViaMCPServerId {
   type: "mcpServerId";
   mcpServerId: string;
   oAuthUseCase: MCPOAuthUseCase | null;
+  // Admin-configured scope restriction stored on the MCP server view. When set,
+  // this overrides the hardcoded metadata scope for personal connection prompts.
+  oauthScope?: string | null;
 }
 
 export function isConnectViaMCPServerId(
@@ -461,7 +492,10 @@ export async function connectToMCPServer(
                   "Internal server workspace authentication failed"
                 );
 
-                const scope = serverInfo.authorization.scope;
+                // Use the admin-configured scope restriction if set, otherwise
+                // fall back to the full scope from server metadata.
+                const scope =
+                  params.oauthScope ?? serverInfo.authorization.scope;
 
                 if (params.oAuthUseCase === "personal_actions") {
                   // Check if admin connection exists for the server.
@@ -650,7 +684,8 @@ export async function connectToMCPServer(
           },
           "Error establishing connection to remote MCP server via URL"
         );
-        return new Err(normalizeError(e));
+        const msg = extractMCPErrorMessage(normalizeError(e).message);
+        return new Err(new RemoteMCPServerError(msg));
       }
       break;
     }
@@ -880,7 +915,9 @@ async function fetchRemoteServerMetaData(
       "Error fetching metadata from remote MCP server"
     );
     return new Err(
-      new Error("Error getting metadata from the remote MCP server.")
+      new RemoteMCPServerError(
+        extractMCPErrorMessage(normalizeError(e).message)
+      )
     );
   }
 }

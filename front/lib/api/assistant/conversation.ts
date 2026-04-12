@@ -1,4 +1,7 @@
 // biome-ignore-all lint/plugin/noNextImports: Next.js-specific file
+
+import type { LightMCPToolConfigurationType } from "@app/lib/actions/mcp";
+import type { StepContext } from "@app/lib/actions/types";
 import {
   getAgentConfiguration,
   getAgentConfigurations,
@@ -9,6 +12,7 @@ import { getContentFragmentBlob } from "@app/lib/api/assistant/conversation/cont
 import { createUserMentions } from "@app/lib/api/assistant/conversation/mentions";
 import {
   createAgentMessages,
+  createCompactionMessage,
   createUserMessage,
 } from "@app/lib/api/assistant/conversation/messages";
 import {
@@ -16,7 +20,11 @@ import {
   updateConversationRequirements,
 } from "@app/lib/api/assistant/conversation/permissions";
 import { ensureConversationTitle } from "@app/lib/api/assistant/conversation/title";
-
+import {
+  batchRenderMessages,
+  batchRenderUserMessagesWithoutMentions,
+} from "@app/lib/api/assistant/messages";
+import { gracefullyStopAgentLoop } from "@app/lib/api/assistant/pubsub";
 import {
   MESSAGE_RATE_LIMIT_PER_ACTOR_PER_HOUR,
   MESSAGE_RATE_LIMIT_PER_ACTOR_PER_HOUR_WINDOW_SECONDS,
@@ -31,19 +39,30 @@ import {
 } from "@app/lib/api/assistant/rate_limits";
 import {
   publishAgentMessagesEvents,
+  publishConversationEvent,
   publishMessageEventsOnMessagePostOrEdit,
 } from "@app/lib/api/assistant/streaming/events";
 import type { ConversationEvents } from "@app/lib/api/assistant/streaming/types";
+import {
+  buildAuditLogTarget,
+  emitAuditLogEvent,
+} from "@app/lib/api/audit/workos_audit";
 import { maybeUpsertFileAttachment } from "@app/lib/api/files/attachments";
 import { getRemainingKeyCapMicroUsd } from "@app/lib/api/programmatic_usage/key_cap";
 import { isProgrammaticUsage } from "@app/lib/api/programmatic_usage/tracking";
+import { fetchLatestProjectContextFileContentFragment } from "@app/lib/api/projects";
 import { isModelAvailable, isProviderWhitelisted } from "@app/lib/assistant";
-import type { Authenticator } from "@app/lib/auth";
-import { getFeatureFlags } from "@app/lib/auth";
+import { Authenticator, getFeatureFlags } from "@app/lib/auth";
 import { getSupportedModelConfig } from "@app/lib/llms/model_configurations";
-import { extractFromString } from "@app/lib/mentions/format";
+import { extractFromString, serializeMention } from "@app/lib/mentions/format";
+import {
+  AgentMCPActionModel,
+  AgentMCPActionOutputItemModel,
+} from "@app/lib/models/agent/actions/mcp";
+import { AgentStepContentModel } from "@app/lib/models/agent/agent_step_content";
 import {
   AgentMessageModel,
+  CompactionMessageModel,
   ConversationModel,
   MentionModel,
   MessageModel,
@@ -61,10 +80,9 @@ import { MembershipResource } from "@app/lib/resources/membership_resource";
 import { SpaceResource } from "@app/lib/resources/space_resource";
 import { frontSequelize } from "@app/lib/resources/storage";
 import { UserModel } from "@app/lib/resources/storage/models/user";
-import {
-  generateRandomModelSId,
-  getResourceIdFromSId,
-} from "@app/lib/resources/string_ids";
+import { getResourceIdFromSId } from "@app/lib/resources/string_ids";
+import { generateRandomModelSId } from "@app/lib/resources/string_ids_server";
+
 import { ServerSideTracking } from "@app/lib/tracking/server";
 import {
   getTimeframeSecondsFromLiteral,
@@ -73,32 +91,44 @@ import {
 import { withTransaction } from "@app/lib/utils/sql_utils";
 import { getStatsDClient } from "@app/lib/utils/statsd";
 import logger, { auditLog } from "@app/logger/logger";
-import { launchAgentLoopWorkflow } from "@app/temporal/agent_loop/client";
 import {
-  launchOrSignalButlerWorkflow,
-  signalButlerComplete,
-} from "@app/temporal/butler/client";
+  launchAgentLoopWorkflow,
+  launchCompactionWorkflow,
+} from "@app/temporal/agent_loop/client";
+import {
+  launchOrSignalProjectTodoWorkflow,
+  signalProjectTodoComplete,
+} from "@app/temporal/project_todo/client";
 import type {
   ContentFragmentInputWithContentNode,
   ContentFragmentInputWithFileIdType,
 } from "@app/types/api/internal/assistant";
 import { isContentFragmentInputWithContentNode } from "@app/types/api/internal/assistant";
-import type { LightAgentConfigurationType } from "@app/types/assistant/agent";
+import type {
+  LightAgentConfigurationType,
+  ToolErrorEvent,
+} from "@app/types/assistant/agent";
+import { GLOBAL_AGENTS_SID } from "@app/types/assistant/assistant";
 import type {
   AgenticMessageData,
   AgentMessageType,
   AgentMessageTypeWithoutMentions,
+  CitationType,
+  CompactionMessageType,
   ConversationMetadata,
   ConversationType,
   ConversationVisibility,
   ConversationWithoutContentType,
+  MessageVisibility,
   RichMentionWithStatus,
   UserMessageContext,
   UserMessageType,
+  UserMessageTypeWithoutMentions,
 } from "@app/types/assistant/conversation";
 import {
   ConversationError,
   isAgentMessageType,
+  isCompactionMessageType,
   isProjectConversation,
   isUserMessageType,
 } from "@app/types/assistant/conversation";
@@ -120,13 +150,24 @@ import { Err, Ok } from "@app/types/shared/result";
 import { assertNever } from "@app/types/shared/utils/assert_never";
 import { md5 } from "@app/types/shared/utils/encryption";
 import { removeNulls } from "@app/types/shared/utils/general";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import assert from "assert";
+import uniq from "lodash/uniq";
 import type { NextApiRequest } from "next";
 import type { Transaction } from "sequelize";
 import { col } from "sequelize";
 
 // Rate limit for programmatic usage: 1 message per this amount of dollars per minute.
 const PROGRAMMATIC_RATE_LIMIT_DOLLARS_PER_MESSAGE = 3;
+
+/** Citations and generated files aggregated from source MCP output items (e.g. branch merge). */
+export type CitationsAndFilesFromOutputItemsType = {
+  citationsAllocated: number;
+  outputItems: Array<{
+    fileId: ModelId | null;
+    citations: Record<string, CitationType> | null;
+  }>;
+};
 
 /**
  * Conversation Creation, update and deletion
@@ -294,10 +335,10 @@ export async function getConversationMessageType(
     return null;
   }
 
-  if (message.branchSId) {
+  if (message.getBranchId()) {
     const branch = await ConversationBranchResource.fetchById(
       auth,
-      message.branchSId
+      message.getBranchId()!
     );
     if (!branch || !branch.canRead(auth)) {
       return null;
@@ -340,39 +381,6 @@ export async function getMessageConversationId(
     conversationId: messageRow?.conversation?.sId ?? null,
     messageId: messageRow?.sId ?? null,
   };
-}
-
-export async function getLastUserMessage(
-  auth: Authenticator,
-  conversation: ConversationWithoutContentType
-): Promise<Result<string, Error>> {
-  const owner = auth.getNonNullableWorkspace();
-
-  const message = await MessageModel.findOne({
-    where: {
-      workspaceId: owner.id,
-      conversationId: conversation.id,
-    },
-    order: [
-      ["rank", "DESC"],
-      ["version", "ASC"],
-    ],
-    include: [
-      {
-        model: UserMessageModel,
-        as: "userMessage",
-        required: false,
-      },
-    ],
-  });
-
-  const content = message?.userMessage?.content;
-  if (!content) {
-    return new Err(
-      new Error("Error suggesting agents: no content found in conversation.")
-    );
-  }
-  return new Ok(content);
 }
 
 /**
@@ -483,7 +491,6 @@ export function isUserMessageContextValid(
 
   switch (context.origin) {
     case "api":
-    case "project_butler":
       return true;
     case "excel":
     case "gsheet":
@@ -514,6 +521,7 @@ export function isUserMessageContextValid(
     case "agent_sidekick":
     case "project_kickoff":
     case "reinforced_agent_notification":
+    case "reinforcement":
     case "web":
       return false;
     default:
@@ -533,7 +541,9 @@ export async function postUserMessage(
     context,
     agenticMessageData,
     skipToolsValidation,
+    skipDustAutoMention,
     doNotAssociateUser,
+    steeringEnabled,
   }: {
     conversation: ConversationType;
     content: string;
@@ -542,6 +552,8 @@ export async function postUserMessage(
     agenticMessageData?: AgenticMessageData;
     skipToolsValidation: boolean;
     doNotAssociateUser?: boolean;
+    skipDustAutoMention?: boolean;
+    steeringEnabled?: boolean;
   }
 ): Promise<
   Result<
@@ -599,6 +611,63 @@ export async function postUserMessage(
     return limitResult;
   }
 
+  // Block posting while compaction is in progress, for now. It's not too hard to add support for
+  // pending messages on top of compaction. We start without support for it to simplify. Note that
+  // we don't currently re-check the existence of a compaction message inside the critical section
+  // below which means an agent loop could be triggered whle a compaction is running. This is not
+  // that problematic if it happens (agent message after the compaction message).
+  const runningCompactionMessage = conversation.content
+    .flat()
+    .find(
+      (m): m is CompactionMessageType =>
+        isCompactionMessageType(m) && m.status === "created"
+    );
+  if (runningCompactionMessage) {
+    return new Err({
+      status_code: 409,
+      api_error: {
+        type: "invalid_request_error",
+        message:
+          "User messages cannot be posted while conversation is being compacted.",
+      },
+    });
+  }
+
+  const agentMentions = mentions.filter(isAgentMention);
+  let runningAgentMessage = conversation.content
+    .flat()
+    .find(
+      (m): m is AgentMessageType =>
+        isAgentMessageType(m) && m.status === "created"
+    );
+
+  // Steering invariants: enforce single agent loop per conversation.
+  if (steeringEnabled) {
+    if (agentMentions.length > 1) {
+      return new Err({
+        status_code: 400,
+        api_error: {
+          type: "invalid_request_error",
+          message: "Only one agent can be mentioned per message.",
+        },
+      });
+    }
+
+    if (
+      runningAgentMessage &&
+      agentMentions.length > 0 &&
+      agentMentions[0].configurationId !== runningAgentMessage.configuration.sId
+    ) {
+      return new Err({
+        status_code: 400,
+        api_error: {
+          type: "invalid_request_error",
+          message: "Cannot run a different agent while one is running.",
+        },
+      });
+    }
+  }
+
   // `getAgentConfiguration` checks that we're only pulling a configuration from the
   // same workspace or a global one.
   const results = await Promise.all([
@@ -623,8 +692,38 @@ export async function postUserMessage(
     })(),
   ]);
 
-  const agentConfigurations = removeNulls(results[0]);
+  let agentConfigurations = removeNulls(results[0]);
   let shouldCreateBranch = false;
+
+  // Check if no mentions, in that case, we might automatically append an @dust mention.
+  if (
+    !skipDustAutoMention &&
+    mentions.length === 0 &&
+    (context.origin === "web" || context.origin === "extension")
+  ) {
+    const hasOtherHumans =
+      uniq(
+        conversation.content
+          .map((versions) => versions[versions.length - 1])
+          .filter(isUserMessageType)
+          .filter((m) => m.user?.sId && m.user.sId !== auth.user()?.sId)
+      ).length >= 1;
+
+    if (!hasOtherHumans) {
+      // Check if the global @dust agent is active for this workspace.
+      const dustAgent = await getAgentConfiguration(auth, {
+        agentId: GLOBAL_AGENTS_SID.DUST,
+        variant: "extra_light",
+      });
+
+      if (dustAgent && dustAgent.status === "active") {
+        agentConfigurations.push(dustAgent);
+        const dustMention: MentionType = { configurationId: dustAgent.sId };
+        mentions.push(dustMention);
+        content = `${serializeMention({ id: dustAgent.sId, type: "agent", label: dustAgent.name })} ${content}`;
+      }
+    }
+  }
 
   for (const agentConfig of agentConfigurations) {
     if (!canAccessAgent(agentConfig)) {
@@ -768,6 +867,30 @@ export async function postUserMessage(
       authMethod: auth.authMethod(),
     };
 
+    // Re-read the agent message status inside the critical section of the advisory lock. Between
+    // the initial check and acquiring the lock, the agent loop may have finalized — if so, clear
+    // runningAgentMessage so we fall through to the normal flow.
+    if (steeringEnabled && runningAgentMessage) {
+      const agentMessageRow = await AgentMessageModel.findOne({
+        where: {
+          id: runningAgentMessage.agentMessageId,
+          workspaceId: owner.id,
+        },
+        transaction: t,
+      });
+
+      if (agentMessageRow?.status !== "created") {
+        runningAgentMessage = undefined;
+      }
+    }
+
+    // We set the visibility of the user message to "pending" if steering is enabled, we have a
+    // running agent message and there are agent mentions in the user messsage.
+    const visibility: MessageVisibility =
+      steeringEnabled && runningAgentMessage && agentMentions.length > 0
+        ? "pending"
+        : "visible";
+
     // Return the user message without mentions.
     // This way typescript forces us to create the mentions after the user message is created.
     const userMessageWithoutMentions = await createUserMessage(auth, {
@@ -779,6 +902,7 @@ export async function postUserMessage(
         rank: nextMessageRank++,
         context: enrichedContext,
         agenticMessageData,
+        visibility,
       },
       transaction: t,
     });
@@ -790,28 +914,6 @@ export async function postUserMessage(
       transaction: t,
     });
 
-    const { agentMessages, richMentions: agentRichMentions } =
-      await createAgentMessages(auth, {
-        conversation,
-        metadata: {
-          type: "create",
-          mentions,
-          agentConfigurations,
-          skipToolsValidation,
-          nextMessageRank,
-          userMessage: userMessageWithoutMentions,
-        },
-        transaction: t,
-      });
-
-    richMentions.push(...agentRichMentions);
-
-    const userMessage = {
-      ...userMessageWithoutMentions,
-      richMentions: richMentions,
-      mentions: richMentions.map(toMentionType),
-    };
-
     await ConversationResource.markAsUpdated(auth, { conversation, t });
 
     if (!doNotAssociateUser) {
@@ -822,10 +924,46 @@ export async function postUserMessage(
       });
     }
 
-    return {
-      userMessage,
-      agentMessages,
-    };
+    if (visibility === "pending") {
+      // Pending path: agent is still running, and we have agent mentions, create a pending user
+      // message without an agent message.
+      const userMessage = {
+        ...userMessageWithoutMentions,
+        richMentions,
+        mentions: richMentions.map(toMentionType),
+      };
+
+      return { userMessage, agentMessages: [] };
+    } else {
+      // Normal path: create agent messages for all mentioned agents, and associate them with the
+      // user message.
+      const { agentMessages, richMentions: agentRichMentions } =
+        await createAgentMessages(auth, {
+          conversation,
+          metadata: {
+            type: "create",
+            mentions,
+            agentConfigurations,
+            skipToolsValidation,
+            nextMessageRank,
+            userMessage: userMessageWithoutMentions,
+          },
+          transaction: t,
+        });
+
+      richMentions.push(...agentRichMentions);
+
+      const userMessage = {
+        ...userMessageWithoutMentions,
+        richMentions: richMentions,
+        mentions: richMentions.map(toMentionType),
+      };
+
+      return {
+        userMessage,
+        agentMessages,
+      };
+    }
   });
 
   // If a user is mentioned, we want to make sure the conversation has a title.
@@ -863,6 +1001,23 @@ export async function postUserMessage(
     agentMessages,
   });
 
+  // Emit agent.executed for each agent being invoked.
+  for (const agentMessage of agentMessages) {
+    void emitAuditLogEvent({
+      auth,
+      action: "agent.executed",
+      targets: [
+        buildAuditLogTarget("workspace", conversation.owner),
+        buildAuditLogTarget("agent", agentMessage.configuration),
+      ],
+      metadata: {
+        conversationId: conversation.sId,
+        agentName: agentMessage.configuration.name,
+        origin: context.origin,
+      },
+    });
+  }
+
   // Run agent loop workflows after the transaction commits, to ensure messages are persisted.
   if (agentMessages.length > 0) {
     await runAgentLoopWorkflow({
@@ -870,6 +1025,16 @@ export async function postUserMessage(
       agentMessages,
       conversation,
       userMessage,
+    });
+  } else if (
+    steeringEnabled &&
+    runningAgentMessage &&
+    userMessage.visibility === "pending"
+  ) {
+    // Pending path: signal the running agent loop to gracefully stop.
+    await gracefullyStopAgentLoop(auth, {
+      messageIds: [runningAgentMessage.sId],
+      conversationId: conversation.sId,
     });
   }
 
@@ -892,20 +1057,20 @@ export async function postUserMessage(
       : Promise.resolve(undefined),
   ]);
 
-  if (featureFlags.includes("conversation_butler") && isPartOfProject) {
-    // Fire-and-forget: butler failures must not block message posting.
-    void launchOrSignalButlerWorkflow({
+  if (isPartOfProject) {
+    const projectTodoParams = {
       authType: auth.toJSON(),
+      spaceId: conversation.spaceId,
       conversationId: conversation.sId,
       messageId: userMessage.sId,
-    });
+    };
 
-    if (agentMessages.length === 0) {
-      void signalButlerComplete({
-        authType: auth.toJSON(),
-        conversationId: conversation.sId,
-        messageId: userMessage.sId,
-      });
+    if (featureFlags.includes("project_todo")) {
+      void launchOrSignalProjectTodoWorkflow(projectTodoParams);
+
+      if (agentMessages.length === 0) {
+        void signalProjectTodoComplete(projectTodoParams);
+      }
     }
   }
 
@@ -1087,7 +1252,6 @@ export async function editUserMessage(
       const userMessageWithoutMentions = await createUserMessage(auth, {
         conversation,
         content,
-
         metadata: {
           type: "edit",
           message,
@@ -1227,23 +1391,20 @@ export async function editUserMessage(
   );
 
   const featureFlags = await getFeatureFlags(auth);
-  if (
-    featureFlags.includes("conversation_butler") &&
-    isProjectConversation(conversation)
-  ) {
-    // Fire-and-forget: butler failures must not block message editing.
-    void launchOrSignalButlerWorkflow({
+  if (isProjectConversation(conversation)) {
+    const projectTodoParams = {
       authType: auth.toJSON(),
+      spaceId: conversation.spaceId,
       conversationId: conversation.sId,
       messageId: userMessage.sId,
-    });
+    };
 
-    if (agentMessages.length === 0) {
-      void signalButlerComplete({
-        authType: auth.toJSON(),
-        conversationId: conversation.sId,
-        messageId: userMessage.sId,
-      });
+    if (featureFlags.includes("project_todo")) {
+      void launchOrSignalProjectTodoWorkflow(projectTodoParams);
+
+      if (agentMessages.length === 0) {
+        void signalProjectTodoComplete(projectTodoParams);
+      }
     }
   }
 
@@ -1261,7 +1422,7 @@ export async function handleAgentMessage(
     conversation,
     agentMessage,
   }: {
-    conversation: ConversationType;
+    conversation: ConversationWithoutContentType;
     agentMessage: AgentMessageTypeWithoutMentions;
   }
 ) {
@@ -1296,6 +1457,227 @@ export async function handleAgentMessage(
       { ...agentMessage, richMentions },
     ]);
   }
+}
+
+export async function createAgentMessageFromText(
+  auth: Authenticator,
+  {
+    conversation,
+    parentId,
+    rank,
+    content,
+    agentConfiguration,
+    skipToolsValidation = true,
+    citationsAndFilesFromOutputItems,
+  }: {
+    conversation: ConversationType;
+    parentId: ModelId;
+    rank: number;
+    content: string;
+    agentConfiguration: { sId: string; version: number };
+    skipToolsValidation?: boolean;
+    citationsAndFilesFromOutputItems?: CitationsAndFilesFromOutputItemsType;
+  }
+): Promise<{
+  messageModelId: ModelId;
+  messageId: string;
+  agentMessageModelId: ModelId;
+}> {
+  const owner = auth.getNonNullableWorkspace();
+
+  const created = await withTransaction(async (t) => {
+    const agentMessageRow = await AgentMessageModel.create(
+      {
+        status: "succeeded",
+        agentConfigurationId: agentConfiguration.sId,
+        agentConfigurationVersion: agentConfiguration.version,
+        workspaceId: owner.id,
+        skipToolsValidation,
+        runIds: null,
+        completedAt: new Date(),
+        modelInteractionDurationMs: 0,
+        prunedContext: false,
+        errorCode: null,
+        errorMessage: null,
+        errorMetadata: null,
+      },
+      { transaction: t }
+    );
+
+    const messageRow = await MessageModel.create(
+      {
+        sId: generateRandomModelSId(),
+        rank,
+        conversationId: conversation.id,
+        branchId: conversation.branchId
+          ? getResourceIdFromSId(conversation.branchId)
+          : null,
+        parentId,
+        agentMessageId: agentMessageRow.id,
+        workspaceId: owner.id,
+      },
+      { transaction: t }
+    );
+
+    await AgentStepContentModel.create(
+      {
+        workspaceId: owner.id,
+        agentMessageId: agentMessageRow.id,
+        step: 0,
+        index: 0,
+        version: 0,
+        type: "text_content",
+        value: { type: "text_content", value: content },
+      },
+      { transaction: t }
+    );
+
+    if (citationsAndFilesFromOutputItems) {
+      const { citationsAllocated, outputItems } =
+        citationsAndFilesFromOutputItems;
+
+      const functionCallStepContent = await AgentStepContentModel.create(
+        {
+          workspaceId: owner.id,
+          agentMessageId: agentMessageRow.id,
+          step: 0,
+          index: 1,
+          version: 0,
+          type: "function_call",
+          value: {
+            type: "function_call",
+            value: {
+              id: `merged_output_${messageRow.id}`,
+              name: "merged_output",
+              arguments: "{}",
+            },
+          },
+        },
+        { transaction: t }
+      );
+
+      const createdAction = await AgentMCPActionModel.create(
+        {
+          workspaceId: owner.id,
+          mcpServerConfigurationId: "",
+          version: 0,
+          agentMessageId: agentMessageRow.id,
+          stepContentId: functionCallStepContent.id,
+          status: "succeeded",
+          citationsAllocated,
+          augmentedInputs: {},
+          toolConfiguration: {} as LightMCPToolConfigurationType,
+          stepContext: {} as StepContext,
+          executionDurationMs: null,
+        },
+        { transaction: t }
+      );
+
+      if (outputItems.length > 0) {
+        const syntheticMcpOutputContent: CallToolResult["content"][number] = {
+          type: "text",
+          text: "",
+        };
+        await AgentMCPActionOutputItemModel.bulkCreate(
+          outputItems.map((oi) => ({
+            workspaceId: owner.id,
+            agentMCPActionId: createdAction.id,
+            content: syntheticMcpOutputContent,
+            contentGcsPath: null,
+            fileId: oi.fileId,
+            citations: oi.citations,
+          })),
+          { transaction: t }
+        );
+      }
+    }
+
+    return {
+      messageModelId: messageRow.id,
+      messageId: messageRow.sId,
+      agentMessageModelId: agentMessageRow.id,
+    };
+  });
+
+  const conversationResource = await ConversationResource.fetchById(
+    auth,
+    conversation.sId
+  );
+  if (!conversationResource) {
+    logger.error(
+      {
+        workspaceId: owner.sId,
+        conversationId: conversation.sId,
+        messageId: created.messageId,
+      },
+      "createAgentMessageFromText: conversation not found for event publish."
+    );
+    return created;
+  }
+
+  const messageRow = await MessageModel.findOne({
+    where: { id: created.messageModelId, workspaceId: owner.id },
+    include: [
+      {
+        model: AgentMessageModel,
+        as: "agentMessage",
+        required: true,
+      },
+    ],
+  });
+
+  if (!messageRow?.agentMessage) {
+    logger.error(
+      {
+        workspaceId: owner.sId,
+        conversationId: conversation.sId,
+        messageId: created.messageId,
+      },
+      "createAgentMessageFromText: message row missing for batch render."
+    );
+    return created;
+  }
+
+  const renderedRes = await batchRenderMessages(
+    auth,
+    conversationResource,
+    [messageRow],
+    "full"
+  );
+
+  if (renderedRes.isErr()) {
+    logger.error(
+      {
+        workspaceId: owner.sId,
+        conversationId: conversation.sId,
+        messageId: created.messageId,
+        error: renderedRes.error,
+      },
+      "createAgentMessageFromText: batchRenderMessages failed."
+    );
+    return created;
+  }
+
+  const agentMessage = renderedRes.value.find(
+    (m): m is AgentMessageType =>
+      isAgentMessageType(m) && m.sId === created.messageId
+  );
+
+  if (!agentMessage) {
+    logger.error(
+      {
+        workspaceId: owner.sId,
+        conversationId: conversation.sId,
+        messageId: created.messageId,
+      },
+      "createAgentMessageFromText: rendered agent message not found."
+    );
+    return created;
+  }
+
+  await publishAgentMessagesEvents(conversation, [agentMessage]);
+
+  return created;
 }
 
 // This method is in charge of re-running an agent interaction (generating a new
@@ -1507,16 +1889,17 @@ export async function retryAgentMessage(
   });
 
   const featureFlags = await getFeatureFlags(auth);
-  if (
-    featureFlags.includes("conversation_butler") &&
-    isProjectConversation(conversation)
-  ) {
-    // Fire-and-forget: butler failures must not block retries.
-    void launchOrSignalButlerWorkflow({
+  if (isProjectConversation(conversation)) {
+    const projectTodoParams = {
       authType: auth.toJSON(),
+      spaceId: conversation.spaceId,
       conversationId: conversation.sId,
       messageId: agentMessage.sId,
-    });
+    };
+
+    if (featureFlags.includes("project_todo")) {
+      void launchOrSignalProjectTodoWorkflow(projectTodoParams);
+    }
   }
 
   // TODO(DURABLE-AGENTS 2025-07-17): Publish message events to all open tabs to maintain
@@ -1560,6 +1943,71 @@ export async function postNewContentFragment(
           "Only content fragments from the project space or the global space are allowed in a project conversation"
         )
       );
+    }
+  }
+
+  // If the user attaches a project-context file to a project conversation, reuse the existing
+  // project content fragment and only create the message row at send time.
+  if (isProjectConversation(conversation) && "fileId" in cf) {
+    const project = await SpaceResource.fetchById(auth, conversation.spaceId);
+    if (project?.isProject()) {
+      const r = await fetchLatestProjectContextFileContentFragment(
+        auth,
+        project,
+        cf.fileId
+      );
+      if (r) {
+        const alreadyPresent = conversation.content.some((versions) => {
+          const latest = versions[versions.length - 1];
+          return (
+            isContentFragmentType(latest) &&
+            latest.contentFragmentVersion === "latest" &&
+            latest.contentFragmentId === r.fragment.sId
+          );
+        });
+
+        if (!alreadyPresent) {
+          await withTransaction(async (t) => {
+            await getConversationRankVersionLock(auth, conversation, t);
+
+            const nextMessageRank =
+              ((await MessageModel.max<number | null, MessageModel>("rank", {
+                where: {
+                  workspaceId: owner.id,
+                  conversationId: conversation.id,
+                  branchId: conversation.branchId
+                    ? getResourceIdFromSId(conversation.branchId)
+                    : null,
+                },
+                transaction: t,
+              })) ?? -1) + 1;
+
+            await MessageModel.create(
+              {
+                sId: generateRandomModelSId(),
+                rank: nextMessageRank,
+                conversationId: conversation.id,
+                branchId: conversation.branchId
+                  ? getResourceIdFromSId(conversation.branchId)
+                  : null,
+                contentFragmentId: r.fragment.id,
+                workspaceId: owner.id,
+              },
+              { transaction: t }
+            );
+
+            await ConversationResource.markAsUpdated(auth, { conversation, t });
+          });
+        }
+
+        const rendered =
+          await ContentFragmentResource.renderToContentFragmentType(
+            auth,
+            r.fragment,
+            { kind: "project_context", file: r.file }
+          );
+        return new Ok(rendered);
+      }
     }
   }
 
@@ -1667,21 +2115,18 @@ export async function postNewContentFragment(
   });
 
   const featureFlags = await getFeatureFlags(auth);
-  if (
-    featureFlags.includes("conversation_butler") &&
-    isProjectConversation(conversation)
-  ) {
-    // Fire-and-forget: butler failures must not block content fragment posting.
-    void launchOrSignalButlerWorkflow({
+  if (isProjectConversation(conversation)) {
+    const projectTodoParams = {
       authType: auth.toJSON(),
+      spaceId: conversation.spaceId,
       conversationId: conversation.sId,
       messageId,
-    });
-    void signalButlerComplete({
-      authType: auth.toJSON(),
-      conversationId: conversation.sId,
-      messageId,
-    });
+    };
+
+    if (featureFlags.includes("project_todo")) {
+      void launchOrSignalProjectTodoWorkflow(projectTodoParams);
+      void signalProjectTodoComplete(projectTodoParams);
+    }
   }
 
   return new Ok(render);
@@ -1854,6 +2299,11 @@ async function checkMessagesLimit(
     context: UserMessageContext;
   }
 ): Promise<Result<void, APIErrorWithStatusCode>> {
+  // Skip rate limiting for system-initiated messages (e.g. reinforced agent workflows).
+  if (!auth.user() && !auth.key() && auth.authMethod() === "internal") {
+    return new Ok(undefined);
+  }
+
   const messageLimit = await isMessagesLimitReached(auth, {
     mentions,
     context,
@@ -2149,12 +2599,387 @@ export async function isConversationEventAllowedForAuth(
       }
       return true;
     case "agent_message_done":
-    case "butler_suggestion_created":
-    case "butler_done":
-    case "butler_thinking":
+    case "compaction_message_new":
+    case "compaction_message_done":
     case "conversation_title":
+    case "user_message_promoted":
       return true;
     default:
       assertNever(type);
   }
+}
+
+/**
+ * Create a CompactionMessage in the conversation and launch the compaction workflow.
+ *
+ * The CompactionMessage is created with status "created" inside the conversation advisory lock,
+ * ensuring it's serialized with other conversation operations. The workflow is launched
+ * fire-and-forget after the transaction commits.
+ */
+export async function compactConversation(
+  auth: Authenticator,
+  { conversation }: { conversation: ConversationType }
+): Promise<
+  Result<{ compactionMessage: CompactionMessageType }, APIErrorWithStatusCode>
+> {
+  const owner = auth.getNonNullableWorkspace();
+
+  // Block compaction while an agent message is running or a compaction is running.
+  const runningAgentMessage = conversation.content
+    .flat()
+    .find(
+      (m): m is AgentMessageType =>
+        isAgentMessageType(m) && m.status === "created"
+    );
+  const runningCompaction = conversation.content
+    .flat()
+    .find(
+      (m): m is CompactionMessageType =>
+        isCompactionMessageType(m) && m.status === "created"
+    );
+  if (runningAgentMessage || runningCompaction) {
+    return new Err({
+      status_code: 409,
+      api_error: {
+        type: "invalid_request_error",
+        message:
+          "Cannot compact while another compaction or an agent message is running.",
+      },
+    });
+  }
+
+  const { compactionMessage } = await withTransaction(async (t) => {
+    await getConversationRankVersionLock(auth, conversation, t);
+
+    // Re-check the existence of a compaction message or running agent message inside the critical
+    // section of the advisory lock to avoid stacking compaction with other compaction or running
+    // agent loop.
+    const [runningCompactionMessage, runningAgentMessage] = await Promise.all([
+      MessageModel.findOne({
+        where: {
+          conversationId: conversation.id,
+          workspaceId: owner.id,
+        },
+        include: [
+          {
+            model: CompactionMessageModel,
+            as: "compactionMessage",
+            required: true,
+            where: { status: "created" },
+          },
+        ],
+        transaction: t,
+      }),
+      MessageModel.findOne({
+        where: {
+          conversationId: conversation.id,
+          workspaceId: owner.id,
+        },
+        include: [
+          {
+            model: AgentMessageModel,
+            as: "agentMessage",
+            required: true,
+            where: { status: "created" },
+          },
+        ],
+        transaction: t,
+      }),
+    ]);
+
+    if (runningCompactionMessage || runningAgentMessage) {
+      return { compactionMessage: null };
+    }
+
+    const nextMessageRank =
+      ((await MessageModel.max<number | null, MessageModel>("rank", {
+        where: {
+          workspaceId: owner.id,
+          conversationId: conversation.id,
+          branchId: conversation.branchId
+            ? getResourceIdFromSId(conversation.branchId)
+            : null,
+        },
+        transaction: t,
+      })) ?? -1) + 1;
+
+    const compactionMessage = await createCompactionMessage(auth, {
+      conversation,
+      rank: nextMessageRank,
+      transaction: t,
+    });
+
+    return { compactionMessage };
+  });
+
+  if (!compactionMessage) {
+    return new Err({
+      status_code: 409,
+      api_error: {
+        type: "invalid_request_error",
+        message:
+          "Cannot compact while another compaction or an agent message is running.",
+      },
+    });
+  }
+
+  await publishConversationEvent(
+    {
+      type: "compaction_message_new",
+      created: Date.now(),
+      messageId: compactionMessage.sId,
+      message: compactionMessage,
+    },
+    { conversationId: conversation.sId }
+  );
+
+  void launchCompactionWorkflow({
+    auth,
+    conversationId: conversation.sId,
+    compactionMessageId: compactionMessage.sId,
+    compactionMessageVersion: compactionMessage.version,
+  });
+
+  return new Ok({ compactionMessage });
+}
+
+export async function updateCompactionMessageWithContentAndFinalStatus(
+  auth: Authenticator,
+  {
+    conversation,
+    compactionMessage,
+    status,
+    content,
+  }: {
+    conversation: ConversationWithoutContentType;
+    compactionMessage: CompactionMessageType;
+    status: "succeeded" | "failed";
+    content: string;
+  }
+): Promise<{
+  completedTs: number;
+  status: "succeeded" | "failed";
+}> {
+  const completedAt = new Date();
+  const owner = auth.getNonNullableWorkspace();
+
+  await withTransaction(async (t) => {
+    await getConversationRankVersionLock(auth, conversation, t);
+
+    await CompactionMessageModel.update(
+      { status, content },
+      {
+        where: {
+          id: compactionMessage.compactionMessageId,
+          workspaceId: owner.id,
+        },
+        transaction: t,
+      }
+    );
+  });
+
+  return {
+    completedTs: completedAt.getTime(),
+    status,
+  };
+}
+
+/**
+ * Finalize an agent message terminal status behind the conversation advisory lock.
+ *
+ * This ensures the status transition is serialized against other conversation operations (e.g.
+ * postUserMessage's pending path).
+ */
+export async function updateAgentMessageWithFinalStatus(
+  auth: Authenticator,
+  {
+    conversation,
+    agentMessage,
+    status,
+    error,
+  }: {
+    conversation: ConversationWithoutContentType;
+    agentMessage: AgentMessageType;
+    status: "succeeded" | "cancelled" | "failed" | "gracefully_stopped";
+    error?: ToolErrorEvent["error"];
+  }
+): Promise<{
+  completedTs: number;
+  status: "succeeded" | "cancelled" | "failed" | "gracefully_stopped";
+}> {
+  const completedAt = new Date();
+  const owner = auth.getNonNullableWorkspace();
+
+  const {
+    promotedUserMessages,
+    promotedAuth,
+    agentMessage: newAgentMessage,
+  } = await withTransaction(async (t) => {
+    await getConversationRankVersionLock(auth, conversation, t);
+
+    await AgentMessageModel.update(
+      {
+        status,
+        completedAt,
+        ...(error
+          ? {
+              errorCode: error.code,
+              errorMessage: error.message,
+              errorMetadata: error.metadata,
+            }
+          : {}),
+      },
+      {
+        where: {
+          id: agentMessage.agentMessageId,
+          workspaceId: owner.id,
+        },
+        transaction: t,
+      }
+    );
+
+    // Promote *all* pending messages when the agent loop ends. If a pending message exists it
+    // will be promoted and will trigger the ending agentMessage. The `enableSteering` invariants
+    // of postUserMessage ensure that we have only one running agentic loop so we can just
+    // recreate a new agentMessage for the same agent as the one that finished.
+    //
+    // There is an edge case here for API interactions which are not subject to the steering
+    // invariant in which case we could have more than one running agent message and could pick
+    // the wrong agent compared to user attempt. But should ~never happen so the simplicity is
+    // worth it.
+    const pendingMessages =
+      await ConversationResource.getPendingUserMessagesInConversation(auth, {
+        conversation,
+        transaction: t,
+      });
+
+    if (pendingMessages.length === 0) {
+      return {
+        promotedUserMessages: [] as UserMessageTypeWithoutMentions[],
+        promotedAuth: auth,
+        agentMessage: null as AgentMessageType | null,
+      };
+    }
+
+    await MessageModel.update(
+      { visibility: "visible" },
+      {
+        where: {
+          id: pendingMessages.map((m) => m.id),
+          workspaceId: owner.id,
+        },
+        // Skip validation: Sequelize bulk update constructs a dummy instance with only the
+        // updated fields, so the beforeValidate hook (which checks that exactly one of
+        // userMessageId/agentMessageId/ contentFragmentId is set) fails because all three are
+        // undefined. The rows are already valid, we're only updating visibility.
+        validate: false,
+        transaction: t,
+      }
+    );
+
+    const nextMessageRank =
+      ((await MessageModel.max<number | null, MessageModel>("rank", {
+        where: {
+          workspaceId: owner.id,
+          conversationId: conversation.id,
+          branchId: conversation.branchId
+            ? getResourceIdFromSId(conversation.branchId)
+            : null,
+        },
+        transaction: t,
+      })) ?? -1) + 1;
+
+    // Render all promoted user messages.
+    const promotedUserMessages = await batchRenderUserMessagesWithoutMentions(
+      auth,
+      {
+        messages: pendingMessages,
+        transaction: t,
+      }
+    );
+
+    // The new agent message is triggered by the last steering message (being promoted here from
+    // pending to visible). We need to use the promotedAuth of the associated user if it differs
+    // from the user who owns the current agent message.
+    const promotedUserMessage =
+      promotedUserMessages[promotedUserMessages.length - 1];
+    const promotedUser = promotedUserMessage.user;
+    let promotedAuth = auth;
+    if (promotedUser && promotedUser.sId !== auth.user()?.sId) {
+      promotedAuth = await Authenticator.fromUserIdAndWorkspaceId(
+        promotedUser.sId,
+        owner.sId,
+        { transaction: t }
+      );
+    }
+
+    await ConversationResource.markAsUpdated(promotedAuth, {
+      conversation,
+      t,
+    });
+
+    // Create a new agent message using the last promoted user message.
+    const { agentMessages } = await createAgentMessages(promotedAuth, {
+      conversation,
+      metadata: {
+        type: "create",
+        mentions: [{ configurationId: agentMessage.configuration.sId }],
+        agentConfigurations: [agentMessage.configuration],
+        skipToolsValidation: agentMessage.skipToolsValidation,
+        nextMessageRank,
+        userMessage: promotedUserMessages[promotedUserMessages.length - 1],
+      },
+      transaction: t,
+    });
+
+    return {
+      promotedUserMessages,
+      promotedAuth,
+      agentMessage: agentMessages[0] ?? null,
+    };
+  });
+
+  // Publish events and launch agent loop outside of the advisory lock.
+  if (promotedUserMessages.length > 0) {
+    for (const userMsg of promotedUserMessages) {
+      await publishConversationEvent(
+        {
+          type: "user_message_promoted",
+          created: Date.now(),
+          messageId: userMsg.sId,
+        },
+        { conversationId: conversation.sId }
+      );
+    }
+  }
+
+  if (newAgentMessage) {
+    await publishAgentMessagesEvents(conversation, [newAgentMessage]);
+
+    void emitAuditLogEvent({
+      auth: promotedAuth,
+      action: "agent.executed",
+      targets: [
+        buildAuditLogTarget("workspace", owner),
+        buildAuditLogTarget("agent", newAgentMessage.configuration),
+      ],
+      metadata: {
+        conversationId: conversation.sId,
+        agentName: newAgentMessage.configuration.name,
+        origin: "steering",
+      },
+    });
+
+    await runAgentLoopWorkflow({
+      auth: promotedAuth,
+      agentMessages: [newAgentMessage],
+      conversation,
+      userMessage: promotedUserMessages[promotedUserMessages.length - 1],
+    });
+  }
+
+  return {
+    completedTs: completedAt.getTime(),
+    status,
+  };
 }

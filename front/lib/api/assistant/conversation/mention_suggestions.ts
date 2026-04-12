@@ -12,6 +12,7 @@ import { ConversationResource } from "@app/lib/resources/conversation_resource";
 import { SpaceResource } from "@app/lib/resources/space_resource";
 import { UserResource } from "@app/lib/resources/user_resource";
 import { concurrentExecutor } from "@app/lib/utils/async_utils";
+import { GLOBAL_AGENTS_SID } from "@app/types/assistant/assistant";
 import type {
   RichAgentMentionInConversation,
   RichMention,
@@ -26,7 +27,8 @@ export function interleaveMentionsPreservingAgentOrder(
   agents: RichAgentMentionInConversation[],
   users: RichUserMentionInConversation[],
   lowerCaseQuery: string = "",
-  lastMentionedId: string | null = null
+  lastMentionedId: string | null = null,
+  conversationId: string | null = null
 ): RichMention[] {
   if (users.length === 0) {
     return [...agents];
@@ -72,7 +74,7 @@ export function interleaveMentionsPreservingAgentOrder(
       lowerCaseQuery &&
       nextAgent?.label?.toLowerCase().startsWith(lowerCaseQuery);
 
-    // Our high priority agents first, then users, then other agents
+    // Our high priority agents first
     if (
       nextAgentStartsWithQuery &&
       SUGGESTION_PRIORITY[nextAgent.id] !== undefined
@@ -81,15 +83,30 @@ export function interleaveMentionsPreservingAgentOrder(
       agentIndex += 1;
       continue;
     }
-    if (nextUserStartsWithQuery) {
-      result.push(nextUser);
-      userIndex += 1;
-      continue;
-    }
-    if (nextAgentStartsWithQuery) {
-      result.push(nextAgent);
-      agentIndex += 1;
-      continue;
+    if (conversationId) {
+      // In a conversation, prioritize users over agents.
+      if (nextUserStartsWithQuery) {
+        result.push(nextUser);
+        userIndex += 1;
+        continue;
+      }
+      if (nextAgentStartsWithQuery) {
+        result.push(nextAgent);
+        agentIndex += 1;
+        continue;
+      }
+    } else {
+      // Outside a conversation, prioritize agents over users.
+      if (nextAgentStartsWithQuery) {
+        result.push(nextAgent);
+        agentIndex += 1;
+        continue;
+      }
+      if (nextUserStartsWithQuery) {
+        result.push(nextUser);
+        userIndex += 1;
+        continue;
+      }
     }
 
     // Then interleave agents and users
@@ -237,8 +254,6 @@ export const suggestionsOfMentions = async (
       variant: "light",
     });
 
-    const activeAgentIds = new Set(agentConfigurations.map((a) => a.sId));
-
     const activeAgents: RichAgentMentionInConversation[] = agentConfigurations
       .filter((a) => a.status === "active")
       .map((a) => ({
@@ -248,12 +263,14 @@ export const suggestionsOfMentions = async (
           participantAgents.find((pa) => pa.id === a.sId)?.lastActivityAt ?? 0,
       }));
 
-    // Include participant agents not already in the fetched configurations
-    // (e.g. the sidekick agent which is excluded from global agent listings).
-    const missingParticipants = participantAgents.filter(
-      (pa) => !activeAgentIds.has(pa.id)
+    // The sidekick agent is excluded from default global agent listings but should
+    // be mentionable when it's a conversation participant.
+    const sidekickParticipant = participantAgents.find(
+      (pa) => pa.id === GLOBAL_AGENTS_SID.SIDEKICK
     );
-    activeAgents.push(...missingParticipants);
+    if (sidekickParticipant) {
+      activeAgents.push(sidekickParticipant);
+    }
 
     const filteredAgents = filterAndSortEditorSuggestionAgents(
       normalizedQuery,
@@ -321,6 +338,7 @@ export const suggestionsOfMentions = async (
     selectedAgents,
     userSuggestions,
     normalizedQuery,
-    lastMentionedId
+    lastMentionedId,
+    conversationId
   );
 };

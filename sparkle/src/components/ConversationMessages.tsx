@@ -22,8 +22,8 @@ const wrapperVariants = cva("s-flex s-flex-col s-@container @xs:s-flex-row", {
 const messageVariants = cva("s-flex s-rounded-2xl s-max-w-full", {
   variants: {
     type: {
-      user: "s-bg-muted-background dark:s-bg-muted-background-night s-p-3 s-gap-2 s-w-fit",
-      agent: "s-w-full s-gap-3 s-p-4 @xs:s-flex-row s-flex-col",
+      user: "s-gap-2 s-w-fit",
+      agent: "s-w-full s-gap-3 s-flex-col",
     },
   },
   defaultVariants: {
@@ -37,6 +37,8 @@ interface ConversationMessageContainerProps
   type: ConversationMessageType;
 }
 
+// This component should only contain padding (inside the bubble).
+// Any margin (inter-message spacing) should live outside of Sparkle.
 export const ConversationMessageContainer = React.forwardRef<
   HTMLDivElement,
   ConversationMessageContainerProps
@@ -58,25 +60,36 @@ interface ConversationMessageContentProps
   citations?: React.ReactElement[];
   type: ConversationMessageType;
   infoChip?: React.ReactNode;
+  reversed?: boolean;
 }
 
 export const ConversationMessageContent = React.forwardRef<
   HTMLDivElement,
   ConversationMessageContentProps
->(({ children, citations, className, ...props }, ref) => {
+>(({ children, citations, className, type, reversed, ...props }, ref) => {
   return (
-    <div
-      ref={ref}
-      className={cn("s-flex s-min-w-0 s-flex-col s-gap-1", className)}
-      {...props}
-    >
-      <div className="s-text-base s-text-foreground dark:s-text-foreground-night">
-        {children}
-      </div>
-      {citations && citations.length > 0 && (
-        <CitationGrid>{citations}</CitationGrid>
+    <>
+      {type === "user" && citations && citations.length > 0 && (
+        <CitationGrid reversed={reversed}>{citations}</CitationGrid>
       )}
-    </div>
+      <div
+        ref={ref}
+        className={cn(
+          "s-flex s-min-w-0 s-flex-col s-gap-1",
+          type === "user" &&
+            "s-rounded-2xl s-bg-muted-background dark:s-bg-muted-background-night s-px-4 s-py-3",
+          className
+        )}
+        {...props}
+      >
+        <div className="s-text-base s-text-foreground dark:s-text-foreground-night">
+          {children}
+        </div>
+        {type === "agent" && citations && citations.length > 0 && (
+          <CitationGrid>{citations}</CitationGrid>
+        )}
+      </div>
+    </>
   );
 });
 
@@ -106,22 +119,12 @@ export const ConversationMessageAvatar = React.forwardRef<
         {...props}
       >
         <Avatar
-          className="@xs:s-hidden"
           name={name}
           visual={avatarUrl}
           busy={isBusy}
           disabled={isDisabled}
           isRounded={type === "user"}
           size="xs"
-        />
-        <Avatar
-          className="s-hidden @xs:s-flex"
-          name={name}
-          visual={avatarUrl}
-          busy={isBusy}
-          disabled={isDisabled}
-          isRounded={type === "user"}
-          size="sm"
         />
       </div>
     );
@@ -164,13 +167,15 @@ export const ConversationMessageTitle = React.forwardRef<
         )}
         {...props}
       >
-        <div className="s-inline-flex s-items-center s-gap-2 s-text-foreground dark:s-text-foreground-night">
-          <span className="s-heading-sm">{renderName(name)}</span>
-          <span className="s-heading-xs s-text-muted-foreground dark:s-text-muted-foreground-night">
+        <div className="s-inline-flex s-items-baseline s-gap-2 s-text-foreground dark:s-text-foreground-night">
+          <span className="s-text-sm s-font-medium">{renderName(name)}</span>
+          <span className="s-text-xs s-text-muted-foreground dark:s-text-muted-foreground-night">
             {timestamp}
           </span>
           {infoChip && (
-            <div className="s-inline-flex s-items-center">{infoChip}</div>
+            <div className="s-inline-flex s-self-[anchor-center]">
+              {infoChip}
+            </div>
           )}
         </div>
         <div className="s-ml-1 s-inline-flex s-items-center">

@@ -8,6 +8,7 @@ import { RemoteMCPServerFactory } from "@app/tests/utils/RemoteMCPServerFactory"
 import { SpaceFactory } from "@app/tests/utils/SpaceFactory";
 import { UserFactory } from "@app/tests/utils/UserFactory";
 import sgMail from "@sendgrid/mail";
+import { escape } from "html-escaper";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import handler from "./index";
@@ -75,13 +76,13 @@ describe("GET /api/w/[wId]/spaces/[spaceId]/mcp_views", () => {
 
 describe("POST /api/w/[wId]/spaces/[spaceId]/mcp_views", () => {
   it("should return 400 when a view with the same name already exists in the space", async () => {
-    const { req, res, workspace, authenticator, globalSpace } =
+    const { req, res, workspace, auth, globalSpace } =
       await createPrivateApiMockRequest({
         role: "admin",
         method: "POST",
       });
 
-    await SpaceFactory.defaults(authenticator);
+    await SpaceFactory.defaults(auth);
 
     // Create two remote MCP servers with the same name.
     const server1 = await RemoteMCPServerFactory.create(workspace, {
@@ -94,11 +95,11 @@ describe("POST /api/w/[wId]/spaces/[spaceId]/mcp_views", () => {
     // Add the first server's view to the global space.
     const systemView1 =
       await MCPServerViewResource.getMCPServerViewForSystemSpace(
-        authenticator,
+        auth,
         server1.sId
       );
     expect(systemView1).not.toBeNull();
-    await MCPServerViewResource.create(authenticator, {
+    await MCPServerViewResource.create(auth, {
       systemView: systemView1!,
       space: globalSpace,
     });
@@ -114,13 +115,13 @@ describe("POST /api/w/[wId]/spaces/[spaceId]/mcp_views", () => {
   });
 
   it("should allow views with the same name in different spaces", async () => {
-    const { req, res, workspace, authenticator, globalSpace, globalGroup } =
+    const { req, res, workspace, auth, globalSpace, globalGroup } =
       await createPrivateApiMockRequest({
         role: "admin",
         method: "POST",
       });
 
-    await SpaceFactory.defaults(authenticator);
+    await SpaceFactory.defaults(auth);
 
     const regularSpace = await SpaceFactory.regular(workspace);
     await GroupSpaceFactory.associate(regularSpace, globalGroup);
@@ -136,11 +137,11 @@ describe("POST /api/w/[wId]/spaces/[spaceId]/mcp_views", () => {
     // Add the first server's view to the global space.
     const systemView1 =
       await MCPServerViewResource.getMCPServerViewForSystemSpace(
-        authenticator,
+        auth,
         server1.sId
       );
     expect(systemView1).not.toBeNull();
-    await MCPServerViewResource.create(authenticator, {
+    await MCPServerViewResource.create(auth, {
       systemView: systemView1!,
       space: globalSpace,
     });
@@ -156,20 +157,13 @@ describe("POST /api/w/[wId]/spaces/[spaceId]/mcp_views", () => {
   });
 
   it("emails workspace admins with affected latest active agent names when sharing globally", async () => {
-    const {
-      req,
-      res,
-      workspace,
-      user,
-      authenticator,
-      globalSpace,
-      globalGroup,
-    } = await createPrivateApiMockRequest({
-      role: "admin",
-      method: "POST",
-    });
+    const { req, res, workspace, user, auth, globalSpace, globalGroup } =
+      await createPrivateApiMockRequest({
+        role: "admin",
+        method: "POST",
+      });
 
-    await SpaceFactory.defaults(authenticator);
+    await SpaceFactory.defaults(auth);
 
     const regularSpace = await SpaceFactory.regular(workspace);
     await GroupSpaceFactory.associate(regularSpace, globalGroup);
@@ -182,56 +176,38 @@ describe("POST /api/w/[wId]/spaces/[spaceId]/mcp_views", () => {
     });
     const systemView =
       await MCPServerViewResource.getMCPServerViewForSystemSpace(
-        authenticator,
+        auth,
         server.sId
       );
 
     expect(systemView).not.toBeNull();
 
-    const { view: regularView } = await MCPServerViewResource.create(
-      authenticator,
-      {
-        systemView: systemView!,
-        space: regularSpace,
-      }
-    );
+    const { view: regularView } = await MCPServerViewResource.create(auth, {
+      systemView: systemView!,
+      space: regularSpace,
+    });
 
     const impactedAgent = await AgentConfigurationFactory.createTestAgent(
-      authenticator,
+      auth,
       {
         name: "Needs Reconfiguration",
       }
     );
-    await AgentMCPServerConfigurationFactory.create(
-      authenticator,
-      regularSpace,
-      {
-        agent: impactedAgent,
-        mcpServerView: regularView,
-      }
-    );
+    await AgentMCPServerConfigurationFactory.create(auth, regularSpace, {
+      agent: impactedAgent,
+      mcpServerView: regularView,
+    });
 
-    const staleAgent = await AgentConfigurationFactory.createTestAgent(
-      authenticator,
-      {
-        name: "Stale Agent",
-      }
-    );
-    await AgentMCPServerConfigurationFactory.create(
-      authenticator,
-      regularSpace,
-      {
-        agent: staleAgent,
-        mcpServerView: regularView,
-      }
-    );
-    await AgentConfigurationFactory.updateTestAgent(
-      authenticator,
-      staleAgent.sId,
-      {
-        name: "Stale Agent",
-      }
-    );
+    const staleAgent = await AgentConfigurationFactory.createTestAgent(auth, {
+      name: "Stale Agent",
+    });
+    await AgentMCPServerConfigurationFactory.create(auth, regularSpace, {
+      agent: staleAgent,
+      mcpServerView: regularView,
+    });
+    await AgentConfigurationFactory.updateTestAgent(auth, staleAgent.sId, {
+      name: "Stale Agent",
+    });
 
     req.query.spaceId = globalSpace.sId;
     req.body = { mcpServerId: server.sId };
@@ -260,7 +236,9 @@ describe("POST /api/w/[wId]/spaces/[spaceId]/mcp_views", () => {
       expect(message.dynamic_template_data.subject).toBe(
         "[Dust] Agents to reconfigure after sharing Notion"
       );
-      expect(message.dynamic_template_data.body).toContain(workspace.name);
+      expect(message.dynamic_template_data.body).toContain(
+        escape(workspace.name)
+      );
       expect(message.dynamic_template_data.body).toContain(
         "Needs Reconfiguration"
       );
@@ -270,13 +248,13 @@ describe("POST /api/w/[wId]/spaces/[spaceId]/mcp_views", () => {
   it("does not fail the sharing request when the notification email fails", async () => {
     vi.mocked(sgMail.send).mockRejectedValue(new Error("email failed"));
 
-    const { req, res, workspace, authenticator, globalSpace, globalGroup } =
+    const { req, res, workspace, auth, globalSpace, globalGroup } =
       await createPrivateApiMockRequest({
         role: "admin",
         method: "POST",
       });
 
-    await SpaceFactory.defaults(authenticator);
+    await SpaceFactory.defaults(auth);
 
     const regularSpace = await SpaceFactory.regular(workspace);
     await GroupSpaceFactory.associate(regularSpace, globalGroup);
@@ -286,34 +264,24 @@ describe("POST /api/w/[wId]/spaces/[spaceId]/mcp_views", () => {
     });
     const systemView =
       await MCPServerViewResource.getMCPServerViewForSystemSpace(
-        authenticator,
+        auth,
         server.sId
       );
 
     expect(systemView).not.toBeNull();
 
-    const { view: regularView } = await MCPServerViewResource.create(
-      authenticator,
-      {
-        systemView: systemView!,
-        space: regularSpace,
-      }
-    );
+    const { view: regularView } = await MCPServerViewResource.create(auth, {
+      systemView: systemView!,
+      space: regularSpace,
+    });
 
-    const agent = await AgentConfigurationFactory.createTestAgent(
-      authenticator,
-      {
-        name: "Needs Reconfiguration",
-      }
-    );
-    await AgentMCPServerConfigurationFactory.create(
-      authenticator,
-      regularSpace,
-      {
-        agent,
-        mcpServerView: regularView,
-      }
-    );
+    const agent = await AgentConfigurationFactory.createTestAgent(auth, {
+      name: "Needs Reconfiguration",
+    });
+    await AgentMCPServerConfigurationFactory.create(auth, regularSpace, {
+      agent,
+      mcpServerView: regularView,
+    });
 
     req.query.spaceId = globalSpace.sId;
     req.body = { mcpServerId: server.sId };
