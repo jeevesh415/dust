@@ -9,10 +9,13 @@ import {
   softDeleteAgentMessage,
 } from "@app/lib/api/assistant/conversation";
 import { getContentFragmentBlob } from "@app/lib/api/assistant/conversation/content_fragment";
-import { getConversation } from "@app/lib/api/assistant/conversation/fetch";
+import {
+  getConversation,
+  getLightConversation,
+} from "@app/lib/api/assistant/conversation/fetch";
 import { publishAgentMessagesEvents } from "@app/lib/api/assistant/streaming/events";
 import * as attachmentsModule from "@app/lib/api/files/attachments";
-import { fetchLatestProjectContextFileContentFragment } from "@app/lib/api/projects";
+import { fetchLatestProjectContextFileContentFragment } from "@app/lib/api/projects/context";
 import { Authenticator } from "@app/lib/auth";
 import { serializeMention } from "@app/lib/mentions/format";
 import { GlobalAgentSettingsModel } from "@app/lib/models/agent/agent";
@@ -76,6 +79,7 @@ vi.mock("@app/lib/api/assistant/conversation/content_fragment", () => ({
 }));
 
 import { ConversationBranchResource } from "@app/lib/resources/conversation_branch_resource";
+import { ConversationForkResource } from "@app/lib/resources/conversation_fork_resource";
 import { ConversationResource } from "@app/lib/resources/conversation_resource";
 import { makeSId } from "@app/lib/resources/string_ids";
 import { generateRandomModelSId } from "@app/lib/resources/string_ids_server";
@@ -2536,7 +2540,10 @@ describe("compactConversation", () => {
   });
 
   it("should create a compaction message on an idle conversation", async () => {
-    const result = await compactConversation(auth, { conversation });
+    const result = await compactConversation(auth, {
+      conversation,
+      model: { providerId: "anthropic", modelId: "claude-haiku-4-5-20251001" },
+    });
 
     expect(result.isOk()).toBe(true);
     if (result.isErr()) {
@@ -2582,6 +2589,7 @@ describe("compactConversation", () => {
 
     const result = await compactConversation(auth, {
       conversation: fetched.value,
+      model: { providerId: "anthropic", modelId: "claude-haiku-4-5-20251001" },
     });
 
     expect(result.isErr()).toBe(true);
@@ -3627,5 +3635,90 @@ describe("isConversationEventAllowedForAuth", () => {
       event,
     });
     expect(result).toBe(false);
+  });
+});
+
+describe("conversation fetch forkedFrom", () => {
+  it("includes forkedFrom in full and light conversation payloads", async () => {
+    const { authenticator: auth, workspace } = await createResourceTest({
+      role: "admin",
+    });
+    const agent = await AgentConfigurationFactory.createTestAgent(auth, {
+      name: "Fork Fetch Agent",
+      description: "Fork fetch agent",
+    });
+
+    const parentConversation = await ConversationFactory.create(auth, {
+      agentConfigurationId: agent.sId,
+      messagesCreatedAt: [new Date("2026-01-05T00:00:00.000Z")],
+    });
+    const childConversation = await ConversationFactory.create(auth, {
+      agentConfigurationId: agent.sId,
+      messagesCreatedAt: [],
+    });
+
+    const parentConversationResource = await ConversationResource.fetchById(
+      auth,
+      parentConversation.sId
+    );
+    const childConversationResource = await ConversationResource.fetchById(
+      auth,
+      childConversation.sId
+    );
+    expect(parentConversationResource).not.toBeNull();
+    expect(childConversationResource).not.toBeNull();
+    if (!parentConversationResource || !childConversationResource) {
+      throw new Error("Failed to fetch fork conversations");
+    }
+
+    const sourceMessage = await MessageModel.findOne({
+      where: {
+        conversationId: parentConversation.id,
+        workspaceId: workspace.id,
+        rank: 1,
+      },
+    });
+    expect(sourceMessage).not.toBeNull();
+    if (!sourceMessage) {
+      throw new Error("Failed to fetch source message");
+    }
+
+    const branchedAt = new Date("2026-01-06T00:00:00.000Z");
+    await ConversationForkResource.makeNew(auth, {
+      parentConversation: parentConversationResource,
+      childConversation: childConversationResource,
+      sourceMessageModelId: sourceMessage.id,
+      branchedAt,
+    });
+
+    const fullConversationResult = await getConversation(
+      auth,
+      childConversation.sId
+    );
+    expect(fullConversationResult.isOk()).toBe(true);
+
+    if (fullConversationResult.isOk()) {
+      expect(fullConversationResult.value.forkedFrom).toEqual({
+        parentConversationId: parentConversation.sId,
+        sourceMessageId: sourceMessage.sId,
+        branchedAt: branchedAt.getTime(),
+        user: auth.getNonNullableUser().toJSON(),
+      });
+    }
+
+    const lightConversationResult = await getLightConversation(
+      auth,
+      childConversation.sId
+    );
+    expect(lightConversationResult.isOk()).toBe(true);
+
+    if (lightConversationResult.isOk()) {
+      expect(lightConversationResult.value.forkedFrom).toEqual({
+        parentConversationId: parentConversation.sId,
+        sourceMessageId: sourceMessage.sId,
+        branchedAt: branchedAt.getTime(),
+        user: auth.getNonNullableUser().toJSON(),
+      });
+    }
   });
 });

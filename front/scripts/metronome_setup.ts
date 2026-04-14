@@ -14,8 +14,12 @@
 
 import { getMetronomeClient } from "@app/lib/metronome/client";
 import {
+  CREDIT_TYPE_EUR_ID,
   CREDIT_TYPE_USD_ID,
-  getCreditTypeAwuId,
+  DEV_CREDIT_TYPE_AWU_ID,
+  DEV_CREDIT_TYPE_PROG_USD_ID,
+  PROD_CREDIT_TYPE_AWU_ID,
+  PROD_CREDIT_TYPE_PROG_USD_ID,
 } from "@app/lib/metronome/constants";
 
 if (!process.env.METRONOME_API_KEY) {
@@ -28,9 +32,7 @@ const EXECUTE = process.argv.includes("--execute");
 const client = getMetronomeClient();
 
 // Detect environment by listing pricing units and checking for the AWU credit type.
-// AWU has a different ID in sandbox vs production; USD/EUR are the same.
-const SANDBOX_AWU_ID = "1ad632f0-4e5a-44d6-a1bf-aa6f6bc550d8";
-const PRODUCTION_AWU_ID = "e53a841e-b741-4bc3-8148-f377c1fb2501";
+// AWU and Programmatic USD have different IDs in sandbox vs production; USD/EUR are the same.
 
 async function detectEnvironment(): Promise<"sandbox" | "production"> {
   const creditTypeIds = new Set<string>();
@@ -39,20 +41,31 @@ async function detectEnvironment(): Promise<"sandbox" | "production"> {
       creditTypeIds.add(pu.id);
     }
   }
-  if (creditTypeIds.has(PRODUCTION_AWU_ID)) {
+  if (creditTypeIds.has(PROD_CREDIT_TYPE_AWU_ID)) {
     return "production";
   }
-  if (creditTypeIds.has(SANDBOX_AWU_ID)) {
+  if (creditTypeIds.has(DEV_CREDIT_TYPE_AWU_ID)) {
     return "sandbox";
   }
   throw new Error(
     "Cannot detect Metronome environment: AWU credit type not found. " +
-      `Expected sandbox=${SANDBOX_AWU_ID} or production=${PRODUCTION_AWU_ID}`
+      `Expected sandbox=${DEV_CREDIT_TYPE_AWU_ID} or production=${PROD_CREDIT_TYPE_AWU_ID}`
   );
 }
 
 // Resolved in main() before anything else runs.
 let ENV: "sandbox" | "production" = "sandbox";
+
+// Credit type accessors based on the script-detected ENV (not NODE_ENV).
+function getCreditTypeAwuId(): string {
+  return ENV === "sandbox" ? DEV_CREDIT_TYPE_AWU_ID : PROD_CREDIT_TYPE_AWU_ID;
+}
+
+function getCreditTypeProgrammaticUsdId(): string {
+  return ENV === "sandbox"
+    ? DEV_CREDIT_TYPE_PROG_USD_ID
+    : PROD_CREDIT_TYPE_PROG_USD_ID;
+}
 
 // ---------------------------------------------------------------------------
 // Types for desired state definitions
@@ -147,49 +160,79 @@ interface PackageDef {
 const METRICS: MetricDef[] = [
   {
     name: "LLM Provider Cost (Programmatic)",
-    event_type_filter: { in_values: ["llm_usage_v2"] },
+    event_type_filter: { in_values: ["llm_usage_v3"] },
     property_filters: [
       { name: "cost_micro_usd", exists: true },
       { name: "is_programmatic_usage", in_values: ["true"] },
+      { name: "api_key_name", exists: true },
+      { name: "model_id", exists: true },
+      { name: "origin", exists: true },
+      { name: "agent_id", exists: true },
     ],
     aggregation_type: "SUM",
     aggregation_key: "cost_micro_usd",
+    group_keys: [["api_key_name"], ["model_id"], ["origin"], ["agent_id"]],
   },
   {
     name: "LLM Provider Cost (User)",
-    event_type_filter: { in_values: ["llm_usage_v2"] },
+    event_type_filter: { in_values: ["llm_usage_v3"] },
     property_filters: [
       { name: "cost_micro_usd", exists: true },
       { name: "is_programmatic_usage", in_values: ["false"] },
+      { name: "user_id", exists: true },
+      { name: "model_id", exists: true },
+      { name: "origin", exists: true },
+      { name: "agent_id", exists: true },
     ],
     aggregation_type: "SUM",
     aggregation_key: "cost_micro_usd",
+    group_keys: [["user_id"], ["model_id"], ["origin"], ["agent_id"]],
   },
   {
     name: "Tool Invocations (Programmatic)",
-    event_type_filter: { in_values: ["tool_use_v2"] },
+    event_type_filter: { in_values: ["tool_use_v3"] },
     property_filters: [
       { name: "count", exists: true },
       { name: "is_programmatic_usage", in_values: ["true"] },
       { name: "tool_category", exists: true },
       { name: "tool_group", exists: true },
+      { name: "api_key_name", exists: true },
+      { name: "origin", exists: true },
+      { name: "agent_id", exists: true },
+      { name: "mcp_server_id", exists: true },
     ],
     aggregation_type: "SUM",
     aggregation_key: "count",
-    group_keys: [["tool_category", "tool_group"]],
+    group_keys: [
+      ["tool_category", "tool_group"],
+      ["api_key_name"],
+      ["origin"],
+      ["agent_id"],
+      ["mcp_server_id"],
+    ],
   },
   {
     name: "Tool Invocations (User)",
-    event_type_filter: { in_values: ["tool_use_v2"] },
+    event_type_filter: { in_values: ["tool_use_v3"] },
     property_filters: [
       { name: "count", exists: true },
       { name: "is_programmatic_usage", in_values: ["false"] },
       { name: "tool_category", exists: true },
       { name: "tool_group", exists: true },
+      { name: "user_id", exists: true },
+      { name: "origin", exists: true },
+      { name: "agent_id", exists: true },
+      { name: "mcp_server_id", exists: true },
     ],
     aggregation_type: "SUM",
     aggregation_key: "count",
-    group_keys: [["tool_category", "tool_group"]],
+    group_keys: [
+      ["tool_category", "tool_group"],
+      ["user_id"],
+      ["origin"],
+      ["agent_id"],
+      ["mcp_server_id"],
+    ],
   },
   {
     name: "Registered Users",
@@ -317,11 +360,17 @@ const PRODUCTS: ProductDef[] = [
 function getRateCards(): RateCardDef[] {
   return [
     {
-      name: "Legacy Pro $29",
+      name: "Legacy Pro USD",
       description:
         "Grandfathered Pro plan. $29/seat via seat subscription. AI usage 30% markup.",
       aliases: [{ name: "legacy-pro-monthly" }],
       fiat_credit_type_id: CREDIT_TYPE_USD_ID,
+      credit_type_conversions: [
+        {
+          custom_credit_type_id: getCreditTypeProgrammaticUsdId(),
+          fiat_per_custom_credit: 0.01,
+        },
+      ],
       rates: [
         {
           product_name: "Workspace Seat",
@@ -336,16 +385,23 @@ function getRateCards(): RateCardDef[] {
           starting_at: "2026-04-01T00:00:00.000Z",
           entitled: true,
           rate_type: "FLAT",
-          price: 100,
+          price: 1,
+          credit_type_id: getCreditTypeProgrammaticUsdId(),
         },
       ],
     },
     {
-      name: "Legacy Business $45",
+      name: "Legacy Business USD",
       description:
         "Grandfathered Business plan. $45/seat via seat subscription. AI usage 30% markup.",
       aliases: [{ name: "legacy-business" }],
       fiat_credit_type_id: CREDIT_TYPE_USD_ID,
+      credit_type_conversions: [
+        {
+          custom_credit_type_id: getCreditTypeProgrammaticUsdId(),
+          fiat_per_custom_credit: 0.01,
+        },
+      ],
       rates: [
         {
           product_name: "Workspace Seat",
@@ -360,16 +416,23 @@ function getRateCards(): RateCardDef[] {
           starting_at: "2026-04-01T00:00:00.000Z",
           entitled: true,
           rate_type: "FLAT",
-          price: 100,
+          price: 1,
+          credit_type_id: getCreditTypeProgrammaticUsdId(),
         },
       ],
     },
     {
-      name: "Legacy Pro $27 Annual",
+      name: "Legacy Pro Annual USD",
       description:
         "Grandfathered Pro plan (annual). $27/seat/month billed monthly. AI usage 30% markup.",
       aliases: [{ name: "legacy-pro-annual" }],
       fiat_credit_type_id: CREDIT_TYPE_USD_ID,
+      credit_type_conversions: [
+        {
+          custom_credit_type_id: getCreditTypeProgrammaticUsdId(),
+          fiat_per_custom_credit: 0.01,
+        },
+      ],
       rates: [
         {
           product_name: "Workspace Seat",
@@ -384,7 +447,8 @@ function getRateCards(): RateCardDef[] {
           starting_at: "2026-04-01T00:00:00.000Z",
           entitled: true,
           rate_type: "FLAT",
-          price: 100,
+          price: 1,
+          credit_type_id: getCreditTypeProgrammaticUsdId(),
         },
       ],
     },
@@ -393,11 +457,17 @@ function getRateCards(): RateCardDef[] {
     // on the rate card so they can be enabled per contract via overrides.
     // Programmatic usage at $1 = $1 (30% markup baked into product).
     {
-      name: "Legacy Enterprise",
+      name: "Legacy Enterprise USD",
       description:
         "Enterprise plan. Per-MAU billing + programmatic usage at cost with 30% markup.",
       aliases: [{ name: "legacy-enterprise" }],
       fiat_credit_type_id: CREDIT_TYPE_USD_ID,
+      credit_type_conversions: [
+        {
+          custom_credit_type_id: getCreditTypeProgrammaticUsdId(),
+          fiat_per_custom_credit: 0.01,
+        },
+      ],
       rates: [
         {
           product_name: "MAU Billing (1+)",
@@ -426,7 +496,156 @@ function getRateCards(): RateCardDef[] {
           starting_at: "2026-04-01T00:00:00.000Z",
           entitled: true,
           rate_type: "FLAT",
-          price: 100,
+          price: 1,
+          credit_type_id: getCreditTypeProgrammaticUsdId(),
+        },
+      ],
+    },
+    // --- EUR variants: same seat prices, billed in EUR ---
+    // For Eurozone/EEA/Switzerland customers.
+    // Programmatic usage: same product (quantity_conversion converts cost_micro_usd to units),
+    // but priced at 87 (€0.87/unit) instead of 100 ($1.00/unit) to apply the USD→EUR FX rate.
+    // EUR prices are in whole euros (not cents) — Metronome EUR pricing unit is "EUR".
+    {
+      name: "Legacy Pro EUR",
+      description:
+        "Grandfathered Pro plan (EUR). 29€/seat via seat subscription. AI usage 30% markup.",
+      aliases: [{ name: "legacy-pro-monthly-eur" }],
+      fiat_credit_type_id: CREDIT_TYPE_EUR_ID,
+      credit_type_conversions: [
+        {
+          custom_credit_type_id: getCreditTypeProgrammaticUsdId(),
+          fiat_per_custom_credit: 0.87,
+        },
+      ],
+      rates: [
+        {
+          product_name: "Workspace Seat",
+          starting_at: "2026-04-01T00:00:00.000Z",
+          entitled: true,
+          rate_type: "FLAT",
+          price: 29,
+          billing_frequency: "MONTHLY",
+          credit_type_id: CREDIT_TYPE_EUR_ID,
+        },
+        {
+          product_name: "Programmatic Usage",
+          starting_at: "2026-04-01T00:00:00.000Z",
+          entitled: true,
+          rate_type: "FLAT",
+          price: 1,
+          credit_type_id: getCreditTypeProgrammaticUsdId(),
+        },
+      ],
+    },
+    {
+      name: "Legacy Business EUR",
+      description:
+        "Grandfathered Business plan (EUR). 45€/seat via seat subscription. AI usage 30% markup.",
+      aliases: [{ name: "legacy-business-eur" }],
+      fiat_credit_type_id: CREDIT_TYPE_EUR_ID,
+      credit_type_conversions: [
+        {
+          custom_credit_type_id: getCreditTypeProgrammaticUsdId(),
+          fiat_per_custom_credit: 0.87,
+        },
+      ],
+      rates: [
+        {
+          product_name: "Workspace Seat",
+          starting_at: "2026-04-01T00:00:00.000Z",
+          entitled: true,
+          rate_type: "FLAT",
+          price: 45,
+          billing_frequency: "MONTHLY",
+          credit_type_id: CREDIT_TYPE_EUR_ID,
+        },
+        {
+          product_name: "Programmatic Usage",
+          starting_at: "2026-04-01T00:00:00.000Z",
+          entitled: true,
+          rate_type: "FLAT",
+          price: 1,
+          credit_type_id: getCreditTypeProgrammaticUsdId(),
+        },
+      ],
+    },
+    {
+      name: "Legacy Pro Annual EUR",
+      description:
+        "Grandfathered Pro plan (EUR, annual). 27€/seat/month billed monthly. AI usage 30% markup.",
+      aliases: [{ name: "legacy-pro-annual-eur" }],
+      fiat_credit_type_id: CREDIT_TYPE_EUR_ID,
+      credit_type_conversions: [
+        {
+          custom_credit_type_id: getCreditTypeProgrammaticUsdId(),
+          fiat_per_custom_credit: 0.87,
+        },
+      ],
+      rates: [
+        {
+          product_name: "Workspace Seat",
+          starting_at: "2026-04-01T00:00:00.000Z",
+          entitled: true,
+          rate_type: "FLAT",
+          price: 27,
+          billing_frequency: "MONTHLY",
+          credit_type_id: CREDIT_TYPE_EUR_ID,
+        },
+        {
+          product_name: "Programmatic Usage",
+          starting_at: "2026-04-01T00:00:00.000Z",
+          entitled: true,
+          rate_type: "FLAT",
+          price: 1,
+          credit_type_id: getCreditTypeProgrammaticUsdId(),
+        },
+      ],
+    },
+    {
+      name: "Legacy Enterprise EUR",
+      description:
+        "Enterprise plan (EUR). Per-MAU billing + programmatic usage at cost with 30% markup.",
+      aliases: [{ name: "legacy-enterprise-eur" }],
+      fiat_credit_type_id: CREDIT_TYPE_EUR_ID,
+      credit_type_conversions: [
+        {
+          custom_credit_type_id: getCreditTypeProgrammaticUsdId(),
+          fiat_per_custom_credit: 0.87,
+        },
+      ],
+      rates: [
+        {
+          product_name: "MAU Billing (1+)",
+          starting_at: "2026-04-01T00:00:00.000Z",
+          entitled: true,
+          rate_type: "FLAT",
+          price: 45,
+          credit_type_id: CREDIT_TYPE_EUR_ID,
+        },
+        {
+          product_name: "MAU Billing (5+)",
+          starting_at: "2026-04-01T00:00:00.000Z",
+          entitled: false,
+          rate_type: "FLAT",
+          price: 0,
+          credit_type_id: CREDIT_TYPE_EUR_ID,
+        },
+        {
+          product_name: "MAU Billing (10+)",
+          starting_at: "2026-04-01T00:00:00.000Z",
+          entitled: false,
+          rate_type: "FLAT",
+          price: 0,
+          credit_type_id: CREDIT_TYPE_EUR_ID,
+        },
+        {
+          product_name: "Programmatic Usage",
+          starting_at: "2026-04-01T00:00:00.000Z",
+          entitled: true,
+          rate_type: "FLAT",
+          price: 1,
+          credit_type_id: getCreditTypeProgrammaticUsdId(),
         },
       ],
     },
@@ -519,36 +738,64 @@ const BILLING_CYCLE_CONFIG = {
 // Package names are versioned (v1, v2, ...) to track pricing changes.
 // Aliases stay stable — code always references the alias, which points to the latest version.
 // Old versions are archived automatically when a new version is created with the same alias.
-// Package names and contract_name are auto-versioned at sync time (e.g., "Legacy Pro $29 v3").
+// Package names and contract_name are auto-versioned at sync time (e.g., "Legacy Pro USD v3").
 // The version is derived from existing packages in Metronome: if the current package matches,
 // keep its version; if it needs recreation, increment by 1.
 const PACKAGES: PackageDef[] = [
   {
-    name: "Legacy Pro $29",
+    name: "Legacy Pro USD",
     aliases: [{ name: "legacy-pro-monthly" }],
-    rate_card_name: "Legacy Pro $29",
+    rate_card_name: "Legacy Pro USD",
     subscriptions: [LEGACY_SEAT_SUBSCRIPTION],
     ...BILLING_CYCLE_CONFIG,
   },
   {
-    name: "Legacy Business $45",
+    name: "Legacy Business USD",
     aliases: [{ name: "legacy-business" }],
-    rate_card_name: "Legacy Business $45",
+    rate_card_name: "Legacy Business USD",
     subscriptions: [LEGACY_SEAT_SUBSCRIPTION],
     ...BILLING_CYCLE_CONFIG,
   },
   {
-    name: "Legacy Pro $27 Annual",
+    name: "Legacy Pro Annual USD",
     aliases: [{ name: "legacy-pro-annual" }],
-    rate_card_name: "Legacy Pro $27 Annual",
+    rate_card_name: "Legacy Pro Annual USD",
     subscriptions: [LEGACY_SEAT_SUBSCRIPTION],
     ...BILLING_CYCLE_CONFIG,
   },
   // Enterprise: MAU-based billing, no seat subscriptions.
   {
-    name: "Legacy Enterprise",
+    name: "Legacy Enterprise USD",
     aliases: [{ name: "legacy-enterprise" }],
-    rate_card_name: "Legacy Enterprise",
+    rate_card_name: "Legacy Enterprise USD",
+    ...BILLING_CYCLE_CONFIG,
+  },
+  // EUR variants
+  {
+    name: "Legacy Pro EUR",
+    aliases: [{ name: "legacy-pro-monthly-eur" }],
+    rate_card_name: "Legacy Pro EUR",
+    subscriptions: [LEGACY_SEAT_SUBSCRIPTION],
+    ...BILLING_CYCLE_CONFIG,
+  },
+  {
+    name: "Legacy Business EUR",
+    aliases: [{ name: "legacy-business-eur" }],
+    rate_card_name: "Legacy Business EUR",
+    subscriptions: [LEGACY_SEAT_SUBSCRIPTION],
+    ...BILLING_CYCLE_CONFIG,
+  },
+  {
+    name: "Legacy Pro Annual EUR",
+    aliases: [{ name: "legacy-pro-annual-eur" }],
+    rate_card_name: "Legacy Pro Annual EUR",
+    subscriptions: [LEGACY_SEAT_SUBSCRIPTION],
+    ...BILLING_CYCLE_CONFIG,
+  },
+  {
+    name: "Legacy Enterprise EUR",
+    aliases: [{ name: "legacy-enterprise-eur" }],
+    rate_card_name: "Legacy Enterprise EUR",
     ...BILLING_CYCLE_CONFIG,
   },
 ];
@@ -615,9 +862,11 @@ async function syncMetrics(): Promise<void> {
 
   for (const desired of METRICS) {
     const ex = byName.get(desired.name);
+    const sortGroupKeys = (keys: string[][]) =>
+      [...keys].sort((a, b) => a.join(",").localeCompare(b.join(",")));
     const groupKeysMatch =
-      JSON.stringify(ex?.group_keys ?? []) ===
-      JSON.stringify(desired.group_keys ?? []);
+      JSON.stringify(sortGroupKeys(ex?.group_keys ?? [])) ===
+      JSON.stringify(sortGroupKeys(desired.group_keys ?? []));
     const eventTypeMatch =
       JSON.stringify(ex?.event_type_filter?.in_values?.sort() ?? []) ===
       JSON.stringify([...desired.event_type_filter.in_values].sort());
@@ -886,11 +1135,18 @@ async function syncProducts(): Promise<void> {
 // Sync: Rate Cards
 // ---------------------------------------------------------------------------
 
-function rateCardMatches(ex: ExistingRateCard, desired: RateCardDef): boolean {
+async function rateCardMatches(
+  ex: ExistingRateCard,
+  desired: RateCardDef
+): Promise<boolean> {
   if (ex.description !== desired.description) {
+    console.log(`    [diff] ${ex.name}: description changed`);
     return false;
   }
   if (ex.fiat_credit_type?.id !== desired.fiat_credit_type_id) {
+    console.log(
+      `    [diff] ${ex.name}: fiat_credit_type ${ex.fiat_credit_type?.id} → ${desired.fiat_credit_type_id}`
+    );
     return false;
   }
 
@@ -898,6 +1154,9 @@ function rateCardMatches(ex: ExistingRateCard, desired: RateCardDef): boolean {
   const exAliases = (ex.aliases ?? []).map((a) => a.name).sort();
   const desiredAliases = desired.aliases.map((a) => a.name).sort();
   if (!arraysEqual(exAliases, desiredAliases)) {
+    console.log(
+      `    [diff] ${ex.name}: aliases [${exAliases}] → [${desiredAliases}]`
+    );
     return false;
   }
 
@@ -909,12 +1168,86 @@ function rateCardMatches(ex: ExistingRateCard, desired: RateCardDef): boolean {
     .map((c) => `${c.custom_credit_type_id}:${c.fiat_per_custom_credit}`)
     .sort();
   if (!arraysEqual(exConvs, desiredConvs)) {
+    console.log(
+      `    [diff] ${ex.name}: credit_type_conversions [${exConvs}] → [${desiredConvs}]`
+    );
     return false;
   }
 
   // Check if any referenced product was recreated
   if (desired.rates.some((r) => recreated.products.has(r.product_name))) {
+    const recreatedProducts = desired.rates
+      .filter((r) => recreated.products.has(r.product_name))
+      .map((r) => r.product_name);
+    console.log(
+      `    [diff] ${ex.name}: products recreated: ${recreatedProducts.join(", ")}`
+    );
     return false;
+  }
+
+  // Compare actual rates on the rate card.
+  const existingRates: Array<{
+    product_id?: string;
+    entitled?: boolean;
+    billing_frequency?: string;
+    rate?: {
+      price?: number;
+      credit_type?: { id: string };
+    };
+  }> = [];
+  for await (const rate of client.v1.contracts.rateCards.rates.list({
+    rate_card_id: ex.id,
+    at: new Date().toISOString(),
+  })) {
+    existingRates.push(rate as (typeof existingRates)[number]);
+  }
+
+  if (existingRates.length !== desired.rates.length) {
+    console.log(
+      `    [diff] ${ex.name}: rate count ${existingRates.length} → ${desired.rates.length}`
+    );
+    return false;
+  }
+
+  for (const desiredRate of desired.rates) {
+    const productId = ids.products[desiredRate.product_name];
+    const match = existingRates.find((r) => r.product_id === productId);
+    if (!match) {
+      console.log(
+        `    [diff] ${ex.name}: product ${desiredRate.product_name} (${productId}) not found in existing rates`
+      );
+      return false;
+    }
+    if (match.rate?.price !== desiredRate.price) {
+      console.log(
+        `    [diff] ${ex.name}: ${desiredRate.product_name} price ${match.rate?.price} → ${desiredRate.price}`
+      );
+      return false;
+    }
+    if (match.entitled !== desiredRate.entitled) {
+      console.log(
+        `    [diff] ${ex.name}: ${desiredRate.product_name} entitled ${match.entitled} → ${desiredRate.entitled}`
+      );
+      return false;
+    }
+    if (
+      desiredRate.credit_type_id &&
+      match.rate?.credit_type?.id !== desiredRate.credit_type_id
+    ) {
+      console.log(
+        `    [diff] ${ex.name}: ${desiredRate.product_name} credit_type ${match.rate?.credit_type?.id} → ${desiredRate.credit_type_id}`
+      );
+      return false;
+    }
+    if (
+      desiredRate.billing_frequency &&
+      match.billing_frequency !== desiredRate.billing_frequency
+    ) {
+      console.log(
+        `    [diff] ${ex.name}: ${desiredRate.product_name} billing_frequency ${match.billing_frequency} → ${desiredRate.billing_frequency}`
+      );
+      return false;
+    }
   }
 
   return true;
@@ -963,7 +1296,7 @@ async function syncRateCards(): Promise<void> {
   for (const desired of rateCards) {
     const ex = byName.get(desired.name);
 
-    if (ex && rateCardMatches(ex, desired)) {
+    if (ex && (await rateCardMatches(ex, desired))) {
       console.log(`  ✓ ${desired.name} — up to date (${ex.id})`);
       ids.rateCards[desired.name] = ex.id;
     } else {
@@ -1158,7 +1491,7 @@ async function syncPackages(): Promise<void> {
     const primaryAlias = desired.aliases[0]?.name;
     const ex = primaryAlias ? byAlias.get(primaryAlias) : undefined;
 
-    // Extract current version from existing package name (e.g., "Legacy Pro $29 v3" → 3).
+    // Extract current version from existing package name (e.g., "Legacy Pro USD v3" → 3).
     const existingVersion = ex?.name
       ? parseInt(ex.name.match(/\sv(\d+)$/)?.[1] ?? "0", 10)
       : 0;
@@ -1250,7 +1583,7 @@ async function main(): Promise<void> {
   );
 
   console.log(
-    `Credit types: USD=${CREDIT_TYPE_USD_ID}, AWU=${getCreditTypeAwuId()}`
+    `Credit types: USD=${CREDIT_TYPE_USD_ID}, AWU=${getCreditTypeAwuId()}, PROG_USD=${getCreditTypeProgrammaticUsdId()}`
   );
 
   await syncMetrics();
@@ -1293,20 +1626,6 @@ async function main(): Promise<void> {
   for (const [name, id] of Object.entries(ids.products)) {
     console.log(
       `const ${toConstName(envPrefix + "_PRODUCT", name)} = "${id}";`
-    );
-  }
-
-  console.log("\n// Rate Cards");
-  for (const [name, id] of Object.entries(ids.rateCards)) {
-    console.log(
-      `const ${toConstName(envPrefix + "_RATE_CARD", name)} = "${id}";`
-    );
-  }
-
-  console.log("\n// Packages");
-  for (const [name, id] of Object.entries(ids.packages)) {
-    console.log(
-      `const ${toConstName(envPrefix + "_PACKAGE", name)} = "${id}";`
     );
   }
 

@@ -30,12 +30,7 @@ import { getJITServers } from "@app/lib/api/assistant/jit_actions";
 import { listAttachments } from "@app/lib/api/assistant/jit_utils";
 import { isLegacyAgentConfiguration } from "@app/lib/api/assistant/legacy_agent";
 import { getCompletionDuration } from "@app/lib/api/assistant/messages";
-import {
-  createSkillKnowledgeDataWarehouseServer,
-  createSkillKnowledgeFileSystemServer,
-  getSkillDataSourceConfigurations,
-  getSkillServers,
-} from "@app/lib/api/assistant/skill_actions";
+import { getSkillServers } from "@app/lib/api/assistant/skill_actions";
 import { getLLM } from "@app/lib/api/llm";
 import type { LLMTraceContext } from "@app/lib/api/llm/traces/types";
 import {
@@ -113,12 +108,14 @@ export async function runModel(
     step,
     functionCallStepContentIds,
     durationRecorder,
+    activityTimeoutDeadlineMs,
   }: {
     runAgentData: AgentLoopExecutionData;
     runIds: string[];
     step: number;
     functionCallStepContentIds: Record<string, ModelId>;
     durationRecorder: DurationRecorder;
+    activityTimeoutDeadlineMs: number;
   }
 ): Promise<{
   actions: AgentActionsEvent["actions"];
@@ -251,30 +248,6 @@ export async function runModel(
       agentConfiguration,
       skills: enabledSkills,
     });
-
-    // Add file system / data warehouse servers if skills have attached knowledge.
-    const {
-      documentDataSourceConfigurations,
-      warehouseDataSourceConfigurations,
-    } = await getSkillDataSourceConfigurations(auth, {
-      skills: enabledSkills,
-    });
-
-    const fileSystemServer = await createSkillKnowledgeFileSystemServer(auth, {
-      dataSourceConfigurations: documentDataSourceConfigurations,
-    });
-    const dataWarehouseServer = await createSkillKnowledgeDataWarehouseServer(
-      auth,
-      {
-        dataSourceConfigurations: warehouseDataSourceConfigurations,
-      }
-    );
-    if (fileSystemServer) {
-      skillServers.push(fileSystemServer);
-    }
-    if (dataWarehouseServer) {
-      skillServers.push(dataWarehouseServer);
-    }
 
     const {
       serverToolsAndInstructions: mcpActions,
@@ -615,6 +588,7 @@ export async function runModel(
     step,
     agentConfiguration,
     model,
+    activityTimeoutDeadlineMs,
     publishAgentError,
     prompt,
     llm,
@@ -891,8 +865,8 @@ export async function runModel(
         id: -1,
         sId: generateRandomModelSId(),
         type: "mcp_configuration" as const,
-        name: a.name,
-        originalName: a.name,
+        name: "missing_action",
+        originalName: "missing_action",
         description: null,
         dataSources: null,
         tables: null,

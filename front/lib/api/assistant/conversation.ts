@@ -50,7 +50,7 @@ import {
 import { maybeUpsertFileAttachment } from "@app/lib/api/files/attachments";
 import { getRemainingKeyCapMicroUsd } from "@app/lib/api/programmatic_usage/key_cap";
 import { isProgrammaticUsage } from "@app/lib/api/programmatic_usage/tracking";
-import { fetchLatestProjectContextFileContentFragment } from "@app/lib/api/projects";
+import { fetchLatestProjectContextFileContentFragment } from "@app/lib/api/projects/context";
 import { isModelAvailable, isProviderWhitelisted } from "@app/lib/assistant";
 import { Authenticator, getFeatureFlags } from "@app/lib/auth";
 import { getSupportedModelConfig } from "@app/lib/llms/model_configurations";
@@ -138,6 +138,7 @@ import {
   isUserMention,
   toMentionType,
 } from "@app/types/assistant/mentions";
+import type { SupportedModel } from "@app/types/assistant/models/types";
 import type {
   ContentFragmentContextType,
   ContentFragmentType,
@@ -730,7 +731,7 @@ export async function postUserMessage(
       return new Err({
         status_code: 400,
         api_error: {
-          type: "invalid_request_error",
+          type: "agent_inaccessible",
           message:
             "This agent is either disabled or you don't have access to it.",
         },
@@ -1177,7 +1178,7 @@ export async function editUserMessage(
       return new Err({
         status_code: 400,
         api_error: {
-          type: "invalid_request_error",
+          type: "agent_inaccessible",
           message:
             "This agent is either disabled or you don't have access to it.",
         },
@@ -2618,7 +2619,13 @@ export async function isConversationEventAllowedForAuth(
  */
 export async function compactConversation(
   auth: Authenticator,
-  { conversation }: { conversation: ConversationType }
+  {
+    conversation,
+    model,
+  }: {
+    conversation: ConversationType;
+    model: SupportedModel;
+  }
 ): Promise<
   Result<{ compactionMessage: CompactionMessageType }, APIErrorWithStatusCode>
 > {
@@ -2738,6 +2745,7 @@ export async function compactConversation(
     conversationId: conversation.sId,
     compactionMessageId: compactionMessage.sId,
     compactionMessageVersion: compactionMessage.version,
+    model,
   });
 
   return new Ok({ compactionMessage });
@@ -2754,7 +2762,7 @@ export async function updateCompactionMessageWithContentAndFinalStatus(
     conversation: ConversationWithoutContentType;
     compactionMessage: CompactionMessageType;
     status: "succeeded" | "failed";
-    content: string;
+    content: string | null;
   }
 ): Promise<{
   completedTs: number;

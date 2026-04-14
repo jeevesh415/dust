@@ -10,6 +10,7 @@ import {
   UserConversationReadsModel,
   UserMessageModel,
 } from "@app/lib/models/agent/conversation";
+import "@app/lib/models/agent/conversation_fork";
 import { REINFORCEMENT_METADATA_KEYS } from "@app/lib/reinforced_agent/types";
 import { REINFORCED_SKILLS_METADATA_KEYS } from "@app/lib/reinforcement/types";
 import { BaseResource } from "@app/lib/resources/base_resource";
@@ -31,6 +32,7 @@ import { UserResource } from "@app/lib/resources/user_resource";
 import { withTransaction } from "@app/lib/utils/sql_utils";
 import type { LightAgentConfigurationType } from "@app/types/assistant/agent";
 import type {
+  ConversationForkedFromType,
   ConversationMCPServerViewType,
   ConversationVisibility,
   ConversationWithoutContentType,
@@ -79,6 +81,7 @@ export class ConversationResource extends BaseResource<ConversationModel> {
   // User-specific fields (populated when conversations are listed for a user).
   private userParticipation?: UserParticipation;
   private userLastReadAt: Date | null = null;
+  private forkedFromData?: ConversationForkedFromType;
 
   constructor(
     model: ModelStaticWorkspaceAware<ConversationModel>,
@@ -86,6 +89,83 @@ export class ConversationResource extends BaseResource<ConversationModel> {
     private readonly _space: SpaceResource | null
   ) {
     super(ConversationModel, blob);
+  }
+
+  private static getForkedFromInclude() {
+    return [
+      {
+        association: "forkedFrom" as const,
+        required: false,
+        attributes: ["branchedAt", "childConversationId"],
+        include: [
+          {
+            association: "parentConversation" as const,
+            required: true,
+            attributes: ["sId"],
+          },
+          {
+            association: "sourceMessage" as const,
+            required: true,
+            attributes: ["sId"],
+          },
+          {
+            association: "createdByUser" as const,
+            required: true,
+            attributes: [
+              "id",
+              "sId",
+              "createdAt",
+              "provider",
+              "username",
+              "email",
+              "firstName",
+              "lastName",
+              "imageUrl",
+              "lastLoginAt",
+            ],
+          },
+        ],
+      },
+    ];
+  }
+
+  private static getForkedFromData(
+    conversation: ConversationModel
+  ): ConversationForkedFromType | undefined {
+    const fork = conversation.forkedFrom;
+    if (!fork) {
+      return undefined;
+    }
+
+    assert(
+      fork.parentConversation,
+      "Forked conversation parent conversation must be loaded."
+    );
+    assert(
+      fork.sourceMessage,
+      "Forked conversation source message must be loaded."
+    );
+    assert(fork.createdByUser, "Forked conversation creator must be loaded.");
+
+    return {
+      parentConversationId: fork.parentConversation.sId,
+      sourceMessageId: fork.sourceMessage.sId,
+      branchedAt: fork.branchedAt.getTime(),
+      user: new UserResource(
+        UserResource.model,
+        fork.createdByUser.get()
+      ).toJSON(),
+    };
+  }
+
+  private static fromModel(
+    conversation: ConversationModel,
+    space: SpaceResource | null
+  ): ConversationResource {
+    const resource = new this(this.model, conversation.get(), space);
+    resource.forkedFromData = this.getForkedFromData(conversation);
+
+    return resource;
   }
 
   static async fetchByModelIds(
@@ -107,18 +187,28 @@ export class ConversationResource extends BaseResource<ConversationModel> {
 
     const workspace = auth.getNonNullableWorkspace();
 
+    const excludedVisibilities: ConversationVisibility[] = ["deleted"];
+    if (excludeTest) {
+      excludedVisibilities.push("test");
+    }
+
     const conversations = await this.model.findAll({
       where: {
         workspaceId: workspace.id,
         id: ids,
-        ...(excludeTest ? { visibility: { [Op.ne]: "test" } } : {}),
+        visibility: { [Op.notIn]: excludedVisibilities },
         ...(updatedAfter ? { updatedAt: { [Op.gte]: updatedAfter } } : {}),
       } as WhereOptions<ConversationModel>,
+      include: this.getForkedFromInclude(),
       transaction,
     });
 
     // Note: no permission filtering here. Callers must ensure the auth is allowed.
-    return conversations.map((c) => new this(this.model, c.get(), null));
+    return conversations.map((c) => this.fromModel(c, null));
+  }
+
+  get forkedFromInfo(): ConversationForkedFromType | undefined {
+    return this.forkedFromData;
   }
 
   get space(): SpaceResource | null {
@@ -133,7 +223,8 @@ export class ConversationResource extends BaseResource<ConversationModel> {
   static async makeNew(
     auth: Authenticator,
     blob: Omit<CreationAttributes<ConversationModel>, "workspaceId">,
-    space: SpaceResource | null
+    space: SpaceResource | null,
+    { transaction }: { transaction?: Transaction } = {}
   ): Promise<ConversationResource> {
     const workspace = auth.getNonNullableWorkspace();
 
@@ -152,15 +243,19 @@ export class ConversationResource extends BaseResource<ConversationModel> {
       );
     }
 
-    // Add spaceId to the requestedSpaceIds if it is not already part of the requestedSpaceIds.
-    if (space && !blob.requestedSpaceIds.includes(space.id)) {
-      blob.requestedSpaceIds.push(space.id);
-    }
+    const requestedSpaceIds =
+      space && !blob.requestedSpaceIds.includes(space.id)
+        ? [...blob.requestedSpaceIds, space.id]
+        : blob.requestedSpaceIds;
 
-    const conversation = await this.model.create({
-      ...blob,
-      workspaceId: workspace.id,
-    });
+    const conversation = await this.model.create(
+      {
+        ...blob,
+        requestedSpaceIds,
+        workspaceId: workspace.id,
+      },
+      { transaction }
+    );
 
     return new ConversationResource(
       ConversationResource.model,
@@ -296,6 +391,7 @@ export class ConversationResource extends BaseResource<ConversationModel> {
         ...options.where,
         workspaceId: workspace.id,
       },
+      include: this.getForkedFromInclude(),
       limit: options.limit,
       order: options.order,
     });
@@ -316,13 +412,11 @@ export class ConversationResource extends BaseResource<ConversationModel> {
     const spaceIdToSpaceMap = new Map(spaces.map((s) => [s.id, s]));
 
     if (fetchConversationOptions?.dangerouslySkipPermissionFiltering) {
-      return conversations.map(
-        (c) =>
-          new this(
-            this.model,
-            c.get(),
-            c.spaceId ? (spaceIdToSpaceMap.get(c.spaceId) ?? null) : null
-          )
+      return conversations.map((c) =>
+        this.fromModel(
+          c,
+          c.spaceId ? (spaceIdToSpaceMap.get(c.spaceId) ?? null) : null
+        )
       );
     }
 
@@ -336,13 +430,11 @@ export class ConversationResource extends BaseResource<ConversationModel> {
     const foundSpaceIds = new Set(spaces.map((s) => s.id));
     const validConversations = conversations
       .filter((c) => c.requestedSpaceIds.every((id) => foundSpaceIds.has(id)))
-      .map(
-        (c) =>
-          new this(
-            this.model,
-            c.get(),
-            c.spaceId ? (spaceIdToSpaceMap.get(c.spaceId) ?? null) : null
-          )
+      .map((c) =>
+        this.fromModel(
+          c,
+          c.spaceId ? (spaceIdToSpaceMap.get(c.spaceId) ?? null) : null
+        )
       );
 
     // Create space-to-groups mapping once for efficient permission checks.
@@ -972,6 +1064,9 @@ export class ConversationResource extends BaseResource<ConversationModel> {
       depth: conversation.depth,
       metadata: conversation.metadata,
       branchId: null,
+      ...(conversation.forkedFromInfo && {
+        forkedFrom: conversation.forkedFromInfo,
+      }),
     });
   }
 
@@ -1951,6 +2046,83 @@ export class ConversationResource extends BaseResource<ConversationModel> {
     return RunResource.fetchByDustRunId(auth, { dustRunId: lastRunId });
   }
 
+  static async resolveForkSourceMessage(
+    auth: Authenticator,
+    {
+      conversationId,
+      sourceMessageId,
+      transaction,
+    }: {
+      conversationId: ModelId;
+      sourceMessageId?: string;
+      transaction?: Transaction;
+    }
+  ): Promise<Result<MessageModel, Error>> {
+    const workspaceId = auth.getNonNullableWorkspace().id;
+    const where: WhereOptions<MessageModel> = {
+      workspaceId,
+      conversationId,
+      visibility: { [Op.ne]: "deleted" },
+      agentMessageId: { [Op.ne]: null },
+    };
+
+    if (sourceMessageId) {
+      where.sId = sourceMessageId;
+    } else {
+      where.branchId = { [Op.is]: null };
+    }
+
+    // Keep the lookup scoped to a single conversation/workspace; ordering by rank/version only
+    // applies within that slice when choosing the latest main-thread agent message.
+    const sourceMessage = await MessageModel.findOne({
+      where,
+      include: [
+        {
+          model: AgentMessageModel,
+          as: "agentMessage",
+          required: true,
+          attributes: ["status"],
+          where: {
+            status: { [Op.ne]: "created" },
+          },
+        },
+      ],
+      order: sourceMessageId
+        ? undefined
+        : [
+            ["rank", "DESC"],
+            ["version", "DESC"],
+          ],
+      transaction,
+    });
+
+    if (!sourceMessage) {
+      return new Err(
+        new Error(
+          sourceMessageId
+            ? "The source message is missing or cannot be used for forking."
+            : "The conversation has no completed agent message to fork from."
+        )
+      );
+    }
+
+    if (sourceMessage.branchId !== null) {
+      const [branch] = await ConversationBranchResource.fetchByModelIds(auth, [
+        sourceMessage.branchId,
+      ]);
+
+      if (!branch || !branch.canRead(auth)) {
+        return new Err(
+          new Error(
+            "The source message is missing or cannot be used for forking."
+          )
+        );
+      }
+    }
+
+    return new Ok(sourceMessage);
+  }
+
   static async getMessageByIdInConversation(
     auth: Authenticator,
     conversation: ConversationWithoutContentType,
@@ -2243,10 +2415,12 @@ export class ConversationResource extends BaseResource<ConversationModel> {
       enabled,
       source,
       agentConfigurationId,
+      transaction,
     }: {
       conversation: ConversationWithoutContentType;
       mcpServerViews: MCPServerViewResource[];
       enabled: boolean;
+      transaction?: Transaction;
     } & (
       | { source: "agent_enabled"; agentConfigurationId: string }
       | { source: "conversation"; agentConfigurationId: null }
@@ -2276,6 +2450,7 @@ export class ConversationResource extends BaseResource<ConversationModel> {
           conversationId: conversation.id,
           agentConfigurationId: agentConfigurationId ?? null,
         },
+        transaction,
       });
 
     // Cycle through the mcpServerViewIds and create or update the conversationMCPServerView
@@ -2298,18 +2473,22 @@ export class ConversationResource extends BaseResource<ConversationModel> {
               workspaceId: auth.getNonNullableWorkspace().id,
               conversationId: conversation.id,
             },
+            transaction,
           }
         );
       } else {
-        await ConversationMCPServerViewModel.create({
-          conversationId: conversation.id,
-          workspaceId: auth.getNonNullableWorkspace().id,
-          mcpServerViewId: mcpServerView.id,
-          userId: auth.getNonNullableUser().id,
-          enabled,
-          source,
-          agentConfigurationId,
-        });
+        await ConversationMCPServerViewModel.create(
+          {
+            conversationId: conversation.id,
+            workspaceId: auth.getNonNullableWorkspace().id,
+            mcpServerViewId: mcpServerView.id,
+            userId: auth.getNonNullableUser().id,
+            enabled,
+            source,
+            agentConfigurationId,
+          },
+          { transaction }
+        );
       }
     }
 
@@ -2690,6 +2869,7 @@ export class ConversationResource extends BaseResource<ConversationModel> {
       depth: this.depth,
       metadata: this.metadata,
       branchId: null,
+      ...(this.forkedFromInfo && { forkedFrom: this.forkedFromInfo }),
     };
   }
 }
