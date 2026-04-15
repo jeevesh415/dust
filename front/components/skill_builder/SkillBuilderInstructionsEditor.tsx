@@ -1,6 +1,7 @@
 import { editorVariants } from "@app/components/editor/editorStyles";
 import { KNOWLEDGE_NODE_TYPE } from "@app/components/editor/extensions/skill_builder/KnowledgeNode";
 import type { KnowledgeItem } from "@app/components/editor/extensions/skill_builder/KnowledgeNodeView";
+import { stripHtmlAttributes } from "@app/components/editor/input_bar/cleanupPastedHTML";
 import {
   SkillInstructionsEditorContent,
   useSkillInstructionsEditor,
@@ -8,6 +9,11 @@ import {
 import { SKILL_BUILDER_INSTRUCTIONS_BLUR_EVENT } from "@app/components/skill_builder/events";
 import type { SkillBuilderFormData } from "@app/components/skill_builder/SkillBuilderFormContext";
 import { useSkillVersionComparisonContext } from "@app/components/skill_builder/SkillBuilderVersionContext";
+import { useFeatureFlags } from "@app/lib/auth/AuthContext";
+import {
+  postProcessMarkdown,
+  preprocessMarkdownForEditor,
+} from "@app/lib/editor/skill_instructions_preprocessing";
 import { cn } from "@dust-tt/sparkle";
 import type { Transaction } from "@tiptap/pm/state";
 import type { Editor } from "@tiptap/react";
@@ -16,6 +22,7 @@ import { useCallback, useEffect, useMemo } from "react";
 import { useController, useFormContext } from "react-hook-form";
 
 const INSTRUCTIONS_FIELD_NAME = "instructions";
+const INSTRUCTIONS_HTML_FIELD_NAME = "instructionsHtml";
 const ATTACHED_KNOWLEDGE_FIELD_NAME = "attachedKnowledge";
 
 function collectKnowledgeItems(editor: Editor): KnowledgeItem[] {
@@ -51,11 +58,20 @@ export function SkillBuilderInstructionsEditor({
 }: SkillBuilderInstructionsEditorProps) {
   const { compareVersion, isDiffMode } = useSkillVersionComparisonContext();
   const { setValue } = useFormContext<SkillBuilderFormData>();
+  const { hasFeature } = useFeatureFlags();
+  const useHtmlInstructions = hasFeature("skill_builder_instructions_html");
 
   const { field: instructionsField, fieldState: instructionsFieldState } =
     useController<SkillBuilderFormData, typeof INSTRUCTIONS_FIELD_NAME>({
       name: INSTRUCTIONS_FIELD_NAME,
     });
+
+  const { field: instructionsHtmlField } = useController<
+    SkillBuilderFormData,
+    typeof INSTRUCTIONS_HTML_FIELD_NAME
+  >({
+    name: INSTRUCTIONS_HTML_FIELD_NAME,
+  });
 
   const { fieldState: attachedKnowledgeFieldState } = useController<
     SkillBuilderFormData,
@@ -71,9 +87,18 @@ export function SkillBuilderInstructionsEditor({
     () =>
       debounce((editor: Editor) => {
         if (!isDiffMode && !editor.isDestroyed) {
-          setValue(INSTRUCTIONS_FIELD_NAME, editor.getMarkdown().trim(), {
-            shouldDirty: true,
-          });
+          setValue(
+            INSTRUCTIONS_FIELD_NAME,
+            postProcessMarkdown(editor.getMarkdown()).trim(),
+            { shouldDirty: true }
+          );
+          if (useHtmlInstructions) {
+            setValue(
+              INSTRUCTIONS_HTML_FIELD_NAME,
+              stripHtmlAttributes(editor.getHTML()),
+              { shouldDirty: true }
+            );
+          }
           setValue(
             ATTACHED_KNOWLEDGE_FIELD_NAME,
             toAttachedKnowledge(collectKnowledgeItems(editor)),
@@ -81,7 +106,7 @@ export function SkillBuilderInstructionsEditor({
           );
         }
       }, 250),
-    [isDiffMode, setValue]
+    [isDiffMode, setValue, useHtmlInstructions]
   );
 
   const handleUpdate = useCallback(
@@ -112,6 +137,11 @@ export function SkillBuilderInstructionsEditor({
 
   const { editor } = useSkillInstructionsEditor({
     content: instructionsField.value ?? "",
+    htmlContent:
+      useHtmlInstructions && instructionsHtmlField.value
+        ? instructionsHtmlField.value
+        : undefined,
+    withDocumentExtensions: useHtmlInstructions,
     isReadOnly: false,
     onUpdate: handleUpdate,
     onBlur: handleBlur,
@@ -182,7 +212,12 @@ export function SkillBuilderInstructionsEditor({
 
   // Sync external changes to the editor content
   useEffect(() => {
-    if (!editor || instructionsField.value === undefined) {
+    if (
+      !editor ||
+      (useHtmlInstructions
+        ? !instructionsHtmlField.value
+        : instructionsField.value === undefined)
+    ) {
       return;
     }
 
@@ -195,16 +230,33 @@ export function SkillBuilderInstructionsEditor({
     ) {
       return;
     }
-    const currentContent = editor.getMarkdown();
-    if (currentContent !== instructionsField.value) {
-      setTimeout(() => {
-        editor.commands.setContent(instructionsField.value, {
-          emitUpdate: false,
-          contentType: "markdown",
-        });
-      }, 0);
+
+    if (useHtmlInstructions) {
+      const incomingHtml = instructionsHtmlField.value;
+      const currentHtml = stripHtmlAttributes(editor.getHTML());
+      if (currentHtml !== incomingHtml) {
+        setTimeout(() => {
+          editor.commands.setContent(incomingHtml, { emitUpdate: false });
+        }, 0);
+      }
+    } else {
+      const incomingMarkdown = instructionsField.value;
+      const currentContent = postProcessMarkdown(editor.getMarkdown());
+      if (currentContent !== incomingMarkdown) {
+        setTimeout(() => {
+          editor.commands.setContent(
+            preprocessMarkdownForEditor(incomingMarkdown),
+            { emitUpdate: false, contentType: "markdown" }
+          );
+        }, 0);
+      }
     }
-  }, [editor, instructionsField.value]);
+  }, [
+    editor,
+    instructionsField.value,
+    instructionsHtmlField.value,
+    useHtmlInstructions,
+  ]);
 
   useEffect(() => {
     if (!editor) {
@@ -219,11 +271,14 @@ export function SkillBuilderInstructionsEditor({
       const compareText = compareVersion.instructions ?? "";
       const currentText = instructionsField.value ?? "";
 
-      editor.commands.setContent(currentText, {
+      editor.commands.setContent(preprocessMarkdownForEditor(currentText), {
         emitUpdate: false,
         contentType: "markdown",
       });
-      editor.commands.applyDiff(compareText, currentText);
+      editor.commands.applyDiff(
+        preprocessMarkdownForEditor(compareText),
+        preprocessMarkdownForEditor(currentText)
+      );
       editor.setEditable(false);
     } else if (editor.storage.agentInstructionDiff?.isDiffMode) {
       editor.commands.exitDiff();

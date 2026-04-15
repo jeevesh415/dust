@@ -1,16 +1,33 @@
+import { unescape } from "html-escaper";
+
 const ZWS = "\u200B";
 
 /**
- * Prepare markdown for conversion to HTML or for loading into the TipTap editor.
- *
- * Inserts a zero-width space after every `<` that is not already ZWS-prefixed.
- * This prevents marked (used by TipTap's MarkdownManager and the browser editor)
- * from treating XML-like tags (e.g. <instructions>) as raw HTML tokens and dropping them.
+ * Escape emphasis delimiters (_ and *) inside $$ ... $$ math blocks so
+ * marked.js does not parse them as italic/bold markers.
  */
-export function preprocessMarkdown(markdown: string): string {
-  return markdown.replace(new RegExp(`<(?!${ZWS})`, "g"), `<${ZWS}`);
+function escapeMathEmphasis(markdown: string): string {
+  return markdown.replace(/\$\$([\s\S]*?)\$\$/g, (block) =>
+    block.replace(/(?<!\\)_/g, "\\_").replace(/(?<!\\)\*/g, "\\*")
+  );
 }
 
+/**
+ * Preprocess markdown before loading it into the TipTap editor.
+ */
+export function preprocessMarkdownForEditor(markdown: string): string {
+  return escapeMathEmphasis(
+    markdown.replace(/<(?!\/?knowledge[\s>/])(\/?\w)/g, `<${ZWS}$1`)
+  );
+}
+
+/**
+ * Normalize markdown serialized out of the TipTap editor before saving.
+ */
 export function postProcessMarkdown(markdown: string): string {
-  return markdown.replace(new RegExp(ZWS, "g"), "");
+  return unescape(markdown)
+    .replace(new RegExp(ZWS, "g"), "")
+    .replace(/\$\$([\s\S]*?)\$\$/g, (block) =>
+      block.replace(/\\_/g, "_").replace(/\\\*/g, "*")
+    );
 }

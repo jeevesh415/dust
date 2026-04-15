@@ -20,11 +20,13 @@ import {
   convertLightMessageTypeToVirtuosoMessages,
   getPredicateForRankAndBranch,
   isAgentMessageWithStreaming,
+  isCompactionMessage,
   isUserMessage,
   makeInitialMessageStreamState,
 } from "@app/components/assistant/conversation/types";
 import {
   useConversation,
+  useConversationContextUsage,
   useConversationFeedbacks,
   useConversationMarkAsRead,
   useConversationMessages,
@@ -39,9 +41,13 @@ import { useSubmitMessage } from "@app/hooks/useSubmitMessage";
 import { getLightAgentMessageFromAgentMessage } from "@app/lib/api/assistant/citations";
 import type { AgentMessageFeedbackType } from "@app/lib/api/assistant/feedback";
 import type { ConversationEvents } from "@app/lib/api/assistant/streaming/types";
+import { useFeatureFlags } from "@app/lib/auth/AuthContext";
 import { getUpdatedParticipantsFromEvent } from "@app/lib/client/conversation/event_handlers";
 import type { DustError } from "@app/lib/error";
-import { AgentMessageCompletedEvent } from "@app/lib/notifications/events";
+import {
+  AgentMessageCompletedEvent,
+  CompactionCompletedEvent,
+} from "@app/lib/notifications/events";
 import { useSpaceInfo } from "@app/lib/swr/spaces";
 import logger from "@app/logger/logger";
 import {
@@ -169,6 +175,8 @@ export const ConversationViewer = ({
       VirtuosoMessageListMethods<VirtuosoMessage, VirtuosoMessageListContext>
     >(null);
   const sendNotification = useSendNotification();
+  const { hasFeature } = useFeatureFlags();
+  const isCompactionEnabled = hasFeature("enable_compaction");
 
   const { mutateConversationAttachments } = useConversationAttachments({
     conversationId,
@@ -239,6 +247,11 @@ export const ConversationViewer = ({
     conversationId,
     workspaceId: owner.sId,
     options: { disabled: true }, // We don't need the participants, only the mutator.
+  });
+
+  const { mutateContextUsage } = useConversationContextUsage({
+    conversationId: isCompactionEnabled ? conversationId : null,
+    workspaceId: owner.sId,
   });
 
   const submitMessage = useSubmitMessage({
@@ -547,6 +560,9 @@ export const ConversationViewer = ({
             // Debounce the call as we might receive multiple events for the same conversation (as we replay the events).
             void debouncedMarkAsRead(event.conversationId);
 
+            // Re-fetch context usage after the agent finishes so the indicator is up-to-date.
+            void mutateContextUsage();
+
             // Update the conversation hasError state in the local cache without making a network request.
             void mutateConversations(
               (currentData: ConversationWithoutContentType[] | undefined) =>
@@ -562,8 +578,36 @@ export const ConversationViewer = ({
             void mutateConversationAttachments();
             break;
           case "compaction_message_new":
+            if (ref.current) {
+              const compactionMessage = event.message;
+              const predicate = getPredicateForRankAndBranch(compactionMessage);
+              const exists = ref.current.data.find(predicate);
+
+              if (!exists) {
+                const currentData = ref.current.data.get();
+                const offset = getBranchedInsertIndex(
+                  currentData,
+                  compactionMessage
+                );
+                if (offset < currentData.length) {
+                  ref.current.data.insert([compactionMessage], offset);
+                } else {
+                  ref.current.data.append([compactionMessage]);
+                }
+              }
+            }
+            break;
+
           case "compaction_message_done":
-            // TODO(compaction): handle compaction events in the UI.
+            if (ref.current) {
+              const doneMessage = event.message;
+              ref.current.data.map((m) =>
+                isCompactionMessage(m) && m.sId === event.messageId
+                  ? doneMessage
+                  : m
+              );
+            }
+            window.dispatchEvent(new CompactionCompletedEvent());
             break;
           default:
             ((t: never) => {
@@ -575,6 +619,7 @@ export const ConversationViewer = ({
     [
       conversationId,
       debouncedMarkAsRead,
+      mutateContextUsage,
       mutateConversation,
       mutateConversationAttachments,
       mutateConversationParticipants,
@@ -835,6 +880,10 @@ export const ConversationViewer = ({
     ? (spaceInfo?.isMember ?? false) // Default false while loading (restrictive)
     : undefined;
 
+  const onConversationBranched = useCallback(() => {
+    void mutateConversations();
+  }, [mutateConversations]);
+
   // After reversal in the hook, messages[0] is the oldest page. This only
   // returns the actual first conversation message when all pages are loaded
   // (works for onboarding conversations which are short / single-page).
@@ -848,6 +897,7 @@ export const ConversationViewer = ({
     return {
       user,
       owner,
+      onConversationBranched,
       handleSubmit,
       conversation,
       isOnboardingConversation,
@@ -858,6 +908,7 @@ export const ConversationViewer = ({
       additionalMarkdownPlugins,
       isProjectMember,
       isProjectRestricted: spaceInfo?.isRestricted,
+      isProjectArchived: !!spaceInfo?.archivedAt,
       projectId: conversation?.spaceId ?? undefined,
       projectSpaceName: spaceInfo?.name,
       branchIdToApprove: branchIdToApprove ?? undefined,
@@ -866,6 +917,7 @@ export const ConversationViewer = ({
   }, [
     user,
     owner,
+    onConversationBranched,
     handleSubmit,
     conversation,
     isOnboardingConversation,
@@ -876,6 +928,7 @@ export const ConversationViewer = ({
     additionalMarkdownPlugins,
     isProjectMember,
     spaceInfo?.isRestricted,
+    spaceInfo?.archivedAt,
     spaceInfo?.name,
     branchIdToApprove,
   ]);

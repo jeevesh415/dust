@@ -25,10 +25,9 @@ export class ProjectTodoFactory {
       markedAsDoneByType: null,
       markedAsDoneByUserId: null,
       markedAsDoneByAgentConfigurationId: null,
-      category: params.category ?? "follow_ups",
+      category: params.category ?? "to_do",
       text: params.text ?? "A test todo item.",
       status: "todo",
-      version: 1,
       doneAt: null,
       actorRationale: null,
     });

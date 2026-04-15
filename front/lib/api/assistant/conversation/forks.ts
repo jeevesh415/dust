@@ -5,6 +5,7 @@ import { DustError } from "@app/lib/error";
 import { ConversationForkResource } from "@app/lib/resources/conversation_fork_resource";
 import { ConversationResource } from "@app/lib/resources/conversation_resource";
 import { MCPServerViewResource } from "@app/lib/resources/mcp_server_view_resource";
+import { SkillResource } from "@app/lib/resources/skill/skill_resource";
 import { generateRandomModelSId } from "@app/lib/resources/string_ids_server";
 import { getConversationRoute } from "@app/lib/utils/router";
 import { withTransaction } from "@app/lib/utils/sql_utils";
@@ -43,7 +44,8 @@ function escapeMarkdownLinkText(text: string): string {
 
 function getForkInitializationMessageContent(
   workspaceId: string,
-  parentConversation: ConversationWithoutContentType
+  parentConversation: ConversationWithoutContentType,
+  sourceMessageId: string
 ): string {
   const parentConversationTitle = escapeMarkdownLinkText(
     parentConversation.title ?? UNTITLED_CONVERSATION_TITLE
@@ -53,7 +55,7 @@ function getForkInitializationMessageContent(
     parentConversation.sId
   );
 
-  return `The conversation was forked from [${parentConversationTitle}](${parentConversationUrl}).`;
+  return `The conversation was forked from [${parentConversationTitle}](${parentConversationUrl}). Source message: ${sourceMessageId}.`;
 }
 
 async function copyConversationMCPServerViews(
@@ -108,7 +110,7 @@ async function copyConversationMCPServerViews(
   return new Ok(undefined);
 }
 
-async function createForkInitializationMessage(
+async function copyConversationSkills(
   auth: Authenticator,
   {
     parentConversation,
@@ -117,6 +119,50 @@ async function createForkInitializationMessage(
   }: {
     parentConversation: ConversationWithoutContentType;
     childConversation: ConversationWithoutContentType;
+    transaction: Transaction;
+  }
+): Promise<Result<undefined, DustError<CreateConversationForkErrorCode>>> {
+  const parentSkills = await SkillResource.listEnabledByConversation(auth, {
+    conversation: parentConversation,
+  });
+
+  if (parentSkills.length === 0) {
+    return new Ok(undefined);
+  }
+
+  const upsertResult = await SkillResource.upsertConversationSkills(
+    auth,
+    {
+      conversationId: childConversation.id,
+      skills: parentSkills,
+      enabled: true,
+    },
+    { transaction }
+  );
+
+  if (upsertResult.isErr()) {
+    return new Err(
+      new DustError(
+        "internal_error",
+        "Failed to copy conversation skills into the forked conversation."
+      )
+    );
+  }
+
+  return new Ok(undefined);
+}
+
+async function createForkInitializationMessage(
+  auth: Authenticator,
+  {
+    parentConversation,
+    childConversation,
+    sourceMessageId,
+    transaction,
+  }: {
+    parentConversation: ConversationWithoutContentType;
+    childConversation: ConversationWithoutContentType;
+    sourceMessageId: string;
     transaction: Transaction;
   }
 ) {
@@ -128,7 +174,8 @@ async function createForkInitializationMessage(
     conversation: childConversation,
     content: getForkInitializationMessageContent(
       auth.getNonNullableWorkspace().sId,
-      parentConversation
+      parentConversation,
+      sourceMessageId
     ),
     metadata: {
       type: "create",
@@ -217,9 +264,20 @@ export async function createConversationFork(
       return copyMCPServerViewsResult;
     }
 
+    const copySkillsResult = await copyConversationSkills(auth, {
+      parentConversation: parentConversation.toJSON(),
+      childConversation: childConversation.toJSON(),
+      transaction,
+    });
+
+    if (copySkillsResult.isErr()) {
+      return copySkillsResult;
+    }
+
     await createForkInitializationMessage(auth, {
       parentConversation: parentConversation.toJSON(),
       childConversation: childConversation.toJSON(),
+      sourceMessageId: sourceMessage.value.sId,
       transaction,
     });
 

@@ -343,6 +343,7 @@ const USER_MESSAGE_ORIGINS = [
   "agent_sidekick",
   "project_kickoff",
   "reinforced_agent_notification",
+  "reinforced_skill_notification",
   "reinforcement",
 ] as const;
 
@@ -722,6 +723,7 @@ const WhitelistableFeaturesSchema = FlexibleEnumSchema<
   | "openai_usage_mcp"
   | "power_bi_mcp"
   | "reinforced_agents"
+  | "reinforcement_ui"
   | "metronome_billing"
   | "poke_mcp"
   | "restrict_agents_publishing"
@@ -731,6 +733,7 @@ const WhitelistableFeaturesSchema = FlexibleEnumSchema<
   | "sandbox_tools"
   | "self_created_slack_app_connector_rollout"
   | "show_debug_tools"
+  | "skill_builder_instructions_html"
   | "slack_bot_mcp"
   | "slack_enhanced_default_agent"
   | "slack_message_splitting"
@@ -743,6 +746,7 @@ const WhitelistableFeaturesSchema = FlexibleEnumSchema<
   | "anthropic_reasoning_token_count"
   | "collapsible_messages"
   | "use_dust_keys"
+  | "enable_compaction"
   | "enable_steering"
 >();
 
@@ -1358,6 +1362,8 @@ const ToolExecutionMetadataSchema = z.object({
     mcpServerDisplayName: z.string().optional(),
     mcpServerId: z.string().optional(),
   }),
+  argumentsRequiringApproval: z.array(z.string()).optional(),
+  approvalArgsLabel: z.string().optional(),
 });
 
 const BlockedActionExecutionSchema = ToolExecutionMetadataSchema.extend({
@@ -1651,6 +1657,7 @@ const APIErrorTypeSchema = FlexibleEnumSchema<
   | "action_failed"
   | "action_unknown_error"
   | "agent_configuration_not_found"
+  | "agent_inaccessible"
   | "agent_message_error"
   | "app_auth_error"
   | "app_not_found"

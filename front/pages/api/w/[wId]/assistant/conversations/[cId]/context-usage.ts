@@ -46,13 +46,13 @@ async function handler(
         });
       }
 
-      const run = await conversation.getLatestCompletedAgentMessageRun(auth);
+      const run = await conversation.getLatestAgentMessageRun(auth);
       if (!run) {
         return apiError(req, res, {
           status_code: 404,
           api_error: {
             type: "conversation_context_usage_not_found",
-            message: "No completed agent message found in this conversation.",
+            message: "Latest agent message has no run data.",
           },
         });
       }
@@ -68,19 +68,19 @@ async function handler(
         });
       }
 
-      // Take the max promptTokens across usages of the last run — in a multi-step agent loop,
-      // each step sees all previous steps' outputs, so the last step's promptTokens is the full
-      // context size as seen by the model.
-      const lastUsage = usages[usages.length - 1];
-      const contextUsage = Math.max(...usages.map((u) => u.promptTokens));
-      const modelConfig = getModelConfigByModelId(lastUsage.modelId);
+      // Take the max promptTokens across usages of the latest run — this represents the peak
+      // context usage as seen by the model.
+      const maxUsage = usages.reduce((max, u) =>
+        u.promptTokens > max.promptTokens ? u : max
+      );
+      const modelConfig = getModelConfigByModelId(maxUsage.modelId);
 
       return res.status(200).json({
         model: {
-          providerId: lastUsage.providerId,
-          modelId: lastUsage.modelId,
+          providerId: maxUsage.providerId,
+          modelId: maxUsage.modelId,
         },
-        contextUsage,
+        contextUsage: maxUsage.promptTokens,
         contextSize: modelConfig?.contextSize ?? 0,
       });
     }

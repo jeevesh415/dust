@@ -22,6 +22,12 @@ export const interceptors: WorkflowInterceptorsFactory = () => ({
   internals: [new OpenTelemetryInternalsInterceptor()],
 });
 
+const { ensureReinforcementWorkspaceCronsActivity } = proxyActivities<
+  typeof activities
+>({
+  startToCloseTimeout: "10 minutes",
+});
+
 const { getReinforcementSettingsActivity } = proxyActivities<typeof activities>(
   {
     startToCloseTimeout: "5 minutes",
@@ -89,10 +95,9 @@ const MAX_REINFORCED_ANALYSIS_STEPS = 4;
 const CONVERSATION_ANALYSIS_CONCURRENCY = 4;
 const SKILL_AGGREGATION_CONCURRENCY = 8;
 
-const BATCH_POLL_INTERVAL_MIN_MS = 30_000; // 30 seconds (linear backoff start).
-const BATCH_POLL_INTERVAL_MAX_MS = 5 * 60_000; // 5 minutes (linear backoff cap).
-const BATCH_POLL_INTERVAL_STEP_MS = 10_000; // 10 seconds (linear backoff step).
-const BATCH_TIMEOUT_MS = 6 * 60 * 60_000; // 6 hours.
+const BATCH_POLL_INTERVAL_MIN_MS = 30_000; // 30 seconds (exponential backoff start).
+const BATCH_POLL_INTERVAL_MAX_MS = 30 * 60_000; // 30 minutes (exponential backoff cap).
+const BATCH_TIMEOUT_MS = 24 * 60 * 60_000 + 5 * 60_000; // 24 hours + 5 minutes (to guarantee we wait longer than Anthropic's batch limit).
 
 const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
 
@@ -111,8 +116,8 @@ function computeWorkspaceDelayMs(workspaceId: string): number {
 
 /**
  * Wait for a batch to complete.
- * Polls with linear backoff starting at 30 seconds, adding 10 seconds each time, capped at 5 minutes.
- * Throws a non-retryable error after 6 hours.
+ * Polls with exponential backoff starting at 30 seconds, doubling each time, capped at 30 minutes.
+ * Throws a non-retryable error after 24 hours.
  */
 async function waitForBatch({
   workspaceId,
@@ -127,10 +132,7 @@ async function waitForBatch({
   while (elapsedMs < BATCH_TIMEOUT_MS) {
     await sleep(intervalMs);
     elapsedMs += intervalMs;
-    intervalMs = Math.min(
-      intervalMs + BATCH_POLL_INTERVAL_STEP_MS,
-      BATCH_POLL_INTERVAL_MAX_MS
-    );
+    intervalMs = Math.min(intervalMs * 2, BATCH_POLL_INTERVAL_MAX_MS);
 
     const status = await checkBatchStatusActivity({ workspaceId, batchId });
     if (status === "ready") {
@@ -139,7 +141,7 @@ async function waitForBatch({
   }
 
   throw new ApplicationFailure(
-    `Batch ${batchId} in workspace ${workspaceId} timed out after 6 hours.`,
+    `Batch ${batchId} in workspace ${workspaceId} timed out after 24 hours.`,
     "BATCH_TIMEOUT",
     true // non-retryable
   );
@@ -274,6 +276,14 @@ async function aggregateSkillWithMultiStepBatch({
 }
 
 /**
+ * Cron workflow that ensures all flagged workspaces have a running
+ * reinforcement cron and stops crons for workspaces that lost the flag.
+ */
+export async function ensureReinforcementWorkspaceCronsWorkflow(): Promise<void> {
+  await ensureReinforcementWorkspaceCronsActivity();
+}
+
+/**
  * Workspace-level workflow (one per workspace, cron-scheduled).
  * When `skipDelay` is false (cron runs), sleeps a deterministic delay derived
  * from the workspace ID to spread load across the midnight-2am window.
@@ -288,7 +298,7 @@ async function aggregateSkillWithMultiStepBatch({
  * 6. Aggregate per-skill concurrently via multi-step loop
  * 7. Finalize per skill
  */
-export async function reinforcedSkillsWorkspaceWorkflow({
+export async function reinforcementWorkspaceWorkflow({
   workspaceId,
   useBatchMode,
   skipDelay = false,

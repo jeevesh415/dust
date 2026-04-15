@@ -4,7 +4,7 @@ import type { Result } from "@app/types/shared/result";
 import { Err, Ok } from "@app/types/shared/result";
 import { normalizeError } from "@app/types/shared/utils/error_utils";
 import Metronome, { ConflictError } from "@metronome/sdk";
-
+import type { ContractV2 } from "@metronome/sdk/resources";
 import type {
   MetronomeBalance,
   MetronomeEvent,
@@ -31,6 +31,11 @@ const DAY_MS = 24 * HOUR_MS;
 
 export function floorToHourISO(date: Date): string {
   return new Date(Math.floor(date.getTime() / HOUR_MS) * HOUR_MS).toISOString();
+}
+
+/** Convert an epoch-seconds timestamp (e.g. from Stripe) to an hour-floored ISO string. */
+export function epochSecondsToFloorHourISO(epochSeconds: number): string {
+  return floorToHourISO(new Date(epochSeconds * 1000));
 }
 
 export function ceilToHourISO(date: Date): string {
@@ -177,6 +182,88 @@ export async function findMetronomeCustomerByAlias(
       { error, workspaceId },
       "[Metronome] Failed to find customer by alias"
     );
+    return new Err(error);
+  }
+}
+
+/**
+ * Add Stripe billing configuration from the Metronome customer to the contract
+ * Idempotent: if Stripe billing is already configured, logs and returns Ok.
+ */
+export async function addStripeMetronomeBillingConfig({
+  metronomeCustomerId,
+  metronomeContractId,
+}: {
+  metronomeCustomerId: string;
+  metronomeContractId: string;
+}): Promise<Result<void, Error>> {
+  let configs;
+
+  try {
+    configs =
+      await getMetronomeClient().v1.customers.retrieveBillingConfigurations({
+        customer_id: metronomeCustomerId,
+      });
+  } catch (err) {
+    const error = normalizeError(err);
+    logger.error(
+      { error, metronomeCustomerId },
+      "[Metronome] Failed to retrieve billing configurations"
+    );
+    return new Err(error);
+  }
+
+  const stripeConfig = configs.data.find(
+    (c) => c.billing_provider === "stripe" && !c.archived_at
+  );
+  if (!stripeConfig) {
+    return new Err(
+      new Error(
+        `No active Stripe billing configuration found for Metronome customer ${metronomeCustomerId}`
+      )
+    );
+  }
+
+  try {
+    await getMetronomeClient().v2.contracts.edit({
+      customer_id: metronomeCustomerId,
+      contract_id: metronomeContractId,
+      add_billing_provider_configuration_update: {
+        billing_provider_configuration: {
+          billing_provider_configuration_id: stripeConfig.id,
+        },
+        schedule: {
+          effective_at: "START_OF_CURRENT_PERIOD",
+        },
+      },
+    });
+
+    logger.info(
+      {
+        metronomeCustomerId,
+        metronomeContractId,
+        billingProviderConfigurationId: stripeConfig.id,
+      },
+      "[Metronome] Stripe billing provider linked to contract"
+    );
+
+    return new Ok(undefined);
+  } catch (err) {
+    if (err instanceof ConflictError) {
+      logger.info(
+        { metronomeCustomerId, metronomeContractId },
+        "[Metronome] Contract billing provider already configured, skipping"
+      );
+
+      return new Ok(undefined);
+    }
+
+    const error = normalizeError(err);
+    logger.error(
+      { error, metronomeCustomerId, metronomeContractId },
+      "[Metronome] Failed to link Stripe billing provider to contract"
+    );
+
     return new Err(error);
   }
 }
@@ -365,12 +452,14 @@ export async function getMetronomeContractPackageAliases({
   metronomeContractId: string;
 }): Promise<Result<string[], Error>> {
   try {
-    const contractResponse = await getMetronomeClient().v1.contracts.retrieve({
+    const contractResponse = await getMetronomeClient().v2.contracts.retrieve({
       customer_id: metronomeCustomerId,
       contract_id: metronomeContractId,
     });
 
-    const packageId = contractResponse.data.package_id;
+    const packageId = (
+      contractResponse.data as ContractV2 & { package_id: string } // package_id is missing in ContractV2 but is actually returned
+    ).package_id;
     if (!packageId) {
       return new Ok([]);
     }
@@ -406,12 +495,14 @@ export async function updateSubscriptionQuantity({
   subscriptionId,
   quantity,
   startingAt,
+  uniquenessKey,
 }: {
   metronomeCustomerId: string;
   contractId: string;
   subscriptionId: string;
   quantity: number;
   startingAt?: string;
+  uniquenessKey?: string;
 }): Promise<Result<void, Error>> {
   const now = startingAt ?? floorToHourISO(new Date());
 
@@ -419,6 +510,7 @@ export async function updateSubscriptionQuantity({
     await getMetronomeClient().v2.contracts.edit({
       customer_id: metronomeCustomerId,
       contract_id: contractId,
+      ...(uniquenessKey ? { uniqueness_key: uniquenessKey } : {}),
       update_subscriptions: [
         {
           subscription_id: subscriptionId,

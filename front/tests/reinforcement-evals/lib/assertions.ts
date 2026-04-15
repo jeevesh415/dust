@@ -1,3 +1,4 @@
+import { DESCRIBE_MCP_TOOL_NAME } from "@app/lib/reinforcement/types";
 import type {
   ToolCall,
   ToolCallAssertion,
@@ -148,6 +149,31 @@ export function validateToolCallAssertion(
             error: `Expected no suggestions, but edit_skill was called with ${instructionEdits.length} instructionEdit(s) and ${toolEdits.length} toolEdit(s)`,
           };
         }
+      }
+      return { success: true };
+    }
+    case "editSkillCallCount": {
+      const actual = toolCalls.filter((tc) => tc.name === "edit_skill").length;
+      if (actual !== assertion.count) {
+        return {
+          success: false,
+          error: `Expected exactly ${assertion.count} edit_skill call(s), but got ${actual}`,
+        };
+      }
+      return { success: true };
+    }
+    case "calledDescribeMcp": {
+      const called = toolCalls.some(
+        (tc) =>
+          tc.name === DESCRIBE_MCP_TOOL_NAME &&
+          isString(tc.arguments["mcpId"]) &&
+          tc.arguments["mcpId"] === assertion.mcpId
+      );
+      if (!called) {
+        return {
+          success: false,
+          error: `Expected ${DESCRIBE_MCP_TOOL_NAME} to be called with mcpId "${assertion.mcpId}", but it was not`,
+        };
       }
       return { success: true };
     }

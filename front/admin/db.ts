@@ -103,6 +103,7 @@ import {
   ProjectTodoConversationModel,
   ProjectTodoModel,
   ProjectTodoSourceModel,
+  ProjectTodoVersionModel,
 } from "@app/lib/resources/storage/models/project_todo";
 import { ProjectTodoStateModel } from "@app/lib/resources/storage/models/project_todo_state";
 import { ProjectTodoTakeawaySourcesModel } from "@app/lib/resources/storage/models/project_todo_takeaway_sources";
@@ -115,6 +116,7 @@ import { SpaceModel } from "@app/lib/resources/storage/models/spaces";
 import {
   TakeawaySourcesModel,
   TakeawaysModel,
+  TakeawaysVersionModel,
 } from "@app/lib/resources/storage/models/takeaways";
 import { TemplateModel } from "@app/lib/resources/storage/models/templates";
 import {
@@ -122,7 +124,6 @@ import {
   UserModel,
   UserToolApprovalModel,
 } from "@app/lib/resources/storage/models/user";
-import { UserProjectDigestModel } from "@app/lib/resources/storage/models/user_project_digest";
 import { WorkspaceModel } from "@app/lib/resources/storage/models/workspace";
 import { WorkspaceHasDomainModel } from "@app/lib/resources/storage/models/workspace_has_domain";
 import { WorkspaceVerificationAttemptModel } from "@app/lib/resources/storage/models/workspace_verification_attempt";
@@ -226,7 +227,6 @@ export function loadAllModels() {
     SkillSuggestionModel,
     WorkspaceVerificationAttemptModel,
     AgentSuggestionModel,
-    UserProjectDigestModel,
     AcademyQuizAttemptModel,
     AcademyChapterVisitModel,
     SandboxModel,
@@ -236,8 +236,10 @@ export function loadAllModels() {
     ProjectTodoConversationModel,
     ProjectTodoSourceModel,
     ProjectTodoStateModel,
+    ProjectTodoVersionModel,
     TakeawaysModel,
     TakeawaySourcesModel,
+    TakeawaysVersionModel,
     ProjectTodoTakeawaySourcesModel,
   ];
 }

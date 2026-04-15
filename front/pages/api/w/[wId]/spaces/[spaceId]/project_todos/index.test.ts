@@ -45,7 +45,7 @@ describe("GET /api/w/[wId]/spaces/[spaceId]/project_todos", () => {
       text: "First todo",
     });
     // Create a new version of the same todo.
-    await todo.createVersion(auth, { text: "Updated todo" });
+    await todo.updateWithVersion(auth, { text: "Updated todo" });
 
     req.query.spaceId = project.sId;
     await handler(req, res);
@@ -108,16 +108,15 @@ describe("POST /api/w/[wId]/spaces/[spaceId]/project_todos", () => {
     const { user } = await setup();
     const project = await SpaceFactory.project(workspace, user.id);
     req.query.spaceId = project.sId;
-    req.body = { category: "follow_ups", text: "New todo item" };
+    req.body = { category: "to_do", text: "New todo item" };
 
     await handler(req, res);
 
     expect(res._getStatusCode()).toBe(201);
     const { todo } = res._getJSONData();
     expect(todo.text).toBe("New todo item");
-    expect(todo.category).toBe("follow_ups");
+    expect(todo.category).toBe("to_do");
     expect(todo.status).toBe("todo");
-    expect(todo.version).toBe(1);
     expect(typeof todo.sId).toBe("string");
   });
 
@@ -139,7 +138,7 @@ describe("POST /api/w/[wId]/spaces/[spaceId]/project_todos", () => {
     }
 
     req.query.spaceId = project.sId;
-    req.body = { category: "key_decisions", text: "User1 todo" };
+    req.body = { category: "to_know", text: "User1 todo" };
     await handler(req, res);
     expect(res._getStatusCode()).toBe(201);
   });

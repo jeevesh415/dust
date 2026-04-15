@@ -2,8 +2,10 @@ export { useAgentMessageSkills } from "./useAgentMessageSkills";
 export { useAgentMessageTools } from "./useAgentMessageTools";
 export { useBranchConversation } from "./useBranchConversation";
 export { useCancelMessage } from "./useCancelMessage";
+export { useCompactConversation } from "./useCompactConversation";
 export { useConversation } from "./useConversation";
 export { useConversationBranchActions } from "./useConversationBranchActions";
+export { useConversationContextUsage } from "./useConversationContextUsage";
 export { useConversationFeedbacks } from "./useConversationFeedbacks";
 export { useConversationMarkAsRead } from "./useConversationMarkAsRead";
 export {

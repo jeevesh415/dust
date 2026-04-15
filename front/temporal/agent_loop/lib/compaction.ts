@@ -5,6 +5,7 @@ import { getConversation } from "@app/lib/api/assistant/conversation/fetch";
 import { renderConversationAsText } from "@app/lib/api/assistant/conversation/render_as_text";
 import { PREVIOUS_INTERACTIONS_TO_PRESERVE } from "@app/lib/api/assistant/conversation_rendering";
 import { publishConversationEvent } from "@app/lib/api/assistant/streaming/events";
+import { isProviderWhitelisted } from "@app/lib/assistant";
 import type { Authenticator } from "@app/lib/auth";
 import logger from "@app/logger/logger";
 import type {
@@ -118,6 +119,14 @@ export async function runCompaction(
     return new Err(new Error("Compaction message not found"));
   }
 
+  if (!isProviderWhitelisted(auth, model.providerId)) {
+    return new Err(
+      new Error(
+        `The model provider ${model.providerId} has been disabled by your workspace admin.`
+      )
+    );
+  }
+
   const summaryRes = await generateCompactionSummary(auth, {
     conversation,
     model,
@@ -129,7 +138,15 @@ export async function runCompaction(
   if (summaryRes.isOk()) {
     content = summaryRes.value;
     status = "succeeded";
+
+    logger.info(
+      { workspaceId: owner.sId, conversationId, compactionMessageId, status },
+      "Compaction generation succeeded"
+    );
   } else {
+    content = null;
+    status = "failed";
+
     logger.error(
       {
         workspaceId: owner.sId,
@@ -139,8 +156,6 @@ export async function runCompaction(
       },
       "Compaction generation failed"
     );
-    content = null;
-    status = "failed";
   }
 
   const result = await updateCompactionMessageWithContentAndFinalStatus(auth, {
@@ -161,11 +176,6 @@ export async function runCompaction(
       message: compactionMessage,
     },
     { conversationId }
-  );
-
-  logger.info(
-    { workspaceId: owner.sId, conversationId, compactionMessageId, status },
-    "Compaction completed"
   );
 
   return new Ok(undefined);
@@ -193,6 +203,7 @@ async function generateCompactionSummary(
   // that the current conversation is not exceeding it already.
   // TODO(compaction): We may want to be more mechanical about files available to the model in
   // conversation and projects by including a lsit as part of the summary.
+  // TODO(compaction: We may want to add retries around the LLM call
 
   const conv: ModelConversationTypeMultiActions = {
     messages: [

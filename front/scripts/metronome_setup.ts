@@ -296,19 +296,19 @@ const PRODUCTS: ProductDef[] = [
     name: "Workspace Seat",
     type: "SUBSCRIPTION",
   },
-  // MAU products — USAGE on MAX gauge, billed once at end of period.
-  {
-    name: "Workspace MAU 1",
-    type: "SUBSCRIPTION",
-  },
-  {
-    name: "Workspace MAU 5",
-    type: "SUBSCRIPTION",
-  },
-  {
-    name: "Workspace MAU 10",
-    type: "SUBSCRIPTION",
-  },
+  // MAU product — single subscription for simple (non-tiered) enterprise contracts.
+  // Used when no MAU_TIERS custom field is set on the contract.
+  { name: "MAU", type: "SUBSCRIPTION" },
+  // MAU tier products — one per pricing tier for enterprise contracts with graduated pricing.
+  // Enabled per-contract via overrides. Quantity managed by syncMauCount based on MAU_TIERS custom field.
+  { name: "MAU Tier 1", type: "SUBSCRIPTION" },
+  { name: "MAU Tier 2", type: "SUBSCRIPTION" },
+  { name: "MAU Tier 3", type: "SUBSCRIPTION" },
+  { name: "MAU Tier 4", type: "SUBSCRIPTION" },
+  { name: "MAU Tier 5", type: "SUBSCRIPTION" },
+  { name: "MAU Tier 6", type: "SUBSCRIPTION" },
+  // MAU Commit — appears as a line item on invoices for the monthly minimum charge.
+  { name: "MAU Commit", type: "FIXED" },
   // FIXED products for credit grants — separate products for distinct invoice line items.
   {
     name: "Free Monthly Credits",
@@ -324,7 +324,31 @@ const PRODUCTS: ProductDef[] = [
   },
 ];
 
-// Function — evaluated after detectEnvironment() resolves ENV.
+// MAU tier rate definitions for enterprise rate cards.
+// Not entitled by default — enabled per contract via overrides with per-tier pricing.
+const MAU_TIER_PRODUCT_NAMES = [
+  "MAU Tier 1",
+  "MAU Tier 2",
+  "MAU Tier 3",
+  "MAU Tier 4",
+  "MAU Tier 5",
+  "MAU Tier 6",
+] as const;
+
+function buildMauTierRates(creditTypeId: string): RateDef[] {
+  return MAU_TIER_PRODUCT_NAMES.map(
+    (name): RateDef => ({
+      product_name: name,
+      starting_at: "2026-04-01T00:00:00.000Z",
+      entitled: false,
+      rate_type: "FLAT",
+      billing_frequency: "MONTHLY",
+      price: 0,
+      credit_type_id: creditTypeId,
+    })
+  );
+}
+
 // Function — evaluated after detectEnvironment() resolves ENV (needed for AWU credit type).
 function getRateCards(): RateCardDef[] {
   return [
@@ -352,7 +376,7 @@ function getRateCards(): RateCardDef[] {
         {
           product_name: "Programmatic Usage",
           starting_at: "2026-04-01T00:00:00.000Z",
-          entitled: true,
+          entitled: false,
           rate_type: "FLAT",
           price: 1,
           credit_type_id: getCreditTypeProgrammaticUsdId(),
@@ -383,7 +407,7 @@ function getRateCards(): RateCardDef[] {
         {
           product_name: "Programmatic Usage",
           starting_at: "2026-04-01T00:00:00.000Z",
-          entitled: true,
+          entitled: false,
           rate_type: "FLAT",
           price: 1,
           credit_type_id: getCreditTypeProgrammaticUsdId(),
@@ -414,7 +438,7 @@ function getRateCards(): RateCardDef[] {
         {
           product_name: "Programmatic Usage",
           starting_at: "2026-04-01T00:00:00.000Z",
-          entitled: true,
+          entitled: false,
           rate_type: "FLAT",
           price: 1,
           credit_type_id: getCreditTypeProgrammaticUsdId(),
@@ -439,38 +463,22 @@ function getRateCards(): RateCardDef[] {
       ],
       rates: [
         {
-          product_name: "Workspace MAU 1",
+          product_name: "MAU",
           starting_at: "2026-04-01T00:00:00.000Z",
           entitled: true,
           rate_type: "FLAT",
           billing_frequency: "MONTHLY",
           price: 4500,
         },
-        // MAU-5 and MAU-10 not entitled by default — enabled per contract via overrides.
-        {
-          product_name: "Workspace MAU 5",
-          starting_at: "2026-04-01T00:00:00.000Z",
-          entitled: false,
-          rate_type: "FLAT",
-          billing_frequency: "MONTHLY",
-          price: 0,
-        },
-        {
-          product_name: "Workspace MAU 10",
-          starting_at: "2026-04-01T00:00:00.000Z",
-          entitled: false,
-          rate_type: "FLAT",
-          billing_frequency: "MONTHLY",
-          price: 0,
-        },
         {
           product_name: "Programmatic Usage",
           starting_at: "2026-04-01T00:00:00.000Z",
-          entitled: true,
+          entitled: false,
           rate_type: "FLAT",
           price: 1,
           credit_type_id: getCreditTypeProgrammaticUsdId(),
         },
+        ...buildMauTierRates(CREDIT_TYPE_USD_ID),
       ],
     },
     // --- EUR variants: same seat prices, billed in EUR ---
@@ -503,7 +511,7 @@ function getRateCards(): RateCardDef[] {
         {
           product_name: "Programmatic Usage",
           starting_at: "2026-04-01T00:00:00.000Z",
-          entitled: true,
+          entitled: false,
           rate_type: "FLAT",
           price: 1,
           credit_type_id: getCreditTypeProgrammaticUsdId(),
@@ -535,7 +543,7 @@ function getRateCards(): RateCardDef[] {
         {
           product_name: "Programmatic Usage",
           starting_at: "2026-04-01T00:00:00.000Z",
-          entitled: true,
+          entitled: false,
           rate_type: "FLAT",
           price: 1,
           credit_type_id: getCreditTypeProgrammaticUsdId(),
@@ -567,7 +575,7 @@ function getRateCards(): RateCardDef[] {
         {
           product_name: "Programmatic Usage",
           starting_at: "2026-04-01T00:00:00.000Z",
-          entitled: true,
+          entitled: false,
           rate_type: "FLAT",
           price: 1,
           credit_type_id: getCreditTypeProgrammaticUsdId(),
@@ -588,7 +596,7 @@ function getRateCards(): RateCardDef[] {
       ],
       rates: [
         {
-          product_name: "Workspace MAU 1",
+          product_name: "MAU",
           starting_at: "2026-04-01T00:00:00.000Z",
           entitled: true,
           rate_type: "FLAT",
@@ -597,31 +605,14 @@ function getRateCards(): RateCardDef[] {
           credit_type_id: CREDIT_TYPE_EUR_ID,
         },
         {
-          product_name: "Workspace MAU 5",
-          starting_at: "2026-04-01T00:00:00.000Z",
-          entitled: false,
-          rate_type: "FLAT",
-          billing_frequency: "MONTHLY",
-          price: 0,
-          credit_type_id: CREDIT_TYPE_EUR_ID,
-        },
-        {
-          product_name: "Workspace MAU 10",
-          starting_at: "2026-04-01T00:00:00.000Z",
-          entitled: false,
-          rate_type: "FLAT",
-          billing_frequency: "MONTHLY",
-          price: 0,
-          credit_type_id: CREDIT_TYPE_EUR_ID,
-        },
-        {
           product_name: "Programmatic Usage",
           starting_at: "2026-04-01T00:00:00.000Z",
-          entitled: true,
+          entitled: false,
           rate_type: "FLAT",
           price: 1,
           credit_type_id: getCreditTypeProgrammaticUsdId(),
         },
+        ...buildMauTierRates(CREDIT_TYPE_EUR_ID),
       ],
     },
     // --- Example: New Business plan with AWU-based usage pricing ---
@@ -742,7 +733,7 @@ const PACKAGES: PackageDef[] = [
   {
     name: "Legacy Enterprise USD",
     aliases: [{ name: "legacy-enterprise" }],
-    rate_card_name: "Legacy Enterprise USD",
+    rate_card_name: "Legacy Enterprise MAU USD",
     ...BILLING_CYCLE_CONFIG,
   },
   // EUR variants
@@ -770,7 +761,7 @@ const PACKAGES: PackageDef[] = [
   {
     name: "Legacy Enterprise EUR",
     aliases: [{ name: "legacy-enterprise-eur" }],
-    rate_card_name: "Legacy Enterprise EUR",
+    rate_card_name: "Legacy Enterprise MAU EUR",
     ...BILLING_CYCLE_CONFIG,
   },
 ];
@@ -1369,6 +1360,12 @@ function packageMatches(ex: ExistingPackage, desired: PackageDef): boolean {
     return false;
   }
 
+  // Check rate card ID matches the expected one.
+  const expectedRateCardId = ids.rateCards[desired.rate_card_name];
+  if (expectedRateCardId && ex.rate_card_id !== expectedRateCardId) {
+    return false;
+  }
+
   // Check subscriptions count
   const desiredSubs = desired.subscriptions ?? [];
   const existingSubs = ex.subscriptions ?? [];
@@ -1551,6 +1548,47 @@ async function syncPackages(): Promise<void> {
 // Main
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Sync: Custom Fields
+// ---------------------------------------------------------------------------
+
+const CUSTOM_FIELD_KEYS: Array<{
+  entity: "contract";
+  key: string;
+}> = [
+  { entity: "contract", key: "MAU_TIERS" },
+  { entity: "contract", key: "MAU_THRESHOLD" },
+];
+
+async function syncCustomFields(): Promise<void> {
+  console.log("\n=== Syncing Custom Fields ===");
+
+  // List existing keys for contract entity.
+  const existingKeys = new Set<string>();
+  for await (const entry of client.v1.customFields.listKeys({
+    entities: ["contract"],
+  })) {
+    existingKeys.add(entry.key);
+  }
+
+  for (const field of CUSTOM_FIELD_KEYS) {
+    if (existingKeys.has(field.key)) {
+      console.log(`  ✓ ${field.entity}.${field.key} — already exists`);
+    } else {
+      console.log(
+        `  + ${EXECUTE ? "Creating" : "[DRYRUN] Would create"}: ${field.entity}.${field.key}`
+      );
+      if (EXECUTE) {
+        await client.v1.customFields.addKey({
+          entity: field.entity,
+          key: field.key,
+          enforce_uniqueness: false,
+        });
+      }
+    }
+  }
+}
+
 async function main(): Promise<void> {
   ENV = await detectEnvironment();
   console.log(
@@ -1565,6 +1603,7 @@ async function main(): Promise<void> {
   await syncProducts();
   await syncRateCards();
   await syncPackages();
+  await syncCustomFields();
 
   if (!EXECUTE) {
     console.log("\n✓ Dry-run complete. Pass --execute to apply changes.");

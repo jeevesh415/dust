@@ -6,16 +6,14 @@ import { AgentMessageActions } from "@app/components/assistant/conversation/acti
 import { InlineActivitySteps } from "@app/components/assistant/conversation/actions/inline/InlineActivitySteps";
 import { AttachmentCitation } from "@app/components/assistant/conversation/attachment/AttachmentCitation";
 import { markdownCitationToAttachmentCitation } from "@app/components/assistant/conversation/attachment/utils";
+import { BlockedAction } from "@app/components/assistant/conversation/BlockedAction";
 import { useBlockedActionsContext } from "@app/components/assistant/conversation/BlockedActionsProvider";
 import { DeletedMessage } from "@app/components/assistant/conversation/DeletedMessage";
 import { ErrorMessage } from "@app/components/assistant/conversation/ErrorMessage";
 import type { FeedbackSelectorBaseProps } from "@app/components/assistant/conversation/FeedbackSelector";
 import { FeedbackSelector } from "@app/components/assistant/conversation/FeedbackSelector";
 import { useGenerationContext } from "@app/components/assistant/conversation/GenerationContextProvider";
-import { GoogleDriveFileAuthorizationRequired } from "@app/components/assistant/conversation/GoogleDriveFileAuthorizationRequired";
 import { useAutoOpenInteractiveContent } from "@app/components/assistant/conversation/interactive_content/useAutoOpenInteractiveContent";
-import { MCPServerPersonalAuthenticationRequired } from "@app/components/assistant/conversation/MCPServerPersonalAuthenticationRequired";
-import { MCPToolValidationRequired } from "@app/components/assistant/conversation/MCPToolValidationRequired";
 import type {
   AgentMessageStateWithControlEvent,
   AgentMessageWithStreaming,
@@ -28,7 +26,6 @@ import {
   isUserMessage,
   makeInitialMessageStreamState,
 } from "@app/components/assistant/conversation/types";
-import { UserAnswerRequired } from "@app/components/assistant/conversation/UserAnswerRequired";
 import { ConfirmContext } from "@app/components/Confirm";
 import {
   CitationsContext,
@@ -42,6 +39,7 @@ import {
   sanitizeVisualizationContent,
 } from "@app/components/markdown/VisualizationBlock";
 import {
+  useBranchConversation,
   useCancelMessage,
   usePostOnboardingFollowUp,
 } from "@app/hooks/conversations";
@@ -85,6 +83,7 @@ import type {
 } from "@app/types/user";
 import type { DropdownMenuItemProps, StreamingState } from "@dust-tt/sparkle";
 import {
+  ActionGitBranchIcon,
   ArrowPathIcon,
   Button,
   ButtonGroup,
@@ -174,6 +173,7 @@ interface AgentMessageProps {
   user: UserType;
   triggeringUser: UserType | null;
   isOnboardingConversation: boolean;
+  onConversationBranched?: () => Promise<void> | void;
   onCompletionStatusClick?: (messageId: string, actionId?: string) => void;
   handleSubmit: (
     input: string,
@@ -182,6 +182,7 @@ interface AgentMessageProps {
   ) => Promise<Result<undefined, DustError>>;
   additionalMarkdownComponents?: Components;
   additionalMarkdownPlugins?: PluggableList;
+  isProjectArchived?: boolean;
 }
 
 export function AgentMessage({
@@ -194,10 +195,12 @@ export function AgentMessage({
   user,
   triggeringUser,
   isOnboardingConversation,
+  onConversationBranched,
   onCompletionStatusClick,
   handleSubmit,
   additionalMarkdownComponents,
   additionalMarkdownPlugins,
+  isProjectArchived = false,
 }: AgentMessageProps) {
   const sId = agentMessage.sId;
   const [streamId, setStreamId] = useState<string>(`message-${sId}`);
@@ -273,6 +276,7 @@ export function AgentMessage({
                 userId: eventPayload.data.userId,
                 argumentsRequiringApproval:
                   eventPayload.data.argumentsRequiringApproval,
+                approvalArgsLabel: eventPayload.data.approvalArgsLabel,
               },
             });
             break;
@@ -576,7 +580,10 @@ export function AgentMessage({
       : null;
 
   const canDeleteAgentMessage =
-    !isDeleted && agentMessage.status !== "created" && isTriggeredByCurrentUser;
+    !isDeleted &&
+    agentMessage.status !== "created" &&
+    isTriggeredByCurrentUser &&
+    !isProjectArchived;
 
   const handleDeleteAgentMessage = useCallback(async () => {
     if (isDeleted || !canDeleteAgentMessage || isDeleting) {
@@ -626,7 +633,11 @@ export function AgentMessage({
     agentMessage.status !== "created" &&
     agentMessage.status !== "failed" &&
     !shouldStream &&
-    !isAgentMessageHandingOver;
+    !isAgentMessageHandingOver &&
+    !isProjectArchived;
+
+  const canBranchConversation =
+    hasFeature("sessions_branching") && shouldShowCopy;
 
   const shouldShowFeedback =
     !isDeleted &&
@@ -639,6 +650,11 @@ export function AgentMessage({
         isGlobalAgentWithFeedback(agentMessage.configuration.sId)));
 
   const retryMessage = useRetryMessage({ owner });
+  const { branchConversation, isBranching } = useBranchConversation({
+    owner,
+    conversationId,
+    onConversationBranched,
+  });
 
   const retryHandler = useCallback(
     async ({
@@ -721,7 +737,10 @@ export function AgentMessage({
   }
 
   // Add copy button or split button with dropdown (hover only)
-  if (shouldShowCopy && (shouldShowRetry || canDeleteAgentMessage)) {
+  if (
+    shouldShowCopy &&
+    (canBranchConversation || shouldShowRetry || canDeleteAgentMessage)
+  ) {
     const dropdownItems: DropdownMenuItemProps[] = [
       {
         label: "Copy message link",
@@ -729,6 +748,17 @@ export function AgentMessage({
         onSelect: handleCopyMessageLink,
       },
     ];
+
+    if (canBranchConversation) {
+      dropdownItems.push({
+        label: "Branch conversation",
+        icon: ActionGitBranchIcon,
+        onSelect: () => {
+          void branchConversation(agentMessage.sId);
+        },
+        disabled: isBranching,
+      });
+    }
 
     if (shouldShowRetry) {
       dropdownItems.push({
@@ -1184,65 +1214,19 @@ function AgentMessageContent({
     isLastMessage,
   });
 
-  if (blockedAction) {
-    switch (blockedAction.status) {
-      case "blocked_validation_required":
-        return (
-          <MCPToolValidationRequired
-            triggeringUser={triggeringUser}
-            owner={owner}
-            blockedAction={blockedAction}
-            conversationId={conversationId}
-            messageId={sId}
-          />
-        );
+  const blockedActionElement = blockedAction ? (
+    <BlockedAction
+      blockedAction={blockedAction}
+      triggeringUser={triggeringUser}
+      owner={owner}
+      conversationId={conversationId}
+      messageId={sId}
+      retryHandler={retryHandlerWithResetState}
+    />
+  ) : null;
 
-      case "blocked_authentication_required":
-        return (
-          <MCPServerPersonalAuthenticationRequired
-            blockedAction={blockedAction}
-            triggeringUser={triggeringUser}
-            owner={owner}
-            mcpServerId={blockedAction.metadata.mcpServerId}
-            provider={blockedAction.authorizationInfo.provider}
-            scope={blockedAction.authorizationInfo.scope}
-            retryHandler={() =>
-              retryHandlerWithResetState({
-                conversationId: blockedAction.conversationId,
-                messageId: blockedAction.messageId,
-              })
-            }
-          />
-        );
-
-      case "blocked_file_authorization_required":
-        return (
-          <GoogleDriveFileAuthorizationRequired
-            blockedAction={blockedAction}
-            triggeringUser={triggeringUser}
-            owner={owner}
-            fileAuthorizationInfo={blockedAction.fileAuthorizationInfo}
-            mcpServerId={blockedAction.metadata.mcpServerId}
-            retryHandler={() =>
-              retryHandlerWithResetState({
-                conversationId: blockedAction.conversationId,
-                messageId: blockedAction.messageId,
-              })
-            }
-          />
-        );
-
-      case "blocked_user_answer_required":
-        return (
-          <UserAnswerRequired
-            blockedAction={blockedAction}
-            triggeringUser={triggeringUser}
-            owner={owner}
-            conversationId={conversationId}
-            messageId={sId}
-          />
-        );
-    }
+  if (blockedActionElement && !isInlineActivityEnabled) {
+    return blockedActionElement;
   }
 
   if (agentMessage.status === "created" && !!streamError) {
@@ -1340,6 +1324,7 @@ function AgentMessageContent({
             owner={owner}
           />
         )}
+        {blockedActionElement}
         <AgentMessageInteractiveContentGeneratedFiles
           files={interactiveFiles}
         />

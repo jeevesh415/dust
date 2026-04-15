@@ -95,10 +95,6 @@ import {
   launchAgentLoopWorkflow,
   launchCompactionWorkflow,
 } from "@app/temporal/agent_loop/client";
-import {
-  launchOrSignalProjectTodoWorkflow,
-  signalProjectTodoComplete,
-} from "@app/temporal/project_todo/client";
 import type {
   ContentFragmentInputWithContentNode,
   ContentFragmentInputWithFileIdType,
@@ -473,6 +469,32 @@ async function getConversationRankVersionLock(
   );
 }
 
+async function getNextConversationMessageRank(
+  auth: Authenticator,
+  {
+    conversation,
+    transaction,
+  }: {
+    conversation: ConversationWithoutContentType;
+    transaction: Transaction;
+  }
+): Promise<number> {
+  const owner = auth.getNonNullableWorkspace();
+
+  return (
+    ((await MessageModel.max<number | null, MessageModel>("rank", {
+      where: {
+        workspaceId: owner.id,
+        conversationId: conversation.id,
+        branchId: conversation.branchId
+          ? getResourceIdFromSId(conversation.branchId)
+          : null,
+      },
+      transaction,
+    })) ?? -1) + 1
+  );
+}
+
 export function isUserMessageContextValid(
   auth: Authenticator,
   req: NextApiRequest,
@@ -522,6 +544,7 @@ export function isUserMessageContextValid(
     case "agent_sidekick":
     case "project_kickoff":
     case "reinforced_agent_notification":
+    case "reinforced_skill_notification":
     case "reinforcement":
     case "web":
       return false;
@@ -849,17 +872,10 @@ export async function postUserMessage(
       );
     }
 
-    nextMessageRank ??=
-      ((await MessageModel.max<number | null, MessageModel>("rank", {
-        where: {
-          workspaceId: owner.id,
-          conversationId: conversation.id,
-          branchId: conversation.branchId
-            ? getResourceIdFromSId(conversation.branchId)
-            : null,
-        },
-        transaction: t,
-      })) ?? -1) + 1;
+    nextMessageRank ??= await getNextConversationMessageRank(auth, {
+      conversation,
+      transaction: t,
+    });
 
     // Enrich context with auth data for analytics tracking.
     const enrichedContext: UserMessageContext = {
@@ -1057,23 +1073,6 @@ export async function postUserMessage(
         })
       : Promise.resolve(undefined),
   ]);
-
-  if (isPartOfProject) {
-    const projectTodoParams = {
-      authType: auth.toJSON(),
-      spaceId: conversation.spaceId,
-      conversationId: conversation.sId,
-      messageId: userMessage.sId,
-    };
-
-    if (featureFlags.includes("project_todo")) {
-      void launchOrSignalProjectTodoWorkflow(projectTodoParams);
-
-      if (agentMessages.length === 0) {
-        void signalProjectTodoComplete(projectTodoParams);
-      }
-    }
-  }
 
   return new Ok({
     userMessage,
@@ -1286,17 +1285,10 @@ export async function editUserMessage(
 
         // Only create agent messages if there are no agent messages after the edited user message
         if (!hasAgentMessagesAfter) {
-          const nextMessageRank =
-            ((await MessageModel.max<number | null, MessageModel>("rank", {
-              where: {
-                workspaceId: owner.id,
-                conversationId: conversation.id,
-                branchId: conversation.branchId
-                  ? getResourceIdFromSId(conversation.branchId)
-                  : null,
-              },
-              transaction: t,
-            })) ?? -1) + 1;
+          const nextMessageRank = await getNextConversationMessageRank(auth, {
+            conversation,
+            transaction: t,
+          });
 
           const {
             agentMessages: newAgentMessages,
@@ -1390,24 +1382,6 @@ export async function editUserMessage(
     },
     agentMessages
   );
-
-  const featureFlags = await getFeatureFlags(auth);
-  if (isProjectConversation(conversation)) {
-    const projectTodoParams = {
-      authType: auth.toJSON(),
-      spaceId: conversation.spaceId,
-      conversationId: conversation.sId,
-      messageId: userMessage.sId,
-    };
-
-    if (featureFlags.includes("project_todo")) {
-      void launchOrSignalProjectTodoWorkflow(projectTodoParams);
-
-      if (agentMessages.length === 0) {
-        void signalProjectTodoComplete(projectTodoParams);
-      }
-    }
-  }
 
   return new Ok({
     userMessage,
@@ -1889,20 +1863,6 @@ export async function retryAgentMessage(
     startStep: 0,
   });
 
-  const featureFlags = await getFeatureFlags(auth);
-  if (isProjectConversation(conversation)) {
-    const projectTodoParams = {
-      authType: auth.toJSON(),
-      spaceId: conversation.spaceId,
-      conversationId: conversation.sId,
-      messageId: agentMessage.sId,
-    };
-
-    if (featureFlags.includes("project_todo")) {
-      void launchOrSignalProjectTodoWorkflow(projectTodoParams);
-    }
-  }
-
   // TODO(DURABLE-AGENTS 2025-07-17): Publish message events to all open tabs to maintain
   // conversation state synchronization in multiplex mode. This is a temporary solution -
   // we should move this to a dedicated real-time sync mechanism.
@@ -1971,17 +1931,10 @@ export async function postNewContentFragment(
           await withTransaction(async (t) => {
             await getConversationRankVersionLock(auth, conversation, t);
 
-            const nextMessageRank =
-              ((await MessageModel.max<number | null, MessageModel>("rank", {
-                where: {
-                  workspaceId: owner.id,
-                  conversationId: conversation.id,
-                  branchId: conversation.branchId
-                    ? getResourceIdFromSId(conversation.branchId)
-                    : null,
-                },
-                transaction: t,
-              })) ?? -1) + 1;
+            const nextMessageRank = await getNextConversationMessageRank(auth, {
+              conversation,
+              transaction: t,
+            });
 
             await MessageModel.create(
               {
@@ -2070,17 +2023,10 @@ export async function postNewContentFragment(
       }
     })();
 
-    const nextMessageRank =
-      ((await MessageModel.max<number | null, MessageModel>("rank", {
-        where: {
-          workspaceId: owner.id,
-          conversationId: conversation.id,
-          branchId: conversation.branchId
-            ? getResourceIdFromSId(conversation.branchId)
-            : null,
-        },
-        transaction: t,
-      })) ?? -1) + 1;
+    const nextMessageRank = await getNextConversationMessageRank(auth, {
+      conversation,
+      transaction: t,
+    });
     const messageRow = await MessageModel.create(
       {
         sId: messageId,
@@ -2114,21 +2060,6 @@ export async function postNewContentFragment(
     conversationId: conversation.sId,
     message: messageRow,
   });
-
-  const featureFlags = await getFeatureFlags(auth);
-  if (isProjectConversation(conversation)) {
-    const projectTodoParams = {
-      authType: auth.toJSON(),
-      spaceId: conversation.spaceId,
-      conversationId: conversation.sId,
-      messageId,
-    };
-
-    if (featureFlags.includes("project_todo")) {
-      void launchOrSignalProjectTodoWorkflow(projectTodoParams);
-      void signalProjectTodoComplete(projectTodoParams);
-    }
-  }
 
   return new Ok(render);
 }
@@ -2644,13 +2575,19 @@ export async function compactConversation(
       (m): m is CompactionMessageType =>
         isCompactionMessageType(m) && m.status === "created"
     );
-  if (runningAgentMessage || runningCompaction) {
+  const lastMessage = conversation.content.at(-1)?.at(-1);
+
+  if (
+    runningAgentMessage ||
+    runningCompaction ||
+    (lastMessage && isCompactionMessageType(lastMessage))
+  ) {
     return new Err({
       status_code: 409,
       api_error: {
         type: "invalid_request_error",
         message:
-          "Cannot compact while another compaction or an agent message is running.",
+          "Cannot compact while another compaction or an agent message is running, or when the last message is already a compaction message.",
       },
     });
   }
@@ -2698,17 +2635,10 @@ export async function compactConversation(
       return { compactionMessage: null };
     }
 
-    const nextMessageRank =
-      ((await MessageModel.max<number | null, MessageModel>("rank", {
-        where: {
-          workspaceId: owner.id,
-          conversationId: conversation.id,
-          branchId: conversation.branchId
-            ? getResourceIdFromSId(conversation.branchId)
-            : null,
-        },
-        transaction: t,
-      })) ?? -1) + 1;
+    const nextMessageRank = await getNextConversationMessageRank(auth, {
+      conversation,
+      transaction: t,
+    });
 
     const compactionMessage = await createCompactionMessage(auth, {
       conversation,
@@ -2885,19 +2815,6 @@ export async function updateAgentMessageWithFinalStatus(
       }
     );
 
-    const nextMessageRank =
-      ((await MessageModel.max<number | null, MessageModel>("rank", {
-        where: {
-          workspaceId: owner.id,
-          conversationId: conversation.id,
-          branchId: conversation.branchId
-            ? getResourceIdFromSId(conversation.branchId)
-            : null,
-        },
-        transaction: t,
-      })) ?? -1) + 1;
-
-    // Render all promoted user messages.
     const promotedUserMessages = await batchRenderUserMessagesWithoutMentions(
       auth,
       {
@@ -2924,6 +2841,11 @@ export async function updateAgentMessageWithFinalStatus(
     await ConversationResource.markAsUpdated(promotedAuth, {
       conversation,
       t,
+    });
+
+    const nextMessageRank = await getNextConversationMessageRank(auth, {
+      conversation,
+      transaction: t,
     });
 
     // Create a new agent message using the last promoted user message.

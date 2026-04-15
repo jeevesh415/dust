@@ -81,6 +81,8 @@ export type StepContext = {
   fileAuthorizationInfo?: FileAuthorizationInfo;
   resumeState: Record<string, unknown> | null;
   retrievalTopK: number;
+  sandboxOrigin?: boolean;
+  sandboxPaused?: boolean;
   websearchResultCount: number;
 };
 
@@ -93,6 +95,9 @@ export type ActionGeneratedFileType = {
   updatedAt?: number;
   isInProjectContext?: boolean;
   hidden?: boolean;
+  // True for files created by offloading oversized tool output to disk. These are never indexed in
+  // Qdrant and should not be flagged as searchable in the conversation render.
+  skipDataSourceIndexing?: boolean;
 };
 
 export type AgentLoopRunContextType = {

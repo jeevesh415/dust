@@ -6,6 +6,7 @@ import {
   buildSkillInstructionsExtensions,
   INSTRUCTIONS_MAXIMUM_CHARACTER_COUNT,
 } from "@app/lib/editor/build_skill_instructions_extensions";
+import { preprocessMarkdownForEditor } from "@app/lib/editor/skill_instructions_preprocessing";
 import { cn } from "@dust-tt/sparkle";
 import { CharacterCount, Placeholder } from "@tiptap/extensions";
 import type { Transaction } from "@tiptap/pm/state";
@@ -40,7 +41,7 @@ function useEditorService(editor: Editor | null) {
       setContent(content: string) {
         // Safety check for Safari: ensure editor and docView are available
         if (editor && !editor.isDestroyed) {
-          editor.commands.setContent(content, {
+          editor.commands.setContent(preprocessMarkdownForEditor(content), {
             emitUpdate: false,
             contentType: "markdown",
           });
@@ -86,6 +87,8 @@ function useEditorService(editor: Editor | null) {
 
 interface UseSkillInstructionsEditorProps {
   content: string;
+  htmlContent?: string;
+  withDocumentExtensions?: boolean;
   isReadOnly: boolean;
   onUpdate?: (props: { editor: Editor; transaction: Transaction }) => void;
   onBlur?: () => void;
@@ -107,6 +110,8 @@ const skillInstructionsEditableExtensions = [
 
 export function useSkillInstructionsEditor({
   content,
+  htmlContent,
+  withDocumentExtensions = false,
   isReadOnly,
   onUpdate,
   onBlur,
@@ -116,9 +121,10 @@ export function useSkillInstructionsEditor({
     () =>
       buildSkillInstructionsExtensions(
         isReadOnly,
-        skillInstructionsEditableExtensions
+        skillInstructionsEditableExtensions,
+        { withDocumentExtensions }
       ),
-    [isReadOnly]
+    [isReadOnly, withDocumentExtensions]
   );
 
   // Track if initial content has been set
@@ -138,11 +144,12 @@ export function useSkillInstructionsEditor({
 
   const editorService = useEditorService(editor);
 
-  // Set initial content after editor is created (markdown must be set via setContent)
+  // Set initial content after editor is created
   useEffect(() => {
+    const hasContent = htmlContent || content;
     if (
       editor &&
-      content &&
+      hasContent &&
       !initialContentSetRef.current &&
       !editor.isDestroyed
     ) {
@@ -150,15 +157,19 @@ export function useSkillInstructionsEditor({
       // This fixes Safari crashes where docView is accessed before render
       requestAnimationFrame(() => {
         if (editor && !editor.isDestroyed) {
-          editor.commands.setContent(content, {
-            emitUpdate: false,
-            contentType: "markdown",
-          });
+          if (htmlContent) {
+            editor.commands.setContent(htmlContent, { emitUpdate: false });
+          } else {
+            editor.commands.setContent(preprocessMarkdownForEditor(content), {
+              emitUpdate: false,
+              contentType: "markdown",
+            });
+          }
           initialContentSetRef.current = true;
         }
       });
     }
-  }, [editor, content]);
+  }, [editor, content, htmlContent]);
 
   return { editor, editorService };
 }

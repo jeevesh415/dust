@@ -1,6 +1,7 @@
 import { AgentMessage } from "@app/components/assistant/conversation/AgentMessage";
 import { AttachmentCitation } from "@app/components/assistant/conversation/attachment/AttachmentCitation";
 import { contentFragmentToAttachmentCitation } from "@app/components/assistant/conversation/attachment/utils";
+import { CompactionMessage } from "@app/components/assistant/conversation/CompactionMessage";
 import type { FeedbackSelectorBaseProps } from "@app/components/assistant/conversation/FeedbackSelector";
 import { MentionInvalid } from "@app/components/assistant/conversation/MentionInvalid";
 import { MentionValidationRequired } from "@app/components/assistant/conversation/MentionValidationRequired";
@@ -12,6 +13,7 @@ import type {
 import {
   getMessageDate,
   isAgentMessageWithStreaming,
+  isCompactionMessage,
   isHiddenMessage,
   isUserMessage,
 } from "@app/components/assistant/conversation/types";
@@ -48,7 +50,11 @@ function getMessageTopMargin({
   isPreviousAgentMessageSteered: boolean;
 }): string | undefined {
   // Previous message has reactions — add extra space to clear them.
-  if (prevData && prevData.reactions.length > 0) {
+  if (
+    prevData &&
+    !isCompactionMessage(prevData) &&
+    prevData.reactions.length > 0
+  ) {
     return "mt-8";
   }
 
@@ -241,11 +247,6 @@ export const MessageItem = React.forwardRef<HTMLDivElement, MessageItemProps>(
       return null;
     }
 
-    // No message without a conversation
-    if (!context.conversation) {
-      return null;
-    }
-
     const topMargin = getMessageTopMargin({
       data,
       prevData,
@@ -253,6 +254,26 @@ export const MessageItem = React.forwardRef<HTMLDivElement, MessageItemProps>(
       isSteeredAgentMessage,
       isPreviousAgentMessageSteered,
     });
+
+    // No message without a conversation
+    if (!context.conversation) {
+      return null;
+    }
+
+    if (isCompactionMessage(data)) {
+      return (
+        <div
+          ref={ref}
+          className={cn(
+            "mx-auto max-w-conversation",
+            topMargin,
+            !nextData && "mb-8"
+          )}
+        >
+          <CompactionMessage message={data} />
+        </div>
+      );
+    }
 
     return (
       <>
@@ -278,6 +299,7 @@ export const MessageItem = React.forwardRef<HTMLDivElement, MessageItemProps>(
               message={data}
               owner={context.owner}
               onReactionToggle={(emoji: string) => onReactionToggle({ emoji })}
+              isProjectArchived={context.isProjectArchived}
             />
           )}
           {isAgentMessageWithStreaming(data) && (
@@ -292,14 +314,17 @@ export const MessageItem = React.forwardRef<HTMLDivElement, MessageItemProps>(
               owner={context.owner}
               handleSubmit={context.handleSubmit}
               isOnboardingConversation={context.isOnboardingConversation}
+              onConversationBranched={context.onConversationBranched}
               onCompletionStatusClick={onAgentMessageCompletionStatusClick}
               additionalMarkdownComponents={
                 context.additionalMarkdownComponents
               }
               additionalMarkdownPlugins={context.additionalMarkdownPlugins}
+              isProjectArchived={context.isProjectArchived}
             />
           )}
           {data.visibility !== "deleted" &&
+            !isCompactionMessage(data) &&
             data.richMentions.map((mention, index) => {
               // To please the type checker
               if (!context.conversation) {

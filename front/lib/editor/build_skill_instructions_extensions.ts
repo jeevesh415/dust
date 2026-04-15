@@ -1,8 +1,15 @@
+import { CodeExtension } from "@app/components/editor/extensions/CodeExtension";
 import { HeadingExtension } from "@app/components/editor/extensions/HeadingExtension";
 import { BlockIdExtension } from "@app/components/editor/extensions/instructions/BlockIdExtension";
 import { InstructionsDocumentExtension } from "@app/components/editor/extensions/instructions/InstructionsDocumentExtension";
 import { InstructionsRootExtension } from "@app/components/editor/extensions/instructions/InstructionsRootExtension";
+import { ListItemExtension } from "@app/components/editor/extensions/ListItemExtension";
 import { KnowledgeNode } from "@app/components/editor/extensions/skill_builder/KnowledgeNode";
+import {
+  RawMarkdownBlock,
+  rawMarkdownBlockParsers,
+} from "@app/components/editor/extensions/skill_builder/RawMarkdownBlock";
+import { LinkExtension } from "@app/components/editor/input_bar/LinkExtension";
 import { markdownStyles } from "@dust-tt/sparkle";
 import type { Extensions } from "@tiptap/core";
 import { Markdown } from "@tiptap/markdown";
@@ -15,33 +22,30 @@ export const INSTRUCTIONS_MAXIMUM_CHARACTER_COUNT = 120_000;
  *
  * @param isReadOnly - When true, interactive editing extensions are omitted.
  * @param editableExtensions - Extensions appended when `isReadOnly` is false.
- * @param serverSide - When true, includes InstructionsDocumentExtension,
- *   InstructionsRootExtension, and BlockIdExtension for server-side HTML
+ * @param withDocumentExtensions - When true, includes InstructionsDocumentExtension,
+ *   InstructionsRootExtension, and BlockIdExtension (document + block IDs).
  */
 export function buildSkillInstructionsExtensions(
   isReadOnly: boolean,
   editableExtensions: Extensions = [],
-  { serverSide = false }: { serverSide?: boolean } = {}
+  { withDocumentExtensions = false }: { withDocumentExtensions?: boolean } = {}
 ): Extensions {
   const baseExtensions: Extensions = [
-    ...(serverSide
+    ...(withDocumentExtensions
       ? [InstructionsDocumentExtension, InstructionsRootExtension]
       : []),
-    Markdown,
+    Markdown.configure(),
     StarterKit.configure({
       // document: false is required when InstructionsDocumentExtension is present
       // (it replaces StarterKit's default Document node).
-      ...(serverSide ? { document: false } : {}),
+      ...(withDocumentExtensions ? { document: false } : {}),
       orderedList: {
         HTMLAttributes: {
           class: markdownStyles.orderedList(),
         },
       },
-      listItem: {
-        HTMLAttributes: {
-          class: markdownStyles.list(),
-        },
-      },
+      listItem: false,
+      link: false,
       bulletList: {
         HTMLAttributes: {
           class: markdownStyles.unorderedList(),
@@ -51,11 +55,7 @@ export function buildSkillInstructionsExtensions(
       horizontalRule: false,
       strike: false,
       heading: false,
-      code: {
-        HTMLAttributes: {
-          class: markdownStyles.codeBlock(),
-        },
-      },
+      code: false,
       codeBlock: {
         HTMLAttributes: {
           class: markdownStyles.codeBlock(),
@@ -67,14 +67,30 @@ export function buildSkillInstructionsExtensions(
         },
       },
     }),
+    CodeExtension.configure({
+      HTMLAttributes: {
+        class: markdownStyles.codeInline(),
+      },
+    }),
+    ListItemExtension.configure({
+      HTMLAttributes: {
+        class: markdownStyles.list(),
+      },
+    }),
+    LinkExtension.configure({
+      autolink: false,
+      openOnClick: false,
+    }),
     HeadingExtension.configure({
-      levels: [1, 2, 3],
+      levels: [1, 2, 3, 4, 5, 6],
       HTMLAttributes: {
         class: "mt-4 mb-3",
       },
     }),
-    ...(serverSide ? [BlockIdExtension] : []),
+    ...(withDocumentExtensions ? [BlockIdExtension] : []),
     KnowledgeNode,
+    RawMarkdownBlock,
+    ...rawMarkdownBlockParsers,
   ];
 
   if (!isReadOnly) {

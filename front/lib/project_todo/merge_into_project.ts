@@ -26,11 +26,11 @@
 //       - Not in dedupMap → makeNew + addSource (current behaviour).
 //
 // Category mapping:
-//   actionItems  (open)    → "follow_ups",      status: "todo"
-//   actionItems  (done)    → "follow_ups",      status: "done"
-//   keyDecisions (open)    → "key_decisions",   status: "todo"
-//   keyDecisions (decided) → "key_decisions",   status: "done"
-//   notableFacts           → "notable_updates", status: "todo"
+//   actionItems  (open)    → "to_do",   status: "todo"
+//   actionItems  (done)    → "to_do",   status: "done"
+//   keyDecisions (open)    → "to_know", status: "todo"
+//   keyDecisions (decided) → "to_know", status: "done"
+//   notableFacts           → "to_know", status: "todo"
 
 import { getFastestWhitelistedModel } from "@app/lib/assistant";
 import type { Authenticator } from "@app/lib/auth";
@@ -63,7 +63,7 @@ const BUTLER_AGENT_SID = "butler";
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 type TodoBlob = {
-  category: "follow_ups" | "key_decisions" | "notable_updates";
+  category: "to_do" | "to_know";
   text: string;
   status: "todo" | "done";
   doneAt: Date | null;
@@ -410,7 +410,6 @@ async function createOrLinkTodos(
         markedAsDoneByType: null,
         markedAsDoneByUserId: null,
         markedAsDoneByAgentConfigurationId: null,
-        version: 1,
       });
 
       await todo.addSource(auth, {
@@ -446,7 +445,7 @@ async function updateTodoIfChanged(
     todo.doneAt?.toISOString() !== blob.doneAt?.toISOString();
 
   if (textChanged || statusChanged || doneAtChanged) {
-    await todo.createVersion(auth, {
+    await todo.updateWithVersion(auth, {
       text: blob.text,
       status: blob.status,
       doneAt: blob.doneAt,
@@ -456,10 +455,10 @@ async function updateTodoIfChanged(
 
 // ── Blob helpers ─────────────────────────────────────────────────────────────
 
-function actionItemBlob(item: TodoVersionedActionItem): TodoBlob {
+export function actionItemBlob(item: TodoVersionedActionItem): TodoBlob {
   const isDone = item.status === "done";
   return {
-    category: "follow_ups",
+    category: "to_do",
     text: item.text,
     status: isDone ? "done" : "todo",
     doneAt:
@@ -467,18 +466,18 @@ function actionItemBlob(item: TodoVersionedActionItem): TodoBlob {
   };
 }
 
-function keyDecisionBlob(item: TodoVersionedKeyDecision): TodoBlob {
+export function keyDecisionBlob(item: TodoVersionedKeyDecision): TodoBlob {
   return {
-    category: "key_decisions",
+    category: "to_know",
     text: item.text,
     status: item.status === "decided" ? "done" : "todo",
     doneAt: null,
   };
 }
 
-function notableFactBlob(item: TodoVersionedNotableFact): TodoBlob {
+export function notableFactBlob(item: TodoVersionedNotableFact): TodoBlob {
   return {
-    category: "notable_updates",
+    category: "to_know",
     text: item.text,
     status: "todo",
     doneAt: null,

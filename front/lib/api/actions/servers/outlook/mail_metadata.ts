@@ -44,6 +44,22 @@ export const OUTLOOK_TOOLS_METADATA = createToolsRecord({
       done: "Fetch messages",
     },
   },
+  get_attachments: {
+    description:
+      "Get all attachments from an Outlook message. Lists attachments and downloads their content, making them available in the conversation.",
+    schema: {
+      messageId: z
+        .string()
+        .describe(
+          "The ID of the message to get attachments from (from the get_messages response)"
+        ),
+    },
+    stake: "never_ask",
+    displayLabels: {
+      running: "Getting Outlook attachments",
+      done: "Get Outlook attachments",
+    },
+  },
   get_drafts: {
     description:
       "Get draft emails from Outlook. Returns a limited number of drafts by default to avoid overwhelming responses.",
@@ -145,6 +161,39 @@ export const OUTLOOK_TOOLS_METADATA = createToolsRecord({
     displayLabels: {
       running: "Creating reply draft",
       done: "Create reply draft",
+    },
+  },
+  send_mail: {
+    description: `Send an email directly via Outlook.
+- The email will be sent immediately without creating a draft.
+- Use this when all required fields are known.`,
+    schema: {
+      to: z
+        .array(z.string())
+        .min(1)
+        .describe("The email addresses of the recipients"),
+      cc: z.array(z.string()).optional().describe("The email addresses to CC"),
+      bcc: z
+        .array(z.string())
+        .optional()
+        .describe("The email addresses to BCC"),
+      subject: z.string().describe("The subject line of the email"),
+      contentType: z
+        .enum(["text", "html"])
+        .default("text")
+        .describe("The content type of the email body (text or html)."),
+      body: z.string().describe("The body of the email"),
+      saveToSentItems: z
+        .boolean()
+        .optional()
+        .describe(
+          "Whether to save the sent email to the Sent Items folder. Defaults to true."
+        ),
+    },
+    stake: "high",
+    displayLabels: {
+      running: "Sending email",
+      done: "Send email",
     },
   },
   get_contacts: {
@@ -255,9 +304,9 @@ export const OUTLOOK_MAIL_SERVER = {
     description: "Read emails, manage drafts and contacts.",
     authorization: {
       provider: "microsoft_tools",
-      supported_use_cases: ["personal_actions"],
+      supported_use_cases: ["personal_actions", "platform_actions"],
       scope:
-        "Mail.ReadWrite.Shared Contacts.ReadWrite Contacts.ReadWrite.Shared User.Read offline_access",
+        "Mail.ReadWrite.Shared Mail.Send Contacts.ReadWrite Contacts.ReadWrite.Shared User.Read offline_access",
       availableScopes: [
         {
           value: "Mail.ReadWrite",
@@ -271,6 +320,11 @@ export const OUTLOOK_MAIL_SERVER = {
           label: "Read & write shared mail",
           description: "Access shared and delegated mailboxes.",
           fallbackScope: "Mail.ReadWrite",
+        },
+        {
+          value: "Mail.Send",
+          label: "Send mail",
+          description: "Send emails on behalf of the signed-in user.",
         },
         {
           value: "Contacts.ReadWrite",

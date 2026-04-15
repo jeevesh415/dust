@@ -6,81 +6,88 @@ import { getConversationRoute } from "@app/lib/utils/router";
 import type { PostConversationForkResponseBody } from "@app/pages/api/w/[wId]/assistant/conversations/[cId]/forks";
 import type { LightWorkspaceType } from "@app/types/user";
 import { useCallback, useState } from "react";
-import { useSWRConfig } from "swr";
 
 export function useBranchConversation({
   owner,
   conversationId,
+  onConversationBranched,
 }: {
   owner: LightWorkspaceType;
   conversationId?: string | null;
+  onConversationBranched?: () => Promise<void> | void;
 }) {
   const sendNotification = useSendNotification();
   const router = useAppRouter();
-  const { mutate } = useSWRConfig();
 
   const [isBranching, setIsBranching] = useState(false);
 
-  const branchConversation = useCallback(async (): Promise<boolean> => {
-    if (!conversationId) {
-      return false;
-    }
-
-    setIsBranching(true);
-
-    try {
-      const res = await clientFetch(
-        `/api/w/${owner.sId}/assistant/conversations/${conversationId}/forks`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({}),
-        }
-      );
-
-      if (!res.ok) {
-        const errorData = await getErrorFromResponse(res);
-
-        sendNotification({
-          type: "error",
-          title: "Failed to branch conversation",
-          description: errorData.message,
-        });
-
+  const branchConversation = useCallback(
+    async (sourceMessageId?: string): Promise<boolean> => {
+      if (!conversationId) {
         return false;
       }
 
-      const { conversation }: PostConversationForkResponseBody =
-        await res.json();
+      setIsBranching(true);
 
-      await router.push(
-        getConversationRoute(owner.sId, conversation.sId),
-        undefined,
-        {
-          shallow: true,
+      try {
+        const requestBody = sourceMessageId ? { sourceMessageId } : {};
+
+        const res = await clientFetch(
+          `/api/w/${owner.sId}/assistant/conversations/${conversationId}/forks`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(requestBody),
+          }
+        );
+
+        if (!res.ok) {
+          const errorData = await getErrorFromResponse(res);
+
+          sendNotification({
+            type: "error",
+            title: "Failed to branch conversation",
+            description: errorData.message,
+          });
+
+          return false;
         }
-      );
 
-      const conversationPathPrefix = `/api/w/${owner.sId}/assistant/conversations`;
-      void mutate(
-        (key) =>
-          typeof key === "string" && key.startsWith(conversationPathPrefix)
-      );
+        const { conversation }: PostConversationForkResponseBody =
+          await res.json();
 
-      return true;
-    } catch {
-      sendNotification({
-        type: "error",
-        title: "Failed to branch conversation",
-      });
+        void onConversationBranched?.();
 
-      return false;
-    } finally {
-      setIsBranching(false);
-    }
-  }, [conversationId, mutate, owner.sId, router, sendNotification]);
+        await router.push(
+          getConversationRoute(owner.sId, conversation.sId),
+          undefined,
+          {
+            shallow: true,
+          }
+        );
+
+        return true;
+      } catch {
+        sendNotification({
+          type: "error",
+          title: "Failed to branch conversation",
+        });
+
+        return false;
+      } finally {
+        setIsBranching(false);
+      }
+    },
+    [
+      conversationId,
+      onConversationBranched,
+      owner.sId,
+      router,
+      sendNotification,
+    ]
+  );
 
   return {
     branchConversation,

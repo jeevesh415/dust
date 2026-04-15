@@ -1,4 +1,9 @@
 export const WHITELISTABLE_FEATURES_CONFIG = {
+  skill_builder_instructions_html: {
+    description:
+      "Enable HTML-backed instructions in the skill builder (block IDs, HTML round-trip storage)",
+    stage: "dust_only",
+  },
   advanced_notion_management: {
     description:
       "Advanced features for Notion workspace management shown to admins",
@@ -247,6 +252,11 @@ export const WHITELISTABLE_FEATURES_CONFIG = {
       "Enable reinforcement: background analysis of conversations to suggest improvements to skills.",
     stage: "dust_only",
   },
+  reinforcement_ui: {
+    description:
+      "Enable the reinforcement suggestions UI panel in the Skills Builder.",
+    stage: "dust_only",
+  },
   collapsible_messages: {
     description: "Enable collapsible messages in conversations",
     stage: "dust_only",
@@ -277,6 +287,11 @@ export const WHITELISTABLE_FEATURES_CONFIG = {
   },
   dummy_feature_for_flag_testing: {
     description: "Dummy feature flag used for testing feature flag behavior",
+    stage: "dust_only",
+  },
+  enable_compaction: {
+    description:
+      "Enable context compaction: summarize older messages to free up context window",
     stage: "dust_only",
   },
   enable_steering: {

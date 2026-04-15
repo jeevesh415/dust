@@ -78,9 +78,10 @@ export const RESOURCES_PREFIX = {
 
   // Project todos.
   project_todo_state: "pts",
+  project_todo: "ptd",
 
-  // Project user digest and todo versioned.
-  user_project_digest: "pje",
+  // Takeaways.
+  takeaways: "tka",
 
   // Conversation branches.
   conversation_branch: "cbr",

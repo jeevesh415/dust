@@ -1,3 +1,4 @@
+import { ContextUsageIndicator } from "@app/components/assistant/conversation/input_bar/ContextUsageIndicator";
 import { InputBarAttachmentsPicker } from "@app/components/assistant/conversation/input_bar/InputBarAttachmentsPicker";
 import { InputBarButtons } from "@app/components/assistant/conversation/input_bar/InputBarButtons";
 import {
@@ -200,8 +201,10 @@ const InputBarContainer = ({
   const isMobile = useIsMobile();
   const { hasFeature } = useFeatureFlags();
   const singleAgentInput = hasFeature("enable_steering");
+  const isCompactionEnabled = hasFeature("enable_compaction");
   const { selectedSingleAgent, setSelectedSingleAgent } =
     useContext(InputBarContext);
+
   const [hasUserMention, setHasUserMention] = useState(false);
   const canSubmitEmpty = singleAgentInput && !!selectedSingleAgent;
 
@@ -1234,24 +1237,31 @@ const InputBarContainer = ({
           </div>
         </div>
         <div
-          className={cn(
-            "absolute bottom-2 right-2 flex items-center gap-2 md:gap-1"
-          )}
+          className={cn("absolute bottom-2 right-2 flex items-center gap-2")}
         >
-          {!subscription.plan.isByok &&
-            owner.metadata?.allowVoiceTranscription !== false &&
-            actions.includes("voice") && (
-              <VoicePicker
-                status={voiceTranscriberService.status}
-                level={voiceTranscriberService.level}
-                elapsedSeconds={voiceTranscriberService.elapsedSeconds}
-                onRecordStart={voiceTranscriberService.startRecording}
-                onRecordStop={voiceTranscriberService.stopRecording}
-                disabled={disableInput}
-                size={buttonSize}
-                showStopLabel={!isMobile}
+          <div className="flex items-center">
+            {isCompactionEnabled && conversation && (
+              <ContextUsageIndicator
+                buttonSize={buttonSize}
+                owner={owner}
+                conversationId={conversation?.sId}
               />
             )}
+            {!subscription.plan.isByok &&
+              owner.metadata?.allowVoiceTranscription !== false &&
+              actions.includes("voice") && (
+                <VoicePicker
+                  status={voiceTranscriberService.status}
+                  level={voiceTranscriberService.level}
+                  elapsedSeconds={voiceTranscriberService.elapsedSeconds}
+                  onRecordStart={voiceTranscriberService.startRecording}
+                  onRecordStop={voiceTranscriberService.stopRecording}
+                  disabled={disableInput}
+                  size={buttonSize}
+                  showStopLabel={!isMobile}
+                />
+              )}
+          </div>
           <Button
             size={buttonSize}
             isLoading={

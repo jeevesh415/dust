@@ -2011,11 +2011,13 @@ export class ConversationResource extends BaseResource<ConversationModel> {
     return pendingMessages;
   }
 
-  async getLatestCompletedAgentMessageRun(
+  async getLatestAgentMessageRun(
     auth: Authenticator
   ): Promise<RunResource | null> {
     const owner = auth.getNonNullableWorkspace();
 
+    // Include in-progress ("created") agent messages so that context usage is available even while
+    // the agent is still running (it accumulates runIds step by step).
     const message = await MessageModel.findOne({
       where: {
         conversationId: this.id,
@@ -2027,7 +2029,7 @@ export class ConversationResource extends BaseResource<ConversationModel> {
           as: "agentMessage",
           required: true,
           where: {
-            status: ["succeeded", "gracefully_stopped"],
+            status: ["succeeded", "gracefully_stopped", "created"],
           },
         },
       ],
@@ -2038,12 +2040,19 @@ export class ConversationResource extends BaseResource<ConversationModel> {
       return null;
     }
 
-    // runIds is ordered chronologically (appended step by step in the agent loop), so the last
-    // element is the most recent run.
-    const lastRunId =
-      message.agentMessage.runIds[message.agentMessage.runIds.length - 1];
+    // The runIds array ordering is not guaranteed to be chronological. Fetch all runs and pick
+    // the most recently created one.
+    const runs = await RunResource.listByDustRunIds(auth, {
+      dustRunIds: message.agentMessage.runIds,
+    });
 
-    return RunResource.fetchByDustRunId(auth, { dustRunId: lastRunId });
+    if (runs.length === 0) {
+      return null;
+    }
+
+    return runs.reduce((latest, r) =>
+      r.createdAt > latest.createdAt ? r : latest
+    );
   }
 
   static async resolveForkSourceMessage(
