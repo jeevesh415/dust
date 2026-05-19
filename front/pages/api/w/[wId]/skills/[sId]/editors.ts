@@ -1,4 +1,5 @@
 /** @ignoreswagger */
+// @migration-status: MIGRATED_TO_HONO
 import { withSessionAuthenticationForWorkspace } from "@app/lib/api/auth_wrappers";
 import type { Authenticator } from "@app/lib/auth";
 import { SkillResource } from "@app/lib/resources/skill/skill_resource";
@@ -8,31 +9,27 @@ import type { WithAPIErrorResponse } from "@app/types/error";
 import { assertNever } from "@app/types/shared/utils/assert_never";
 import { isString } from "@app/types/shared/utils/general";
 import type { UserType } from "@app/types/user";
-import { isLeft } from "fp-ts/lib/Either";
-import * as t from "io-ts";
-import * as reporter from "io-ts-reporters";
 import type { NextApiRequest, NextApiResponse } from "next";
+import { z } from "zod";
+import { fromError } from "zod-validation-error";
 
-const PatchSkillEditorsRequestBodySchema = t.intersection([
-  t.type({}),
-  t.partial({
-    addEditorIds: t.array(t.string),
-    removeEditorIds: t.array(t.string),
-  }),
-  t.refinement(
-    t.type({
-      addEditorIds: t.union([t.array(t.string), t.undefined]),
-      removeEditorIds: t.union([t.array(t.string), t.undefined]),
-    }),
+const PatchSkillEditorsRequestBodySchema = z
+  .object({
+    addEditorIds: z.array(z.string()).optional(),
+    removeEditorIds: z.array(z.string()).optional(),
+  })
+  .refine(
     (body) =>
       (body.addEditorIds instanceof Array && body.addEditorIds.length > 0) ||
       (body.removeEditorIds instanceof Array &&
         body.removeEditorIds.length > 0),
-    "Either addEditorIds or removeEditorIds must be provided and contain at least one ID."
-  ),
-]);
+    {
+      message:
+        "Either addEditorIds or removeEditorIds must be provided and contain at least one ID.",
+    }
+  );
 
-export type PatchSkillEditorsRequestBody = t.TypeOf<
+export type PatchSkillEditorsRequestBody = z.infer<
   typeof PatchSkillEditorsRequestBodySchema
 >;
 
@@ -106,11 +103,11 @@ async function handler(
         });
       }
 
-      const bodyValidation = PatchSkillEditorsRequestBodySchema.decode(
+      const bodyValidation = PatchSkillEditorsRequestBodySchema.safeParse(
         req.body
       );
-      if (isLeft(bodyValidation)) {
-        const pathError = reporter.formatValidationErrors(bodyValidation.left);
+      if (!bodyValidation.success) {
+        const pathError = fromError(bodyValidation.error).toString();
         return apiError(req, res, {
           status_code: 400,
           api_error: {
@@ -120,7 +117,7 @@ async function handler(
         });
       }
 
-      const { addEditorIds = [], removeEditorIds = [] } = bodyValidation.right;
+      const { addEditorIds = [], removeEditorIds = [] } = bodyValidation.data;
 
       const usersToAddResources = await UserResource.fetchByIds(addEditorIds);
       const usersToRemoveResources =

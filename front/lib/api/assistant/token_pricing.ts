@@ -27,6 +27,11 @@ export const MAX_DISCOUNT_PERCENT = Math.ceil(
 // This record contains all static model IDs. Custom models use default pricing.
 const CURRENT_MODEL_PRICING: Record<StaticModelIdType, PricingEntry> = {
   // https://openai.com/api/pricing
+  "gpt-5.5": {
+    input: 5.0,
+    output: 30.0,
+    cache_read_input_tokens: 0.5,
+  },
   "gpt-5.4": {
     input: 2.5,
     output: 15.0,
@@ -137,6 +142,12 @@ const CURRENT_MODEL_PRICING: Record<StaticModelIdType, PricingEntry> = {
     cache_creation_input_tokens: 6.25,
     cache_read_input_tokens: 0.5,
   },
+  "claude-opus-4-7": {
+    input: 5.0,
+    output: 25.0,
+    cache_creation_input_tokens: 6.25,
+    cache_read_input_tokens: 0.5,
+  },
   "claude-sonnet-4-6": {
     input: 3.0,
     output: 15.0,
@@ -191,6 +202,11 @@ const CURRENT_MODEL_PRICING: Record<StaticModelIdType, PricingEntry> = {
   },
   "mistral-medium": {
     input: 2.5,
+    output: 7.5,
+  },
+  // No cache pricing published by Mistral for medium 3.5 as of 2026-05-19.
+  "mistral-medium-3-5": {
+    input: 1.5,
     output: 7.5,
   },
   "mistral-small-latest": {
@@ -279,6 +295,12 @@ const CURRENT_MODEL_PRICING: Record<StaticModelIdType, PricingEntry> = {
     output: 1.68,
     cache_read_input_tokens: 0.28,
   },
+  // https://fireworks.ai/models/deepseek-ai/deepseek-v4-pro
+  "accounts/fireworks/models/deepseek-v4-pro": {
+    input: 1.74,
+    output: 3.48,
+    cache_read_input_tokens: 0.14,
+  },
   // https://fireworks.ai/models/fireworks/kimi-k2-instruct-0905
   "accounts/fireworks/models/kimi-k2-instruct-0905": {
     input: 0.6,
@@ -312,24 +334,25 @@ const CURRENT_MODEL_PRICING: Record<StaticModelIdType, PricingEntry> = {
     output: 1.0,
   },
   "grok-4-latest": {
-    input: 2.0,
-    output: 15.0,
+    input: 1.25,
+    output: 2.5,
   },
+  // Retired May 15, 2026 — redirected to grok-4.3 by xAI at these rates.
   "grok-4-1-fast-reasoning-latest": {
-    input: 0.2,
-    output: 0.5,
+    input: 1.25,
+    output: 2.5,
   },
   "grok-4-1-fast-non-reasoning-latest": {
-    input: 0.2,
-    output: 0.5,
+    input: 1.25,
+    output: 2.5,
   },
   "grok-4-fast-non-reasoning-latest": {
-    input: 0.2,
-    output: 0.5,
+    input: 1.25,
+    output: 2.5,
   },
   "grok-4-fast-reasoning-latest": {
-    input: 0.2,
-    output: 0.5,
+    input: 1.25,
+    output: 2.5,
   },
   noop: {
     input: 0,
@@ -351,6 +374,11 @@ const IMAGE_MODEL_PRICING: Record<string, PricingEntry> = {
   "gpt-image-1.5": {
     input: 8.0,
     output: 32.0,
+  },
+  // https://developers.openai.com/api/docs/pricing
+  "gpt-image-2": {
+    input: 8.0,
+    output: 30.0,
   },
 };
 

@@ -1,5 +1,7 @@
 import { DeleteSpaceDialog } from "@app/components/assistant/conversation/space/about/DeleteSpaceDialog";
 import { MembersTable } from "@app/components/assistant/conversation/space/about/MembersTable";
+import { ProjectSettingsOptionLabel } from "@app/components/assistant/conversation/space/about/ProjectSettingsOptionLabel";
+import { SuggestedTasksGenerationTile } from "@app/components/assistant/conversation/space/conversations/project_tasks/SuggestedTasksGenerationTile";
 import { ConfirmContext } from "@app/components/Confirm";
 import { useSpaceConversationsSummary } from "@app/hooks/conversations";
 import { useArchiveProject } from "@app/hooks/useArchiveProject";
@@ -11,6 +13,7 @@ import {
   useUpdateSpace,
 } from "@app/lib/swr/spaces";
 import { formatTimestampToFriendlyDate } from "@app/lib/utils";
+import { areOpenProjectsAllowed } from "@app/lib/workspace_policies";
 import type { RichSpaceType } from "@app/pages/api/w/[wId]/spaces/[spaceId]";
 import type { PatchProjectMetadataBodyType } from "@app/types/api/internal/spaces";
 import { PatchProjectMetadataBodySchema } from "@app/types/api/internal/spaces";
@@ -24,12 +27,14 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
+  GlobeAltIcon,
   Input,
   MoreIcon,
   ScrollArea,
   SearchInput,
   SliderToggle,
   TextArea,
+  Tooltip,
   UserGroupIcon,
 } from "@dust-tt/sparkle";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -42,6 +47,9 @@ interface SpaceAboutTabProps {
   onOpenMembersPanel?: () => void;
 }
 
+const OPEN_PROJECTS_DISABLED_TOOLTIP =
+  "Open Pods are disabled by your workspace admin.";
+
 export function SpaceAboutTab({
   owner,
   space,
@@ -53,6 +61,11 @@ export function SpaceAboutTab({
     isRestricted,
   } = space;
   const isPublic = !isRestricted;
+  const areWorkspaceOpenProjectsAllowed = areOpenProjectsAllowed(owner);
+  const isPrivateProjectAndOpenProjectsDisallowed =
+    !areWorkspaceOpenProjectsAllowed && !isPublic;
+  const isVisibilityToggleDisabled =
+    !isProjectEditor || isPrivateProjectAndOpenProjectsDisallowed;
   const [searchSelectedMembers, setSearchSelectedMembers] = useState("");
 
   const confirm = useContext(ConfirmContext);
@@ -111,8 +124,8 @@ export function SpaceAboutTab({
       return;
     }
     const confirmed = await confirm({
-      title: "Update project name?",
-      message: `The project name will be changed to "${newProjectName}".`,
+      title: "Update Pod name?",
+      message: `The Pod name will be changed to "${newProjectName}".`,
       validateVariant: "warning",
     });
 
@@ -130,8 +143,8 @@ export function SpaceAboutTab({
         name: newProjectName,
       },
       {
-        title: "Successfully updated project name",
-        description: "Project name was successfully updated.",
+        title: "Successfully updated Pod name",
+        description: "Pod name was successfully updated.",
       }
     );
 
@@ -144,16 +157,6 @@ export function SpaceAboutTab({
   };
 
   const onSaveDescription = async () => {
-    const confirmed = await confirm({
-      title: "Update project description?",
-      message: "The project description will be updated.",
-      validateVariant: "warning",
-    });
-
-    if (!confirmed) {
-      return;
-    }
-
     await doUpdateMetadata({ description: projectDescription });
     setIsEditingDescription(false);
   };
@@ -175,7 +178,7 @@ export function SpaceAboutTab({
     const newIsPublic = !isPublic;
     const title = newIsPublic ? "Switch to public?" : "Switch to restricted?";
     const message = newIsPublic
-      ? "Everyone in the workspace will be able to see and join this project."
+      ? "All workspace members will be able to join and see everything in this Pod — including existing conversations and files."
       : "Access will be limited to invited members only.";
 
     const confirmed = await confirm({
@@ -198,8 +201,8 @@ export function SpaceAboutTab({
         name: space.name,
       },
       {
-        title: "Successfully updated project visibility",
-        description: "Project visibility was successfully updated.",
+        title: "Successfully updated Pod visibility",
+        description: "Pod visibility was successfully updated.",
       }
     );
 
@@ -231,13 +234,13 @@ export function SpaceAboutTab({
                 {projectMetadata?.archivedAt ? (
                   <DropdownMenuItem
                     icon={ArrowUpOnSquareIcon}
-                    label="Unarchive project"
+                    label="Unarchive Pod"
                     onClick={handleArchiveToggle}
                   />
                 ) : (
                   <DropdownMenuItem
                     icon={ArchiveIcon}
-                    label="Archive project"
+                    label="Archive Pod"
                     variant="warning"
                     onClick={handleArchiveToggle}
                   />
@@ -248,7 +251,7 @@ export function SpaceAboutTab({
         </div>
         {space.archivedAt && (
           <ContentMessage variant="info" size="lg">
-            This project has been archived.
+            This Pod has been archived.
           </ContentMessage>
         )}
         <div className="flex w-full flex-col gap-2">
@@ -262,7 +265,7 @@ export function SpaceAboutTab({
                 setNameToCheck(e.target.value);
                 setIsEditingName(e.target.value.trim() !== space.name.trim());
               }}
-              placeholder="Enter project name"
+              placeholder="Enter Pod name"
               containerClassName="flex-1"
             />
             {isEditingName && (
@@ -287,7 +290,7 @@ export function SpaceAboutTab({
           </div>
           {isEditingName && nameNotAvailable && (
             <div className="text-xs text-warning-500">
-              A project or space with this name already exists.
+              A Pod or space with this name already exists.
             </div>
           )}
         </div>
@@ -305,7 +308,7 @@ export function SpaceAboutTab({
               placeholder={
                 isProjectMetadataLoading
                   ? "Loading..."
-                  : "Describe what this project is about..."
+                  : "Describe what this Pod is about..."
               }
               disabled={isProjectMetadataLoading || !isProjectEditor}
               minRows={3}
@@ -333,22 +336,42 @@ export function SpaceAboutTab({
         </div>
 
         <div className="flex w-full flex-col gap-2">
-          <h3 className="heading-lg">Visibility</h3>
-          <div className="flex items-center justify-between gap-4 border-y border-border py-4">
-            <div className="flex flex-col">
-              <div className="heading-sm text-foreground dark:text-foreground-night">
-                Open to everyone
-              </div>
-              <div className="text-sm text-muted-foreground dark:text-muted-foreground-night">
-                Anyone in the workspace can find and join the project.
+          <div className="flex flex-col border-y border-border">
+            <div className="flex items-center justify-between gap-4 py-4">
+              <ProjectSettingsOptionLabel
+                icon={GlobeAltIcon}
+                title="Open to everyone"
+                description="Anyone in the workspace can find and join the Pod."
+              />
+              <div className="flex shrink-0 items-center gap-2">
+                {isVisibilityToggleDisabled ? (
+                  <Tooltip
+                    label={OPEN_PROJECTS_DISABLED_TOOLTIP}
+                    trigger={
+                      <div>
+                        <SliderToggle
+                          size="xs"
+                          selected={isPublic}
+                          onClick={handleVisibilityToggle}
+                          disabled
+                        />
+                      </div>
+                    }
+                  />
+                ) : (
+                  <SliderToggle
+                    size="xs"
+                    selected={isPublic}
+                    onClick={handleVisibilityToggle}
+                    disabled={isVisibilityToggleDisabled}
+                  />
+                )}
               </div>
             </div>
-            <SliderToggle
-              size="xs"
-              selected={isPublic}
-              onClick={handleVisibilityToggle}
-              disabled={!isProjectEditor}
-            />
+
+            <div className="border-t border-border py-4">
+              <SuggestedTasksGenerationTile owner={owner} space={space} />
+            </div>
           </div>
         </div>
 
@@ -415,7 +438,7 @@ export function SpaceAboutTab({
             ) : (
               <>
                 <p className="text-sm text-muted-foreground dark:text-muted-foreground-night">
-                  This project will be removed from the sidebar. Its data stays
+                  This Pod will be removed from the sidebar. Its data stays
                   intact and can still be used as a data source.
                 </p>
                 <Button
@@ -430,8 +453,8 @@ export function SpaceAboutTab({
             <h4 className="heading-base">Delete</h4>
             <p className="text-sm text-muted-foreground dark:text-muted-foreground-night">
               This permanently removes all content—conversations, folders,
-              websites, and data sources. Assistants using this project's tools
-              will be impacted. This cannot be undone.
+              websites, and data sources. Assistants using this Pod's tools will
+              be impacted. This cannot be undone.
             </p>
             <DeleteSpaceDialog owner={owner} space={space} />
           </div>

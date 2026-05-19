@@ -1,8 +1,6 @@
 import { AgentMessageMarkdown } from "@app/components/assistant/AgentMessageMarkdown";
 import { AgentHandle } from "@app/components/assistant/conversation/AgentHandle";
-import { AgentMessageCompletionStatus } from "@app/components/assistant/conversation/AgentMessageCompletionStatus";
 import { AgentMessageInteractiveContentGeneratedFiles } from "@app/components/assistant/conversation/AgentMessageGeneratedFiles";
-import { AgentMessageActions } from "@app/components/assistant/conversation/actions/AgentMessageActions";
 import { InlineActivitySteps } from "@app/components/assistant/conversation/actions/inline/InlineActivitySteps";
 import { AttachmentCitation } from "@app/components/assistant/conversation/attachment/AttachmentCitation";
 import { markdownCitationToAttachmentCitation } from "@app/components/assistant/conversation/attachment/utils";
@@ -46,6 +44,7 @@ import {
 import { useConversationAttachments } from "@app/hooks/conversations/useConversationAttachments";
 import { useConversationSandboxFiles } from "@app/hooks/conversations/useConversationSandboxFiles";
 import { useConversationSandboxStatus } from "@app/hooks/conversations/useConversationSandboxStatus";
+import { useConversations } from "@app/hooks/conversations/useConversations";
 import { useAgentMessageStream } from "@app/hooks/useAgentMessageStream";
 import { useDeleteAgentMessage } from "@app/hooks/useDeleteAgentMessage";
 import { useSendNotification } from "@app/hooks/useNotification";
@@ -56,19 +55,23 @@ import { useAuth, useFeatureFlags } from "@app/lib/auth/AuthContext";
 import { clientFetch } from "@app/lib/egress/client";
 import type { DustError } from "@app/lib/error";
 import { FILE_ID_PATTERN } from "@app/lib/files";
+import { useConversationWakeUps } from "@app/lib/swr/wakeups";
 import { getConversationRoute } from "@app/lib/utils/router";
 import { formatTimestring } from "@app/lib/utils/timestamps";
+import { getNextWakeUpFireAt } from "@app/lib/utils/wakeup_description";
 import type { FetchConversationMessageResponseLight } from "@app/pages/api/w/[wId]/assistant/conversations/[cId]/messages/[mId]";
 import {
   canShowAgentConversationActions,
   isGlobalAgentId,
   isGlobalAgentWithFeedback,
 } from "@app/types/assistant/assistant";
+import type { ConversationListItemType } from "@app/types/assistant/conversation";
 import { isLightAgentMessageType } from "@app/types/assistant/conversation";
 import type {
   RichAgentMention,
   RichMention,
 } from "@app/types/assistant/mentions";
+import { isActiveWakeUp } from "@app/types/assistant/wakeups";
 import type { ContentFragmentsType } from "@app/types/content_fragment";
 import {
   isInteractiveContentType,
@@ -81,7 +84,7 @@ import type {
   UserType,
   WorkspaceType,
 } from "@app/types/user";
-import type { DropdownMenuItemProps, StreamingState } from "@dust-tt/sparkle";
+import type { DropdownMenuItemProps } from "@dust-tt/sparkle";
 import {
   ActionGitBranchIcon,
   ArrowPathIcon,
@@ -117,6 +120,9 @@ import {
 } from "react";
 import type { Components } from "react-markdown";
 import type { PluggableList } from "react-markdown/lib/react-markdown";
+
+// TODO(sessions-branching): Re-enable once branching from a source message is fixed.
+const SHOW_BRANCH_FROM_HERE_ACTION = false;
 
 function PrunedContextChip() {
   return (
@@ -163,8 +169,37 @@ function PrunedContextChip() {
   );
 }
 
+function buildMountFilePreviewHref({
+  apiBaseUrl,
+  ownerId,
+  conversationId,
+  spaceId,
+  filePath,
+}: {
+  apiBaseUrl: string;
+  ownerId: string;
+  conversationId: string;
+  spaceId: string | null;
+  filePath: string;
+}): string | undefined {
+  if (filePath.startsWith("conversation/")) {
+    return `${apiBaseUrl}/api/w/${ownerId}/assistant/conversations/${conversationId}/files/${filePath}`;
+  }
+
+  if (filePath.startsWith("project/")) {
+    if (!spaceId) {
+      return undefined;
+    }
+
+    return `${apiBaseUrl}/api/w/${ownerId}/spaces/${spaceId}/files/${filePath}`;
+  }
+
+  return undefined;
+}
+
 interface AgentMessageProps {
   conversationId: string;
+  spaceId: string | null;
   hideHeader: boolean;
   isLastMessage: boolean;
   agentMessage: AgentMessageWithStreaming;
@@ -173,7 +208,6 @@ interface AgentMessageProps {
   user: UserType;
   triggeringUser: UserType | null;
   isOnboardingConversation: boolean;
-  onConversationBranched?: () => Promise<void> | void;
   onCompletionStatusClick?: (messageId: string, actionId?: string) => void;
   handleSubmit: (
     input: string,
@@ -187,6 +221,7 @@ interface AgentMessageProps {
 
 export function AgentMessage({
   conversationId,
+  spaceId,
   hideHeader,
   isLastMessage,
   agentMessage,
@@ -195,7 +230,6 @@ export function AgentMessage({
   user,
   triggeringUser,
   isOnboardingConversation,
-  onConversationBranched,
   onCompletionStatusClick,
   handleSubmit,
   additionalMarkdownComponents,
@@ -206,7 +240,6 @@ export function AgentMessage({
   const [streamId, setStreamId] = useState<string>(`message-${sId}`);
   const { hasFeature } = useFeatureFlags();
   const isCollapsibleEnabled = hasFeature("collapsible_messages");
-  const isInlineActivityEnabled = hasFeature("enable_steering");
 
   const [isRetryHandlerProcessing, setIsRetryHandlerProcessing] =
     useState<boolean>(false);
@@ -237,6 +270,15 @@ export function AgentMessage({
     owner,
     options: { disabled: true },
   });
+  const { mutateWakeUps } = useConversationWakeUps({
+    owner,
+    conversationId,
+    disabled: true,
+  });
+  const { mutateConversations } = useConversations({
+    workspaceId: owner.sId,
+    options: { disabled: true },
+  });
 
   const methods = useVirtuosoMethods<
     VirtuosoMessage,
@@ -251,7 +293,6 @@ export function AgentMessage({
   const { shouldStream, streamError } = useAgentMessageStream({
     agentMessage: agentMessage,
     conversationId,
-    isInlineActivityEnabled,
     owner,
     onEventCallback: useCallback(
       (eventPayload: {
@@ -369,7 +410,28 @@ export function AgentMessage({
             }
             if (action.internalMCPServerName === "sandbox") {
               void mutateSandboxStatus();
+            }
+            if (
+              action.internalMCPServerName === "sandbox" ||
+              action.generatedFiles.length > 0
+            ) {
               void mutateSandboxFiles();
+            }
+            if (action.internalMCPServerName === "wakeups") {
+              void mutateWakeUps().then((updated) => {
+                const activeWakeUp =
+                  updated?.wakeUps.find(isActiveWakeUp) ?? null;
+                const nextWakeupAt = activeWakeUp
+                  ? getNextWakeUpFireAt(activeWakeUp)
+                  : null;
+                void mutateConversations(
+                  (currentData: ConversationListItemType[] | undefined) =>
+                    currentData?.map((c) =>
+                      c.sId === conversationId ? { ...c, nextWakeupAt } : c
+                    ),
+                  { revalidate: false }
+                );
+              });
             }
             break;
           }
@@ -392,10 +454,11 @@ export function AgentMessage({
         mutateConversationAttachments,
         mutateSandboxStatus,
         mutateSandboxFiles,
+        mutateWakeUps,
+        mutateConversations,
       ]
     ),
     streamId,
-    useFullChainOfThought: false,
   });
 
   const isDeleted = agentMessage.visibility === "deleted";
@@ -408,17 +471,17 @@ export function AgentMessage({
     () =>
       Object.entries(agentMessage.citations ?? {}).reduce<
         Record<string, MCPReferenceCitation>
-      >((acc, [key, citation]) => {
+      >((acc, [ref, citation]) => {
         if (citation) {
           return {
             ...acc,
-            [key]: {
+            [ref]: {
               provider: citation.provider,
               href: citation.href,
               title: citation.title,
               description: citation.description,
               contentType: citation.contentType,
-              fileId: key,
+              ref,
             },
           };
         }
@@ -427,22 +490,48 @@ export function AgentMessage({
     [agentMessage.citations]
   );
 
-  // GenerationContext: to know if we are generating or not.
-  const generationContext = useGenerationContext();
+  // GenerationContext: to know if we are generating or not. Destructure the (stable) mutators
+  // so the effect below doesn't re-run on every context value change — which happens on every
+  // add/remove since the context value ref is tied to the generatingMessages state.
+  const {
+    addGeneratingMessage,
+    removeGeneratingMessage,
+    getConversationGeneratingMessages,
+  } = useGenerationContext();
+
+  // Once a handoff user message exists for this agent message, the agent has
+  // effectively handed over: the child agent owns the generation from here.
+  // Treat this message as no longer generating so we don't show duplicate
+  // "Stop agent" buttons / streaming affordances alongside the child.
+  const isAgentMessageHandingOver = methods.data
+    .get()
+    .some(
+      (m) =>
+        isUserMessage(m) &&
+        isHandoverUserMessage(m) &&
+        m.agenticMessageData?.originMessageId === sId
+    );
 
   useEffect(() => {
-    if (shouldStream) {
-      generationContext.addGeneratingMessage({
+    if (shouldStream && !isAgentMessageHandingOver) {
+      addGeneratingMessage({
         messageId: sId,
         conversationId,
         agentId: agentMessage.configuration.sId,
       });
     } else {
-      generationContext.removeGeneratingMessage({ messageId: sId });
+      removeGeneratingMessage({ messageId: sId });
     }
+    // Clean up on unmount so we don't leak a generating entry (e.g. when the message is replaced
+    // by a v+1 deletion placeholder mid-stream).
+    return () => {
+      removeGeneratingMessage({ messageId: sId });
+    };
   }, [
     shouldStream,
-    generationContext,
+    isAgentMessageHandingOver,
+    addGeneratingMessage,
+    removeGeneratingMessage,
     sId,
     conversationId,
     agentMessage.configuration.sId,
@@ -537,8 +626,7 @@ export function AgentMessage({
   const hoverButtons: ReactElement[] = [];
 
   const hasMultiAgents =
-    generationContext.getConversationGeneratingMessages(conversationId).length >
-    1;
+    getConversationGeneratingMessages(conversationId).length > 1;
 
   // Show stop agent button only when streaming with multiple agents
   if (hasMultiAgents && shouldStream) {
@@ -556,15 +644,6 @@ export function AgentMessage({
       />
     );
   }
-
-  const isAgentMessageHandingOver = methods.data
-    .get()
-    .some(
-      (m) =>
-        isUserMessage(m) &&
-        isHandoverUserMessage(m) &&
-        m.agenticMessageData?.originMessageId === sId
-    );
 
   const parentAgentMessage = methods.data
     .get()
@@ -605,7 +684,7 @@ export function AgentMessage({
     await deleteAgentMessage(agentMessage.sId);
 
     methods.data.map((m) => {
-      if (m.sId === agentMessage.sId) {
+      if (isAgentMessageWithStreaming(m) && m.sId === agentMessage.sId) {
         return {
           ...m,
           visibility: "deleted",
@@ -636,8 +715,7 @@ export function AgentMessage({
     !isAgentMessageHandingOver &&
     !isProjectArchived;
 
-  const canBranchConversation =
-    hasFeature("sessions_branching") && shouldShowCopy;
+  const canBranchConversation = SHOW_BRANCH_FROM_HERE_ACTION && shouldShowCopy;
 
   const shouldShowFeedback =
     !isDeleted &&
@@ -653,7 +731,6 @@ export function AgentMessage({
   const { branchConversation, isBranching } = useBranchConversation({
     owner,
     conversationId,
-    onConversationBranched,
   });
 
   const retryHandler = useCallback(
@@ -751,7 +828,7 @@ export function AgentMessage({
 
     if (canBranchConversation) {
       dropdownItems.push({
-        label: "Branch conversation",
+        label: "Branch from here",
         icon: ActionGitBranchIcon,
         onSelect: () => {
           void branchConversation(agentMessage.sId);
@@ -944,6 +1021,7 @@ export function AgentMessage({
           onQuickReplySend={handleQuickReply}
           owner={owner}
           conversationId={conversationId}
+          spaceId={spaceId}
           retryHandler={retryHandler}
           reloadMessage={reloadMessage}
           isRetryHandlerProcessing={isRetryHandlerProcessing}
@@ -952,16 +1030,10 @@ export function AgentMessage({
           references={references}
           streaming={shouldStream}
           streamError={streamError}
-          lastTokenClassification={
-            isInlineActivityEnabled
-              ? null
-              : agentMessage.streaming.agentState === "thinking"
-                ? "tokens"
-                : null
-          }
           activeReferences={activeReferences}
           setActiveReferences={setActiveReferences}
           triggeringUser={triggeringUser}
+          isAgentMessageHandingOver={isAgentMessageHandingOver}
           additionalMarkdownComponents={additionalMarkdownComponents}
           additionalMarkdownPlugins={additionalMarkdownPlugins}
         />
@@ -1006,8 +1078,6 @@ export function AgentMessage({
     );
   };
 
-  const hideCompletionStatus = isDeleted || isInlineActivityEnabled;
-
   return (
     <ConversationMessageContainer messageType="agent" type="agent">
       {!hideHeader && (
@@ -1025,18 +1095,7 @@ export function AgentMessage({
             infoChip={
               agentMessage.prunedContext ? <PrunedContextChip /> : undefined
             }
-            completionStatus={
-              hideCompletionStatus ? undefined : (
-                <AgentMessageCompletionStatus
-                  agentMessage={agentMessage}
-                  onClick={
-                    onCompletionStatusClick
-                      ? () => onCompletionStatusClick(agentMessage.sId)
-                      : undefined
-                  }
-                />
-              )
-            }
+            completionStatus={undefined}
             renderName={renderName}
           />
         </div>
@@ -1057,15 +1116,16 @@ function AgentMessageContent({
   references,
   streaming,
   streamError,
-  lastTokenClassification,
   owner,
   conversationId,
+  spaceId,
   activeReferences,
   setActiveReferences,
   retryHandler,
   reloadMessage,
   isRetryHandlerProcessing,
   onQuickReplySend,
+  isAgentMessageHandingOver,
   additionalMarkdownComponents: propsAdditionalMarkdownComponents,
   additionalMarkdownPlugins,
 }: {
@@ -1074,6 +1134,7 @@ function AgentMessageContent({
   isLastMessage: boolean;
   owner: LightWorkspaceType;
   conversationId: string;
+  spaceId: string | null;
   retryHandler: (params: {
     conversationId: string;
     messageId: string;
@@ -1088,15 +1149,15 @@ function AgentMessageContent({
   references: { [key: string]: MCPReferenceCitation };
   streaming: boolean;
   streamError: Error | null;
-  lastTokenClassification: null | "tokens" | "chain_of_thought";
   activeReferences: { index: number; document: MCPReferenceCitation }[];
-  setActiveReferences: (
-    references: {
-      index: number;
-      document: MCPReferenceCitation;
-    }[]
-  ) => void;
+  setActiveReferences: React.Dispatch<
+    React.SetStateAction<{ index: number; document: MCPReferenceCitation }[]>
+  >;
   onQuickReplySend: (message: string) => Promise<void>;
+  // True once a handoff user message pointing to this agent message exists —
+  // the child agent owns generation from that point, so this message should
+  // collapse its inline activity (no more "Thinking…") and drop its stop button.
+  isAgentMessageHandingOver: boolean;
   additionalMarkdownComponents?: Components;
   additionalMarkdownPlugins?: PluggableList;
 }) {
@@ -1106,8 +1167,6 @@ function AgentMessageContent({
   >();
 
   const { vizUrl } = useAuth();
-  const { hasFeature } = useFeatureFlags();
-  const isInlineActivityEnabled = hasFeature("enable_steering");
   const { sId, configuration: agentConfiguration } = agentMessage;
 
   const { postFollowUp } = usePostOnboardingFollowUp({
@@ -1161,12 +1220,14 @@ function AgentMessageContent({
   // References logic.
   const updateActiveReferences = useCallback(
     (document: MCPReferenceCitation, index: number) => {
-      const existingIndex = activeReferences.find((r) => r.index === index);
-      if (!existingIndex) {
-        setActiveReferences([...activeReferences, { index, document }]);
-      }
+      setActiveReferences((prev) => {
+        if (prev.some((r) => r.index === index)) {
+          return prev;
+        }
+        return [...prev, { index, document }];
+      });
     },
-    [activeReferences, setActiveReferences]
+    [setActiveReferences]
   );
 
   const citationsContextValue = useMemo(
@@ -1225,10 +1286,6 @@ function AgentMessageContent({
     />
   ) : null;
 
-  if (blockedActionElement && !isInlineActivityEnabled) {
-    return blockedActionElement;
-  }
-
   if (agentMessage.status === "created" && !!streamError) {
     return (
       <ErrorMessage
@@ -1280,21 +1337,22 @@ function AgentMessageContent({
   const filesFromMessage = agentMessage.generatedFiles.filter((f) => !f.hidden);
 
   // Combine both sources, preferring actions (more up-to-date during streaming).
-  // Dedupe by fileId.
-  const seenFileIds = new Set<string>();
+  // Dedupe by fileId (file resource) or filePath (file path).
+  const seenFileKeys = new Set<string>();
   const allGeneratedFiles = [...filesFromActions, ...filesFromMessage].filter(
     (file) => {
-      if (seenFileIds.has(file.fileId)) {
+      const key = file.fileId ?? file.filePath;
+      if (!key || seenFileKeys.has(key)) {
         return false;
       }
-      seenFileIds.add(file.fileId);
+      seenFileKeys.add(key);
       return true;
     }
   );
 
   const completedImages = allGeneratedFiles
     .filter((file) => isSupportedImageContentType(file.contentType))
-    .filter((file) => !referencedFileIds.has(file.fileId));
+    .filter((file) => file.fileId && !referencedFileIds.has(file.fileId));
 
   const generatedFiles = filesFromMessage.filter(
     (file) =>
@@ -1305,25 +1363,19 @@ function AgentMessageContent({
   return (
     <CitationsContext.Provider value={citationsContextValue}>
       <div className="flex flex-col gap-y-4">
-        {isInlineActivityEnabled ? (
-          <InlineActivitySteps
-            agentMessage={agentMessage}
-            lastAgentStateClassification={agentMessage.streaming.agentState}
-            completedSteps={agentMessage.streaming.inlineActivitySteps}
-            pendingToolCalls={agentMessage.streaming.pendingToolCalls}
-            onOpenDetails={onOpenDetails}
-            owner={owner}
-            isLastMessage={isLastMessage}
-          />
-        ) : (
-          <AgentMessageActions
-            agentMessage={agentMessage}
-            lastAgentStateClassification={agentMessage.streaming.agentState}
-            actionProgress={agentMessage.streaming.actionProgress}
-            pendingToolCalls={agentMessage.streaming.pendingToolCalls}
-            owner={owner}
-          />
-        )}
+        <InlineActivitySteps
+          agentMessage={agentMessage}
+          lastAgentStateClassification={
+            isAgentMessageHandingOver
+              ? "done"
+              : agentMessage.streaming.agentState
+          }
+          completedSteps={agentMessage.streaming.inlineActivitySteps}
+          pendingToolCalls={agentMessage.streaming.pendingToolCalls}
+          onOpenDetails={onOpenDetails}
+          owner={owner}
+          isLastMessage={isLastMessage}
+        />
         {blockedActionElement}
         <AgentMessageInteractiveContentGeneratedFiles
           files={interactiveFiles}
@@ -1342,19 +1394,14 @@ function AgentMessageContent({
 
         {agentMessage.content !== null &&
           agentMessage.content !== "" &&
-          !(
-            isInlineActivityEnabled &&
-            agentMessage.streaming.agentState !== "done"
-          ) && (
+          agentMessage.streaming.agentState === "done" && (
             <div>
               <AgentMessageMarkdown
                 content={sanitizeVisualizationContent(agentMessage.content)}
                 owner={owner}
-                isStreaming={streaming && lastTokenClassification === "tokens"}
-                streamingState={getStreamingState(
-                  streaming && lastTokenClassification === "tokens",
-                  agentMessage.status
-                )}
+                streamingState={
+                  agentMessage.status === "cancelled" ? "cancelled" : "none"
+                }
                 isLastMessage={isLastMessage}
                 additionalMarkdownComponents={additionalMarkdownComponents}
                 additionalMarkdownPlugins={additionalMarkdownPlugins}
@@ -1364,24 +1411,40 @@ function AgentMessageContent({
         {generatedFiles.length > 0 && (
           <div className="mt-2 grid grid-cols-5 gap-1">
             {getCitations({
-              activeReferences: generatedFiles.map((file) => ({
-                index: -1,
-                document: {
-                  fileId: file.fileId,
-                  contentType: file.contentType,
-                  href: `${config.getApiBaseUrl()}/api/w/${owner.sId}/files/${file.fileId}`,
-                  title: file.title,
-                },
-              })),
+              activeReferences: generatedFiles.map((file) => {
+                const href = file.fileId
+                  ? `${config.getApiBaseUrl()}/api/w/${owner.sId}/files/${file.fileId}`
+                  : file.filePath
+                    ? buildMountFilePreviewHref({
+                        apiBaseUrl: config.getApiBaseUrl(),
+                        ownerId: owner.sId,
+                        conversationId,
+                        spaceId,
+                        filePath: file.filePath,
+                      })
+                    : undefined;
+                return {
+                  index: -1,
+                  document: {
+                    fileId: file.fileId ?? undefined,
+                    contentType: file.contentType,
+                    href,
+                    title: file.title,
+                  },
+                };
+              }),
               owner,
               conversationId,
             })}
           </div>
         )}
-        {agentMessage.status === "cancelled" && (
+        {(agentMessage.status === "cancelled" ||
+          agentMessage.status === "interrupted") && (
           <div className="flex flex-col gap-2">
             <div className="text-sm text-faint dark:text-faint-night">
-              Message generation was interrupted
+              {agentMessage.status === "interrupted"
+                ? "Skipped. Running your next message."
+                : "Generation stopped."}
             </div>
             <div>
               <ButtonGroupDropdown
@@ -1414,19 +1477,6 @@ function AgentMessageContent({
       </div>
     </CitationsContext.Provider>
   );
-}
-
-function getStreamingState(
-  isStreaming: boolean,
-  messageStatus: string
-): StreamingState {
-  if (isStreaming) {
-    return "streaming";
-  }
-  if (messageStatus === "cancelled") {
-    return "cancelled";
-  }
-  return "none";
 }
 
 function getCitations({

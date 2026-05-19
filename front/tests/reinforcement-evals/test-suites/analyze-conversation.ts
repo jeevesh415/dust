@@ -1,5 +1,6 @@
 import {
   calledDescribeMcp,
+  editSkillWithAgentFacingDescription,
   editSkillWithInstructions,
   editSkillWithTool,
   type MockMcpDescription,
@@ -669,6 +670,137 @@ CRITICAL constraints:
 Score 0 if no edit_skill call is made for skill_github_reporter, or if edit_skill is called for skill_jira_extractor or skill_notion_publisher.
 Score 1 if edit_skill is called only for skill_github_reporter but the suggestion doesn't specifically mention adding DevCode to the project list.
 Score 3 if edit_skill is called only for skill_github_reporter, the suggestion adds DevCode to the project list, and no other skills are modified.`,
+    },
+    {
+      scenarioId: "misleading-agent-facing-description",
+      type: "analysis",
+      skillConfigs: [
+        {
+          name: "Payment Issue Resolver",
+          sId: "skill_payment_resolver",
+          // Too broad: nothing tells the agent this skill is ONLY for failures
+          // and chargebacks, so it gets enabled for unrelated billing questions.
+          description: "Helps customers with payment issues.",
+          instructions:
+            "When a customer reports that a payment failed, walk them through the retry flow: first ask for the failed transaction ID, then call payment-retry with that ID, and report the new status. For chargeback disputes, collect the dispute reason and call chargeback-open with the transaction ID and reason. Always confirm the resolution before ending the conversation.",
+          tools: [{ name: "JIRA", sId: "mcp_jira" }],
+        },
+      ],
+      conversation: [
+        {
+          role: "user",
+          content:
+            "Hey, I just moved — how do I update the billing address on my account?",
+        },
+        {
+          role: "agent",
+          content:
+            "I can help you with your payment issue. To get started, what's the transaction ID of the payment that failed?",
+        },
+        {
+          role: "user",
+          content:
+            "There's no failed payment. I just want to change my billing address. Why are you asking about transaction IDs?",
+        },
+        {
+          role: "agent",
+          content:
+            "Apologies for the confusion. I'm set up to handle failed payments and chargebacks. For a billing address update you'll want to use Account Settings — I'm not able to do that here.",
+          feedback: {
+            direction: "down",
+            comment:
+              "This skill kicked in for a billing address change, which has nothing to do with payment failures. Its description is way too broad — the agent shouldn't have picked this skill at all for an address update.",
+          },
+        },
+      ],
+      workspaceContext: WORKSPACE_CONTEXT,
+      expectedToolCalls: [
+        editSkillWithAgentFacingDescription("skill_payment_resolver"),
+      ],
+      judgeCriteria: `The skill's instructions accurately describe what it does (handling failed payments and chargeback disputes), so they should NOT be edited. The routing problem comes entirely from the agentFacingDescription "Helps customers with payment issues." being too broad — it caused the agent to enable this skill for a billing address update.
+
+The analyst MUST call edit_skill with an agentFacingDescriptionEdit for skill "skill_payment_resolver". The new description should:
+- Narrow the skill to failed payments and chargeback disputes specifically
+- Explicitly steer the agent AWAY from generic billing/account changes (e.g. address updates, invoice questions)
+- Stay focused on routing signals (when to use vs. not), not behavior (which lives in the instructions)
+
+Score 0 if no edit_skill call with agentFacingDescriptionEdit is made for skill_payment_resolver.
+Score 0 if the suggestion is bundled with instructionEdits or toolEdits — per the analysis prompt, description edits should be a standalone edit_skill call when the routing problem is the only issue (the instructions and tools here are correct).
+Score 1 if a description edit is made but it does not narrow the scope (still vague) OR does not steer away from billing/address-style requests.
+Score 2 if the new description narrows the skill but the language is weak or does not call out what to skip.
+Score 3 if the new description clearly limits the skill to payment failures + chargebacks AND explicitly tells the agent not to use it for unrelated billing/account-management changes.`,
+    },
+    {
+      scenarioId: "knowledge-tag-vague-runbook-instructions",
+      type: "analysis",
+      skillConfigs: [
+        {
+          name: "On-call runbook shortcut",
+          sId: "skill_eval_runbook",
+          description: "Surfaces the incident runbook from workspace knowledge",
+          instructions: "Always open the incident runbook document first.",
+        },
+      ],
+      conversation: [
+        {
+          role: "user",
+          content:
+            "According to our incident runbook, when should we page the on-call engineer?",
+        },
+        {
+          role: "agent",
+          content:
+            "The **Incident runbook** says to page on-call when customer-facing APIs return 5xx for more than five minutes or when the error budget burn rate exceeds the threshold in section 2.1.",
+          actions: [
+            {
+              functionCallName: "company_data__find",
+              status: "succeeded",
+              params: { query: "incident runbook" },
+            },
+            {
+              functionCallName: "company_data__list",
+              status: "succeeded",
+              params: { nodeId: null },
+            },
+            {
+              functionCallName: "company_data__cat",
+              status: "succeeded",
+              params: { nodeId: "doc_incident_runbook" },
+            },
+          ],
+        },
+      ],
+      workspaceContext: {
+        tools: [
+          mockTool(
+            "Company data",
+            "Search, list, and read documents from connected company data sources"
+          ),
+        ],
+        searchKnowledgeNodes: [
+          {
+            nodeId: "doc_incident_runbook",
+            title: "Incident runbook",
+            dataSourceViewId: "dsv_eval_handbook",
+            spaceId: "spc_eval_workspace",
+            hasChildren: false,
+            connectorProvider: null,
+            sourceUrl: null,
+          },
+        ],
+      },
+      expectedToolCalls: [editSkillWithInstructions("skill_eval_runbook")],
+      judgeCriteria: `The analyst should treat the runbook skill instructions as underspecified: they tell the agent to open a document but not which node to read, which led to search/list work before reading the file.
+The ideal improvement is to embed a direct <knowledge> reference to the runbook node so future runs can open it without exploratory browsing.
+
+The analyst SHOULD:
+1. Call search_knowledge to discover the incident runbook node in workspace knowledge.
+2. Call edit_skill with instructionEdits for skill "skill_eval_runbook" that embed a <knowledge id="doc_incident_runbook" title="Incident runbook" space="spc_eval_workspace" dsv="dsv_eval_handbook" hasChildren="false"/> tag inline in the replacement instruction content.
+
+Score 0 if no edit_skill call is made for skill_eval_runbook.
+Score 1 if edit_skill is called with instructionEdits for skill_eval_runbook but the instruction content does not include any <knowledge> tag.
+Score 2 if edit_skill is called with instructionEdits that include a <knowledge> tag but the tag attributes are missing or incorrect (wrong nodeId, missing dsv/space, etc.).
+Score 3 if edit_skill is called with instructionEdits for skill_eval_runbook and the instruction content includes a correctly formed <knowledge id="doc_incident_runbook" ...> tag with all required attributes aligned with the search_knowledge result.`,
     },
   ],
 };

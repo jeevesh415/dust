@@ -1,4 +1,4 @@
-import { Button, XMarkIcon } from "@dust-tt/sparkle";
+import { Button, ClockIcon, UserIcon, XMarkIcon } from "@dust-tt/sparkle";
 import { useEffect, useState } from "react";
 
 // =============================================================================
@@ -6,14 +6,15 @@ import { useEffect, useState } from "react";
 // Set to null when there's nothing to promote.
 // =============================================================================
 const CURRENT_PROMO: PromoConfig | null = {
-  id: "product-vision-webinar-2026-04",
-  image: "/static/landing/Webinar_Banner.jpeg",
-  link: "https://watch.getcontrast.io/register/dust-dust-community-office-hours-a24c1c99?utm_source=dust-website&utm_medium=banner",
-  title: "Dust Product Vision Webinar",
-  subtitle: "Apr 14 at 3:45 PM · Gabriel (CEO) & Thibaut (Partnerships)",
-  linkLabel: "Register now",
-  // Banner auto-hides after this date (end of the event day).
-  expiresAt: new Date("2026-04-14T17:00:00"),
+  id: "dust-for-data-teams-webinar",
+  image: "/static/landing/Data_Teams_Webinar_Banner.png",
+  link: "https://watch.getcontrast.io/register/dust-dust-for-data-teams?utm_source=website",
+  title: "How Data Teams use Dust",
+  time: "11 AM PT",
+  host: "Theo Gantzer · Lead Data @ Dust",
+  linkLabel: "Register Now",
+  // Banner auto-hides after this date (May 20th 7:00 PM Paris / CEST).
+  expiresAt: new Date("2026-05-20T19:00:00+02:00"),
 };
 // =============================================================================
 
@@ -25,7 +26,10 @@ interface PromoConfig {
   /** Registration / event URL. */
   link: string;
   title: string;
-  subtitle: string;
+  /** Event time line, shown with a clock icon. */
+  time: string;
+  /** Optional host line, shown with a user icon. */
+  host?: string;
   linkLabel: string;
   /** Optional expiry — banner stops showing after this date. */
   expiresAt?: Date;
@@ -54,34 +58,43 @@ export function PromoBanner() {
     return null;
   }
 
-  const { image, link, title, subtitle, linkLabel, id } = CURRENT_PROMO;
+  const { link, title, time, host, linkLabel, id } = CURRENT_PROMO;
 
   return (
-    <div className="fixed bottom-4 left-4 z-40 max-w-[320px] overflow-hidden rounded-xl border border-slate-200 bg-white shadow-lg">
-      <div className="relative">
-        <a href={link} target="_blank" rel="noopener noreferrer">
-          <img src={image} alt={title} className="w-full cursor-pointer" />
-        </a>
-        <Button
-          variant="outline"
-          icon={XMarkIcon}
-          size="icon-xs"
-          className="absolute right-1 top-1"
-          onClick={() => {
-            sessionStorage.setItem(storageKey(id), "true");
-            setIsVisible(false);
-          }}
-        />
-      </div>
+    <div className="fixed bottom-4 left-4 z-40 max-w-[180px] overflow-hidden rounded-xl border border-slate-200 bg-white shadow-lg sm:max-w-[210px]">
+      <Button
+        variant="outline"
+        icon={XMarkIcon}
+        size="icon-xs"
+        className="absolute right-1 top-1 z-10"
+        onClick={() => {
+          sessionStorage.setItem(storageKey(id), "true");
+          setIsVisible(false);
+        }}
+      />
       <a
         href={link}
         target="_blank"
         rel="noopener noreferrer"
-        className="block px-4 py-3"
+        className="block px-2.5 py-2 pr-7 sm:px-3 sm:py-2.5 sm:pr-3"
       >
-        <div className="text-sm font-medium text-slate-900">{title}</div>
-        <div className="mt-0.5 text-xs text-slate-500">{subtitle}</div>
-        <div className="mt-1.5 text-xs font-medium text-blue-600 hover:underline">
+        <div className="mb-1 inline-block rounded-full bg-blue-100 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-blue-700">
+          Webinar
+        </div>
+        <div className="text-xs font-semibold text-slate-900">{title}</div>
+        <div className="mt-1 space-y-0.5 text-[11px] text-slate-600">
+          <div className="flex items-center gap-1.5">
+            <ClockIcon className="h-3 w-3 shrink-0 text-slate-400" />
+            <span>{time}</span>
+          </div>
+          {host && (
+            <div className="flex items-center gap-1.5">
+              <UserIcon className="h-3 w-3 shrink-0 text-slate-400" />
+              <span>{host}</span>
+            </div>
+          )}
+        </div>
+        <div className="mt-1.5 text-[11px] font-medium text-blue-600 hover:underline">
           {linkLabel} →
         </div>
       </a>

@@ -1,12 +1,17 @@
 import config from "@app/lib/file_storage/config";
-import { isGCSNotFoundError } from "@app/lib/file_storage/types";
+import {
+  type GCSAPIError,
+  isGCSNotFoundError,
+} from "@app/lib/file_storage/types";
 import { setTimeoutAsync } from "@app/lib/utils/async_utils";
 import logger from "@app/logger/logger";
 import type { AllSupportedFileContentType } from "@app/types/files";
 import { frameContentType } from "@app/types/files";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
 import { normalizeError } from "@app/types/shared/utils/error_utils";
 import { stripNullBytes } from "@app/types/shared/utils/string_utils";
-import type { Bucket } from "@google-cloud/storage";
+import type { Bucket, File } from "@google-cloud/storage";
 import { Storage } from "@google-cloud/storage";
 import type formidable from "formidable";
 import fs from "fs";
@@ -107,12 +112,22 @@ export class FileStorage {
     return textTypes.some((type) => contentType.startsWith(type));
   }
 
-  async getFileContentType(filename: string): Promise<string | undefined> {
-    const gcsFile = this.file(filename);
+  async getFileContentType(
+    filename: string
+  ): Promise<Result<string | undefined, GCSAPIError>> {
+    try {
+      const gcsFile = this.file(filename);
 
-    const [metadata] = await gcsFile.getMetadata();
+      const [metadata] = await gcsFile.getMetadata();
 
-    return metadata.contentType;
+      return new Ok(metadata.contentType);
+    } catch (error) {
+      if (isGCSNotFoundError(error)) {
+        return new Err(error);
+      }
+
+      throw error;
+    }
   }
 
   async getSignedUrl(
@@ -150,6 +165,43 @@ export class FileStorage {
     const [files] = await this.bucket.getFiles({ prefix, maxResults });
 
     return files;
+  }
+
+  /**
+   * Lists all objects under `prefix` by following GCS list pagination.
+   */
+  async getAllFilesByPrefix({
+    prefix,
+    pageSize = 1000,
+  }: {
+    prefix: string;
+    pageSize?: number;
+  }): Promise<{ files: File[]; pageFetchCount: number }> {
+    const allFiles: File[] = [];
+    let pageToken: string | undefined;
+    let pageFetchCount = 0;
+
+    do {
+      const [files, nextQuery] = await this.bucket.getFiles({
+        prefix,
+        maxResults: pageSize,
+        pageToken,
+        autoPaginate: false,
+      });
+      pageFetchCount++;
+      allFiles.push(...files);
+
+      const nextToken =
+        nextQuery &&
+        typeof nextQuery === "object" &&
+        "pageToken" in nextQuery &&
+        nextQuery.pageToken
+          ? String(nextQuery.pageToken)
+          : undefined;
+      pageToken = nextToken || undefined;
+    } while (pageToken);
+
+    return { files: allFiles, pageFetchCount };
   }
 
   async getSortedFileVersions({
@@ -211,16 +263,22 @@ export class FileStorage {
   }
 
   /**
-   * Copy a file within the same bucket with retry logic.
+   * Copy a file within Cloud Storage with retry logic.
    *
    * The GCS SDK's built-in autoRetry is effectively disabled for copy operations and
    * "socket hang up" errors aren't in the SDK's retryable error list anyway.
    * Since copy is idempotent (same source, same destination), retrying is safe.
    */
-  async copyFile(srcPath: string, destPath: string): Promise<void> {
+  async copyFile(
+    srcPath: string,
+    destPath: string,
+    destinationStorage: FileStorage = this
+  ): Promise<void> {
+    const destinationFile = destinationStorage.file(destPath);
+
     for (let attempt = 1; attempt <= GCS_COPY_MAX_RETRIES; attempt++) {
       try {
-        await this.bucket.file(srcPath).copy(this.bucket.file(destPath));
+        await this.file(srcPath).copy(destinationFile);
         return;
       } catch (err) {
         if (attempt === GCS_COPY_MAX_RETRIES) {
@@ -232,7 +290,9 @@ export class FileStorage {
         logger.warn(
           {
             error: normalizeError(err),
+            srcBucket: this.name,
             srcPath,
+            destBucket: destinationStorage.name,
             destPath,
             attempt,
             maxRetries: GCS_COPY_MAX_RETRIES,

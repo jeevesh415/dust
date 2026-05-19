@@ -1,115 +1,249 @@
+import { SpaceSelectionSheet } from "@app/components/agent_builder/capabilities/capabilities_sheet/SpaceSelectionPage";
 import { useSpacesContext } from "@app/components/agent_builder/SpacesContext";
 import { getSpaceIdToActionsMap } from "@app/components/shared/getSpaceIdToActionsMap";
-import { useRemoveSpaceConfirm } from "@app/components/shared/RemoveSpaceDialog";
+import { useBlockedSkillSpaceRemovalConfirm } from "@app/components/shared/RemoveSpaceDialog";
 import { SpaceChips } from "@app/components/shared/SpaceChips";
 import { useMCPServerViewsContext } from "@app/components/shared/tools_picker/MCPServerViewsContext";
-import type { SkillBuilderFormData } from "@app/components/skill_builder/SkillBuilderFormContext";
+import type {
+  AttachedKnowledgeFormData,
+  SkillBuilderFormData,
+} from "@app/components/skill_builder/SkillBuilderFormContext";
+import { useSpaceProjectsLookup } from "@app/lib/swr/spaces";
 import { removeNulls } from "@app/types/shared/utils/general";
-import { pluralize } from "@app/types/shared/utils/string_utils";
 import type { SpaceType } from "@app/types/space";
-import { ContentMessage } from "@dust-tt/sparkle";
-import { useMemo } from "react";
-import { useFormContext } from "react-hook-form";
+import { Button, ContentMessage, PlanetIcon } from "@dust-tt/sparkle";
+import { useEffect, useMemo, useState } from "react";
+import { useController, useFormContext, useWatch } from "react-hook-form";
 
-export function SkillBuilderRequestedSpacesSection() {
-  const { watch, setValue } = useFormContext<SkillBuilderFormData>();
+interface SkillBuilderRequestedSpacesSectionProps {
+  initialRequestedSpaceIds?: string[];
+}
 
-  const tools = watch("tools");
-  const attachedKnowledge = watch("attachedKnowledge");
+export function SkillBuilderRequestedSpacesSection({
+  initialRequestedSpaceIds,
+}: SkillBuilderRequestedSpacesSectionProps) {
+  const { resetField } = useFormContext<SkillBuilderFormData>();
 
-  const { mcpServerViews } = useMCPServerViewsContext();
-  const { spaces } = useSpacesContext();
+  const tools = useWatch<SkillBuilderFormData, "tools">({ name: "tools" });
+  const attachedKnowledge = useWatch<SkillBuilderFormData, "attachedKnowledge">(
+    {
+      name: "attachedKnowledge",
+    }
+  );
 
-  const confirmRemoveSpace = useRemoveSpaceConfirm({
-    entityName: "skill",
+  const {
+    field: additionalSpacesField,
+    fieldState: additionalSpacesFieldState,
+  } = useController<SkillBuilderFormData, "additionalSpaces">({
+    name: "additionalSpaces",
+  });
+  const selectedAdditionalSpaces = additionalSpacesField.value ?? [];
+
+  const { mcpServerViews, isMCPServerViewsLoading } =
+    useMCPServerViewsContext();
+  const { spaces, owner, isSpacesLoading } = useSpacesContext();
+  const confirmBlockedSpaceRemoval = useBlockedSkillSpaceRemovalConfirm({
     mcpServerViews,
   });
 
-  const spaceIdToActions = useMemo(() => {
-    return getSpaceIdToActionsMap(tools, mcpServerViews);
+  const missingSpaceIds = useMemo(() => {
+    if (isSpacesLoading || !initialRequestedSpaceIds?.length) {
+      return [];
+    }
+
+    const existingSpaceIds = new Set(spaces.map((space) => space.sId));
+    return initialRequestedSpaceIds.filter((id) => !existingSpaceIds.has(id));
+  }, [isSpacesLoading, initialRequestedSpaceIds, spaces]);
+
+  const { spaces: missingSpaces } = useSpaceProjectsLookup({
+    workspaceId: owner.sId,
+    spaceIds: missingSpaceIds,
+  });
+
+  const allSpaces = useMemo(() => {
+    return [...spaces, ...missingSpaces].filter(
+      (space) => space.kind !== "project"
+    );
+  }, [spaces, missingSpaces]);
+
+  const [isSheetOpen, setIsSheetOpen] = useState(false);
+  const [draftSelectedSpaces, setDraftSelectedSpaces] = useState<string[]>([]);
+
+  const actionsBySpaceId = useMemo(() => {
+    return getSpaceIdToActionsMap(tools ?? [], mcpServerViews);
   }, [tools, mcpServerViews]);
 
   const spaceIdsFromKnowledge = useMemo(() => {
     return new Set(attachedKnowledge?.map((k) => k.spaceId) ?? []);
   }, [attachedKnowledge]);
 
-  const nonGlobalSpacesUsedInActions = useMemo(() => {
-    return spaces.filter(
-      (s) =>
-        s.kind !== "global" &&
-        (spaceIdToActions[s.sId]?.length > 0 ||
-          spaceIdsFromKnowledge.has(s.sId))
+  const spaceIdsUsedBySkill = useMemo(() => {
+    const actionRequestedSpaceIds = Object.keys(actionsBySpaceId).filter(
+      (spaceId) => actionsBySpaceId[spaceId]?.length > 0
     );
-  }, [spaceIdToActions, spaceIdsFromKnowledge, spaces]);
 
-  const knowledgeToRemoveBySpaceId = useMemo(() => {
-    const map: Record<string, NonNullable<typeof attachedKnowledge>> = {};
-    for (const k of attachedKnowledge ?? []) {
-      if (!map[k.spaceId]) {
-        map[k.spaceId] = [];
-      }
-      map[k.spaceId].push(k);
+    return new Set([...actionRequestedSpaceIds, ...spaceIdsFromKnowledge]);
+  }, [actionsBySpaceId, spaceIdsFromKnowledge]);
+
+  const areSpaceRequirementsReady =
+    !isMCPServerViewsLoading &&
+    (!initialRequestedSpaceIds || attachedKnowledge !== undefined);
+
+  const knowledgeBySpaceId = useMemo(() => {
+    const knowledgeBySpace: Record<string, AttachedKnowledgeFormData[]> = {};
+
+    for (const knowledge of attachedKnowledge ?? []) {
+      knowledgeBySpace[knowledge.spaceId] = (
+        knowledgeBySpace[knowledge.spaceId] ?? []
+      ).concat(knowledge);
     }
-    return map;
+
+    return knowledgeBySpace;
   }, [attachedKnowledge]);
 
-  const handleRemoveSpace = async (space: SpaceType) => {
-    const actionsToRemove = spaceIdToActions[space.sId] || [];
-    const knowledgeInSpace = knowledgeToRemoveBySpaceId[space.sId] || [];
+  const initialAdditionalSpaces = useMemo(() => {
+    if (!areSpaceRequirementsReady || !initialRequestedSpaceIds?.length) {
+      return [];
+    }
 
-    // Don't show confirmation if nothing to remove.
-    if (actionsToRemove.length === 0 && knowledgeInSpace.length === 0) {
+    return initialRequestedSpaceIds.filter(
+      (spaceId) => !spaceIdsUsedBySkill.has(spaceId)
+    );
+  }, [
+    areSpaceRequirementsReady,
+    initialRequestedSpaceIds,
+    spaceIdsUsedBySkill,
+  ]);
+
+  useEffect(() => {
+    if (
+      !areSpaceRequirementsReady ||
+      !initialRequestedSpaceIds ||
+      additionalSpacesFieldState.isDirty
+    ) {
       return;
     }
 
-    const confirmed = await confirmRemoveSpace({
-      space,
-      actions: actionsToRemove,
-      knowledgeInInstructions: knowledgeInSpace,
+    resetField("additionalSpaces", {
+      defaultValue: initialAdditionalSpaces,
     });
+  }, [
+    areSpaceRequirementsReady,
+    additionalSpacesFieldState.isDirty,
+    initialAdditionalSpaces,
+    initialRequestedSpaceIds,
+    resetField,
+  ]);
 
-    if (!confirmed) {
+  const additionalSpaceIds = useMemo(() => {
+    return new Set(selectedAdditionalSpaces);
+  }, [selectedAdditionalSpaces]);
+
+  const nonGlobalSpacesWithRestrictions = useMemo(() => {
+    return allSpaces.filter(
+      (space) =>
+        space.kind !== "global" &&
+        (spaceIdsUsedBySkill.has(space.sId) ||
+          additionalSpaceIds.has(space.sId))
+    );
+  }, [additionalSpaceIds, allSpaces, spaceIdsUsedBySkill]);
+
+  const handleRemoveSpace = async (space: SpaceType) => {
+    if (!areSpaceRequirementsReady) {
       return;
     }
 
-    const actionIdsToRemove = new Set(actionsToRemove.map((a) => a.id));
+    if (spaceIdsUsedBySkill.has(space.sId)) {
+      await confirmBlockedSpaceRemoval({
+        space,
+        actions: actionsBySpaceId[space.sId] ?? [],
+        knowledge: knowledgeBySpaceId[space.sId] ?? [],
+      });
+      return;
+    }
 
-    // Filter out the tools to remove and set the new value.
-    const newTools = tools.filter((t) => !actionIdsToRemove.has(t.id));
-    setValue("tools", newTools, { shouldDirty: true });
+    additionalSpacesField.onChange(
+      selectedAdditionalSpaces.filter((spaceId) => spaceId !== space.sId)
+    );
+  };
+
+  const handleOpenSheet = () => {
+    if (!areSpaceRequirementsReady) {
+      return;
+    }
+
+    setDraftSelectedSpaces(
+      selectedAdditionalSpaces.filter(
+        (spaceId) => !spaceIdsUsedBySkill.has(spaceId)
+      )
+    );
+    setIsSheetOpen(true);
+  };
+
+  const handleCloseSheet = () => {
+    setIsSheetOpen(false);
+    setDraftSelectedSpaces([]);
+  };
+
+  const handleSaveSpaces = () => {
+    additionalSpacesField.onChange(draftSelectedSpaces);
+    handleCloseSheet();
   };
 
   const globalSpace = useMemo(() => {
-    return spaces.find((s) => s.kind === "global");
-  }, [spaces]);
+    return allSpaces.find((s) => s.kind === "global");
+  }, [allSpaces]);
+
   const spacesToDisplay = useMemo(() => {
-    return removeNulls([globalSpace, ...nonGlobalSpacesUsedInActions]);
-  }, [globalSpace, nonGlobalSpacesUsedInActions]);
+    return removeNulls([globalSpace, ...nonGlobalSpacesWithRestrictions]);
+  }, [globalSpace, nonGlobalSpacesWithRestrictions]);
 
   return (
     <div className="space-y-3">
-      <div>
-        <h3 className="heading-lg font-semibold text-foreground dark:text-foreground-night">
-          Spaces
-        </h3>
-        <p className="text-sm text-muted-foreground dark:text-muted-foreground-night">
-          Sets what knowledge and tools the skill can access.
-        </p>
+      <div className="flex items-start justify-between">
+        <div>
+          <h3 className="heading-lg font-semibold text-foreground dark:text-foreground-night">
+            Spaces
+          </h3>
+          <p className="text-sm text-muted-foreground dark:text-muted-foreground-night">
+            Set what knowledge and tools the skill can access.
+          </p>
+        </div>
+        <Button
+          label="Manage"
+          icon={PlanetIcon}
+          variant="outline"
+          disabled={!areSpaceRequirementsReady}
+          onClick={handleOpenSheet}
+        />
       </div>
-      {nonGlobalSpacesUsedInActions.length > 0 && (
+      {nonGlobalSpacesWithRestrictions.length > 0 && (
         <div className="mb-4 w-full">
           <ContentMessage variant="golden" size="lg">
-            Based on your selection of knowledge and tools, this skill can only
-            be used by users with access to space
-            {pluralize(nonGlobalSpacesUsedInActions.length)} :{" "}
+            Based on your selection of spaces, knowledge, and tools, this skill
+            can only be used by users with access to:&nbsp;
             <strong>
-              {nonGlobalSpacesUsedInActions.map((v) => v.name).join(", ")}
+              {nonGlobalSpacesWithRestrictions
+                .map((space) => space.name)
+                .join(", ")}
             </strong>
             .
           </ContentMessage>
         </div>
       )}
       <SpaceChips spaces={spacesToDisplay} onRemoveSpace={handleRemoveSpace} />
+
+      <SpaceSelectionSheet
+        alreadyRequestedSpaceIds={spaceIdsUsedBySkill}
+        entityName="skill"
+        includeProjects={false}
+        missingSpaceIds={missingSpaceIds}
+        onClose={handleCloseSheet}
+        onSave={handleSaveSpaces}
+        open={isSheetOpen}
+        selectedSpaces={draftSelectedSpaces}
+        setSelectedSpaces={setDraftSelectedSpaces}
+      />
     </div>
   );
 }

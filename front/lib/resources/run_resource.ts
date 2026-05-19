@@ -308,7 +308,6 @@ export class RunResource extends BaseResource<RunModel> {
       const tags = [
         `provider_id:${usage.providerId}`,
         `model_id:${usage.modelId}`,
-        `workspace_id:${auth.getNonNullableWorkspace().sId}`,
       ];
 
       getStatsDClient().increment(

@@ -14,10 +14,12 @@ import { getIndexedColor } from "@app/components/agent_builder/observability/uti
 import { ChartContainer } from "@app/components/charts/ChartContainer";
 import { RoundedBarShape } from "@app/components/charts/ChartShapes";
 import { ChartTooltipCard } from "@app/components/charts/ChartTooltip";
+import { useSelectableSeries } from "@app/components/charts/useSelectableSeries";
 import {
   Button,
   ButtonsSwitch,
   ButtonsSwitchList,
+  cn,
   DropdownMenu,
   DropdownMenuCheckboxItem,
   DropdownMenuContent,
@@ -128,20 +130,29 @@ export function SkillUsageChart({
       ? versionData.chartData.length === 0
       : filteredSourceItems.length === 0;
 
+  const visibleSeriesKeys =
+    skillMode === "version" ? versionData.topTools : filteredSkillNames;
+  const { selectedKey, isDimmed, decorate } =
+    useSelectableSeries(visibleSeriesKeys);
+
   const legendItems = useMemo(() => {
     if (skillMode === "version") {
-      return versionData.topTools.map((t) => ({
-        key: t,
-        label: t,
-        colorClassName: getIndexedColor(t, versionData.topTools),
-      }));
+      return decorate(
+        versionData.topTools.map((t) => ({
+          key: t,
+          label: t,
+          colorClassName: getIndexedColor(t, versionData.topTools),
+        }))
+      );
     }
-    return filteredSkillNames.map((name) => ({
-      key: name,
-      label: name,
-      colorClassName: getIndexedColor(name, filteredSkillNames),
-    }));
-  }, [skillMode, versionData.topTools, filteredSkillNames]);
+    return decorate(
+      filteredSkillNames.map((name) => ({
+        key: name,
+        label: name,
+        colorClassName: getIndexedColor(name, filteredSkillNames),
+      }))
+    );
+  }, [skillMode, versionData.topTools, filteredSkillNames, decorate]);
 
   const renderVersionTooltip = useCallback(
     (props: TooltipContentProps<number, string>) => (
@@ -149,10 +160,11 @@ export function SkillUsageChart({
         {...props}
         topTools={versionData.topTools}
         hoveredTool={hoveredTool}
+        selectedKey={selectedKey}
         showLabel
       />
     ),
-    [versionData.topTools, hoveredTool]
+    [versionData.topTools, hoveredTool, selectedKey]
   );
 
   const renderSourceTooltip = useCallback(
@@ -166,6 +178,9 @@ export function SkillUsageChart({
         return null;
       }
       const item = first.payload;
+      if (selectedKey !== undefined && item.skillName !== selectedKey) {
+        return null;
+      }
       const sourceEntries = Object.entries(item.sources)
         .map(([key, val]): [string, number] => [key, Number(val)])
         .sort(([, a], [, b]) => b - a);
@@ -184,7 +199,7 @@ export function SkillUsageChart({
         />
       );
     },
-    []
+    [selectedKey]
   );
 
   const handleSkillToggle = (skill: string, checked: boolean) => {
@@ -317,7 +332,11 @@ export function SkillUsageChart({
               dataKey={(row: ChartDatum) => row.values[toolName]?.count ?? 0}
               stackId="a"
               fill="currentColor"
-              className={getIndexedColor(toolName, versionData.topTools)}
+              className={cn(
+                getIndexedColor(toolName, versionData.topTools),
+                "transition-opacity",
+                isDimmed(toolName) && "opacity-25"
+              )}
               name={toolName}
               shape={
                 <RoundedBarShape
@@ -325,6 +344,7 @@ export function SkillUsageChart({
                   stackOrderKeys={versionData.topTools}
                 />
               }
+              isAnimationActive={false}
               onMouseEnter={() => setHoveredTool(toolName)}
               onMouseLeave={() => setHoveredTool(null)}
             />
@@ -357,12 +377,20 @@ export function SkillUsageChart({
             content={renderSourceTooltip}
             wrapperStyle={{ outline: "none", zIndex: 50 }}
           />
-          <Bar dataKey="totalCount" radius={[4, 4, 0, 0]}>
+          <Bar
+            dataKey="totalCount"
+            radius={[4, 4, 0, 0]}
+            isAnimationActive={false}
+          >
             {filteredSourceItems.map((item) => (
               <Cell
                 key={item.skillName}
                 fill="currentColor"
-                className={getIndexedColor(item.skillName, filteredSkillNames)}
+                className={cn(
+                  getIndexedColor(item.skillName, filteredSkillNames),
+                  "transition-opacity",
+                  isDimmed(item.skillName) && "opacity-25"
+                )}
               />
             ))}
           </Bar>

@@ -1,3 +1,5 @@
+// @migration-status: MIGRATED_TO_HONO
+
 /** @ignoreswagger */
 import { withSessionAuthenticationForWorkspace } from "@app/lib/api/auth_wrappers";
 import type { Authenticator } from "@app/lib/auth";
@@ -6,18 +8,17 @@ import { apiError } from "@app/logger/withlogging";
 import type { WithAPIErrorResponse } from "@app/types/error";
 import type { GroupKind, GroupType } from "@app/types/groups";
 import { GroupKindCodec } from "@app/types/groups";
-import { isLeft } from "fp-ts/lib/Either";
-import * as t from "io-ts";
-import * as reporter from "io-ts-reporters";
 import type { NextApiRequest, NextApiResponse } from "next";
+import { z } from "zod";
+import { fromError } from "zod-validation-error";
 
 export type GetGroupsResponseBody = {
   groups: GroupType[];
 };
 
-const GetGroupsQuerySchema = t.partial({
-  kind: t.union([GroupKindCodec, t.array(GroupKindCodec)]),
-  spaceId: t.string,
+const GetGroupsQuerySchema = z.object({
+  kind: z.union([GroupKindCodec, z.array(GroupKindCodec)]).optional(),
+  spaceId: z.string().optional(),
 });
 
 async function handler(
@@ -27,9 +28,9 @@ async function handler(
 ): Promise<void> {
   switch (req.method) {
     case "GET": {
-      const queryValidation = GetGroupsQuerySchema.decode(req.query);
-      if (isLeft(queryValidation)) {
-        const pathError = reporter.formatValidationErrors(queryValidation.left);
+      const queryValidation = GetGroupsQuerySchema.safeParse(req.query);
+      if (!queryValidation.success) {
+        const pathError = fromError(queryValidation.error).toString();
         return apiError(req, res, {
           status_code: 400,
           api_error: {
@@ -39,7 +40,7 @@ async function handler(
         });
       }
 
-      const { kind, spaceId } = queryValidation.right;
+      const { kind, spaceId } = queryValidation.data;
       const groupKinds: GroupKind[] = kind
         ? Array.isArray(kind)
           ? kind
@@ -60,9 +61,15 @@ async function handler(
         });
       }
 
-      const groupsWithMemberCount = await Promise.all(
-        groups.map((group) => group.toJSONWithMemberCount(auth))
+      const memberCounts = await GroupResource.getMemberCountsForGroups(
+        auth,
+        groups
       );
+
+      const groupsWithMemberCount = groups.map((group) => ({
+        ...group.toJSON(),
+        memberCount: memberCounts.get(group.id) ?? 0,
+      }));
 
       return res.status(200).json({
         groups: groupsWithMemberCount,

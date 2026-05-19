@@ -1,17 +1,37 @@
 import { createConversation } from "@app/lib/api/assistant/conversation";
+import { getConversation } from "@app/lib/api/assistant/conversation/fetch";
+import { Authenticator } from "@app/lib/auth";
 import {
   AgentMessageModel,
   MessageModel,
   UserMessageModel,
 } from "@app/lib/models/agent/conversation";
+import { GroupSpaceMemberResource } from "@app/lib/resources/group_space_member_resource";
 import { generateRandomModelSId } from "@app/lib/resources/string_ids_server";
-import { FeatureFlagFactory } from "@app/tests/utils/FeatureFlagFactory";
 import { createPrivateApiMockRequest } from "@app/tests/utils/generic_private_api_tests";
+import { SpaceFactory } from "@app/tests/utils/SpaceFactory";
 import { GLOBAL_AGENTS_SID } from "@app/types/assistant/assistant";
 import type { ConversationWithoutContentType } from "@app/types/assistant/conversation";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import handler from "./index";
+
+vi.mock("@app/temporal/agent_loop/client", () => ({
+  launchAgentLoopWorkflow: vi.fn(),
+  launchCompactionWorkflow: vi.fn(),
+}));
+
+async function fetchConversationOrThrow(
+  auth: Awaited<ReturnType<typeof createPrivateApiMockRequest>>["auth"],
+  conversationId: string
+) {
+  const result = await getConversation(auth, conversationId);
+  if (result.isErr()) {
+    throw result.error;
+  }
+
+  return result.value;
+}
 
 async function createUserMessage(
   auth: Awaited<ReturnType<typeof createPrivateApiMockRequest>>["auth"],
@@ -99,26 +119,10 @@ describe("POST /api/w/[wId]/assistant/conversations/[cId]/forks", () => {
     expect(res._getStatusCode()).toBe(405);
   });
 
-  it("returns 403 when the sessions branching feature flag is disabled", async () => {
-    const { req, res } = await createPrivateApiMockRequest({
-      method: "POST",
-    });
-
-    req.query.cId = "conv_test";
-    req.body = {};
-
-    await handler(req, res);
-
-    expect(res._getStatusCode()).toBe(403);
-    expect(res._getJSONData().error.type).toBe("feature_flag_not_found");
-  });
-
-  it("creates a fork and returns the child conversation", async () => {
+  it("creates a fork and returns the child conversation id", async () => {
     const { req, res, auth, globalSpace } = await createPrivateApiMockRequest({
       method: "POST",
     });
-
-    await FeatureFlagFactory.basic(auth, "sessions_branching");
 
     const parentConversation = await createConversation(auth, {
       title: "Parent conversation",
@@ -144,25 +148,27 @@ describe("POST /api/w/[wId]/assistant/conversations/[cId]/forks", () => {
     await handler(req, res);
 
     expect(res._getStatusCode()).toBe(200);
-    expect(res._getJSONData().conversation.title).toBe(
-      "Parent conversation (forked)"
-    );
-    expect(res._getJSONData().conversation.forkedFrom).toEqual({
-      parentConversationId: parentConversation.sId,
-      sourceMessageId: sourceMessage.sId,
-      branchedAt: expect.any(Number),
-      user: auth.getNonNullableUser().toJSON(),
+    const { conversationId } = res._getJSONData();
+    const conversation = await fetchConversationOrThrow(auth, conversationId);
+
+    expect(conversation.title).toBeNull();
+    expect(conversation.forkingData).toEqual({
+      forkedFrom: {
+        parentConversationId: parentConversation.sId,
+        parentConversationTitle: "Parent conversation",
+        sourceMessageId: sourceMessage.sId,
+        branchedAt: expect.any(Number),
+        user: auth.getNonNullableUser().toJSON(),
+      },
     });
-    expect(res._getJSONData().conversation.depth).toBe(1);
-    expect(res._getJSONData().conversation.spaceId).toBe(globalSpace.sId);
+    expect(conversation.depth).toBe(1);
+    expect(conversation.spaceId).toBe(globalSpace.sId);
   });
 
   it("accepts an empty string body and resolves the latest source message", async () => {
     const { req, res, auth } = await createPrivateApiMockRequest({
       method: "POST",
     });
-
-    await FeatureFlagFactory.basic(auth, "sessions_branching");
 
     const parentConversation = await createConversation(auth, {
       title: "Parent conversation",
@@ -188,11 +194,17 @@ describe("POST /api/w/[wId]/assistant/conversations/[cId]/forks", () => {
     await handler(req, res);
 
     expect(res._getStatusCode()).toBe(200);
-    expect(res._getJSONData().conversation.forkedFrom).toEqual({
-      parentConversationId: parentConversation.sId,
-      sourceMessageId: sourceMessage.sId,
-      branchedAt: expect.any(Number),
-      user: auth.getNonNullableUser().toJSON(),
+    const { conversationId } = res._getJSONData();
+    const conversation = await fetchConversationOrThrow(auth, conversationId);
+
+    expect(conversation.forkingData).toEqual({
+      forkedFrom: {
+        parentConversationId: parentConversation.sId,
+        parentConversationTitle: "Parent conversation",
+        sourceMessageId: sourceMessage.sId,
+        branchedAt: expect.any(Number),
+        user: auth.getNonNullableUser().toJSON(),
+      },
     });
   });
 
@@ -200,8 +212,6 @@ describe("POST /api/w/[wId]/assistant/conversations/[cId]/forks", () => {
     const { req, res, auth } = await createPrivateApiMockRequest({
       method: "POST",
     });
-
-    await FeatureFlagFactory.basic(auth, "sessions_branching");
 
     const parentConversation = await createConversation(auth, {
       title: "Parent conversation",
@@ -222,5 +232,47 @@ describe("POST /api/w/[wId]/assistant/conversations/[cId]/forks", () => {
 
     expect(res._getStatusCode()).toBe(400);
     expect(res._getJSONData().error.type).toBe("invalid_request_error");
+  });
+
+  it("returns 403 when creating a fork in a project where the user is not a member", async () => {
+    const { req, res, auth, workspace, globalGroup } =
+      await createPrivateApiMockRequest({
+        method: "POST",
+      });
+
+    const projectSpace = await SpaceFactory.project(workspace);
+    const internalAdminAuth = await Authenticator.internalAdminForWorkspace(
+      workspace.sId
+    );
+    await GroupSpaceMemberResource.makeNew(internalAdminAuth, {
+      group: globalGroup,
+      space: projectSpace,
+    });
+
+    const parentConversation = await createConversation(auth, {
+      title: "Parent conversation",
+      visibility: "unlisted",
+      spaceId: projectSpace.id,
+    });
+
+    const userMessage = await createUserMessage(auth, {
+      conversation: parentConversation,
+      rank: 0,
+      content: "Please continue from here.",
+    });
+    const sourceMessage = await createAgentMessage(auth, {
+      conversation: parentConversation,
+      rank: 1,
+      parentId: userMessage.id,
+      status: "succeeded",
+    });
+
+    req.query.cId = parentConversation.sId;
+    req.body = { sourceMessageId: sourceMessage.sId };
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(403);
+    expect(res._getJSONData().error.type).toBe("workspace_auth_error");
   });
 });

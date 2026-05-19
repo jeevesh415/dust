@@ -8,13 +8,34 @@ import {
   useSkillSuggestions,
 } from "@app/hooks/useSkillSuggestions";
 import type { SkillSuggestionType } from "@app/types/suggestions/skill_suggestion";
-import { LightbulbIcon, ScrollArea, Spinner } from "@dust-tt/sparkle";
+import {
+  Chip,
+  ContentMessage,
+  LightbulbIcon,
+  ScrollArea,
+  Spinner,
+} from "@dust-tt/sparkle";
 import { useCallback } from "react";
 import { useFormContext } from "react-hook-form";
 
 export function SkillBuilderSuggestionsPanel() {
-  const { owner, skillId } = useSkillBuilderContext();
+  const {
+    owner,
+    skillId,
+    selectedSuggestionId,
+    setSelectedSuggestionId,
+    acceptInstructionEdits,
+  } = useSkillBuilderContext();
   const { getValues, setValue } = useFormContext<SkillBuilderFormData>();
+
+  const getSkillInstructionsHtml = useCallback(
+    () => getValues("instructionsHtml") ?? "",
+    [getValues]
+  );
+  const getCurrentAgentFacingDescription = useCallback(
+    () => getValues("agentFacingDescription") ?? "",
+    [getValues]
+  );
   const { mcpServerViews } = useMCPServerViewsContext();
 
   const { suggestions, isSuggestionsLoading, mutateSuggestions } =
@@ -29,27 +50,6 @@ export function SkillBuilderSuggestionsPanel() {
     skillId,
     workspaceId: owner.sId,
   });
-
-  const applyInstructionEdits = useCallback(
-    (suggestion: SkillSuggestionType) => {
-      const { instructionEdits } = suggestion.suggestion;
-      if (!instructionEdits || instructionEdits.length === 0) {
-        return;
-      }
-
-      let instructions = getValues("instructions");
-
-      for (const edit of instructionEdits) {
-        instructions = instructions.replaceAll(
-          edit.old_string,
-          edit.new_string
-        );
-      }
-
-      setValue("instructions", instructions, { shouldDirty: true });
-    },
-    [getValues, setValue]
-  );
 
   const applyToolEdits = useCallback(
     (suggestion: SkillSuggestionType) => {
@@ -83,34 +83,74 @@ export function SkillBuilderSuggestionsPanel() {
     [getValues, setValue, mcpServerViews]
   );
 
+  const applyAgentFacingDescriptionEdit = useCallback(
+    (suggestion: SkillSuggestionType) => {
+      const { agentFacingDescriptionEdit } = suggestion.suggestion;
+      if (!agentFacingDescriptionEdit) {
+        return;
+      }
+      setValue("agentFacingDescription", agentFacingDescriptionEdit.content, {
+        shouldDirty: true,
+        shouldValidate: true,
+      });
+    },
+    [setValue]
+  );
+
   const handleAccept = useCallback(
     async (suggestion: SkillSuggestionType) => {
       const result = await patchSuggestions([suggestion.sId], "approved");
       if (result) {
-        applyInstructionEdits(suggestion);
+        acceptInstructionEdits?.(suggestion.sId);
         applyToolEdits(suggestion);
+        applyAgentFacingDescriptionEdit(suggestion);
+        setSelectedSuggestionId(null);
         await mutateSuggestions();
       }
     },
-    [patchSuggestions, mutateSuggestions, applyInstructionEdits, applyToolEdits]
+    [
+      patchSuggestions,
+      mutateSuggestions,
+      acceptInstructionEdits,
+      applyToolEdits,
+      applyAgentFacingDescriptionEdit,
+      setSelectedSuggestionId,
+    ]
   );
 
   const handleDecline = useCallback(
     async (suggestion: SkillSuggestionType) => {
       const result = await patchSuggestions([suggestion.sId], "rejected");
       if (result) {
+        setSelectedSuggestionId(null);
         await mutateSuggestions();
       }
     },
-    [patchSuggestions, mutateSuggestions]
+    [patchSuggestions, mutateSuggestions, setSelectedSuggestionId]
+  );
+
+  const handleSelect = useCallback(
+    (suggestionId: string) => {
+      setSelectedSuggestionId(
+        selectedSuggestionId === suggestionId ? null : suggestionId
+      );
+    },
+    [selectedSuggestionId, setSelectedSuggestionId]
   );
 
   return (
     <div className="flex h-full flex-col">
       <div className="flex flex-col gap-1 px-4 pb-3 pt-4">
-        <h2 className="heading-lg font-semibold text-foreground dark:text-foreground-night">
-          Suggestions
-        </h2>
+        <div className="flex items-center gap-2">
+          <h2 className="heading-lg font-semibold text-foreground dark:text-foreground-night">
+            Suggestions
+          </h2>
+          <Chip size="xs" color="golden" label="Beta" />
+        </div>
+        <ContentMessage variant="info" size="lg">
+          Skill suggestions are currently in beta testing. We are very
+          interested in your feedback to improve the feature.
+        </ContentMessage>
         <p className="text-sm text-muted-foreground dark:text-muted-foreground-night">
           Dust continuously analyses conversations using this skill to suggest
           improvements.
@@ -137,6 +177,13 @@ export function SkillBuilderSuggestionsPanel() {
                 suggestion={suggestion}
                 onAccept={handleAccept}
                 onDecline={handleDecline}
+                getSkillInstructionsHtml={getSkillInstructionsHtml}
+                getCurrentAgentFacingDescription={
+                  getCurrentAgentFacingDescription
+                }
+                isSelected={selectedSuggestionId === suggestion.sId}
+                onSelect={() => handleSelect(suggestion.sId)}
+                workspaceId={owner.sId}
               />
             ))
           )}

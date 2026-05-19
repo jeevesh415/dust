@@ -1,4 +1,5 @@
 /** @ignoreswagger */
+// @migration-status: MIGRATED_TO_HONO
 import { createOnboardingConversationIfNeeded } from "@app/lib/api/assistant/onboarding";
 import { withSessionAuthenticationForWorkspace } from "@app/lib/api/auth_wrappers";
 import type { Authenticator } from "@app/lib/auth";
@@ -9,8 +10,6 @@ import type { NextApiRequest, NextApiResponse } from "next";
 
 export type PostSendOnboardingResponseBody = {
   conversationId: string | null;
-  // TODO(2026-04-08 aubin): field kept for retro-compatibility over older front-end, to remove once.
-  conversationSId: string | null;
 };
 
 async function handler(
@@ -51,7 +50,6 @@ async function handler(
 
   return res.status(200).json({
     conversationId: result.value,
-    conversationSId: result.value,
   });
 }
 

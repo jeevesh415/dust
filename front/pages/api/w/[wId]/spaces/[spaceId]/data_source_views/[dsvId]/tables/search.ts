@@ -1,4 +1,5 @@
 /** @ignoreswagger */
+// @migration-status: MIGRATED_TO_HONO
 import { withSessionAuthenticationForWorkspace } from "@app/lib/api/auth_wrappers";
 import config from "@app/lib/api/config";
 import { getContentNodeFromCoreNode } from "@app/lib/api/content_nodes";
@@ -9,7 +10,8 @@ import type { DataSourceViewResource } from "@app/lib/resources/data_source_view
 import logger from "@app/logger/logger";
 import { apiError } from "@app/logger/withlogging";
 import type { SearchWarningCode } from "@app/types/core/core_api";
-import { CoreAPI, MIN_SEARCH_QUERY_SIZE } from "@app/types/core/core_api";
+import { CoreAPI } from "@app/types/core/core_api";
+import { MIN_SEARCH_QUERY_SIZE } from "@app/types/core/utils";
 import type { DataSourceViewContentNode } from "@app/types/data_source_view";
 import type { WithAPIErrorResponse } from "@app/types/error";
 import type { NextApiRequest, NextApiResponse } from "next";
@@ -57,7 +59,7 @@ async function handler(
     });
   }
 
-  const paginationRes = getCursorPaginationParams(req);
+  const paginationRes = getCursorPaginationParams(req.query);
   if (paginationRes.isErr()) {
     return apiError(req, res, {
       status_code: 400,

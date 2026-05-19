@@ -2,8 +2,8 @@
  * @swagger
  * /api/v1/w/{wId}/analytics/export:
  *   get:
- *     summary: Export workspace analytics as CSV
- *     description: Export analytics data for the workspace identified by {wId} in CSV format.
+ *     summary: Export workspace analytics
+ *     description: Export analytics data for the workspace identified by {wId} in CSV or JSON format.
  *     tags:
  *       - Workspace
  *     security:
@@ -51,22 +51,38 @@
  *         description: IANA timezone name (defaults to UTC)
  *         schema:
  *           type: string
+ *       - in: query
+ *         name: format
+ *         required: false
+ *         description: Output format (defaults to csv)
+ *         schema:
+ *           type: string
+ *           enum: [csv, json]
  *     responses:
  *       200:
- *         description: The analytics data in CSV format
+ *         description: The analytics data in CSV or JSON format
  *         content:
  *           text/csv:
  *             schema:
  *               type: string
+ *           application/json:
+ *             schema:
+ *               type: array
+ *               items:
+ *                 type: object
  *       400:
  *         description: Invalid request query parameters
  *       403:
- *         description: Requires an API key with at least builder role
+ *         description: Requires an API key with admin scope
  *       405:
  *         description: Method not supported
  */
 
-import { exportTable } from "@app/lib/api/analytics/export_tables";
+import type { ExportTableData } from "@app/lib/api/analytics/export_tables";
+import {
+  exportTable,
+  stringifyExportTableAsCsv,
+} from "@app/lib/api/analytics/export_tables";
 import { withPublicAPIAuthentication } from "@app/lib/api/auth_wrappers";
 import type { Authenticator } from "@app/lib/auth";
 import { apiError } from "@app/logger/withlogging";
@@ -76,28 +92,41 @@ import type { NextApiRequest, NextApiResponse } from "next";
 
 async function handler(
   req: NextApiRequest,
-  res: NextApiResponse<WithAPIErrorResponse<string>>,
+  res: NextApiResponse<WithAPIErrorResponse<string | ExportTableData["rows"]>>,
   auth: Authenticator
 ): Promise<void> {
-  if (!auth.isKey() || !auth.isBuilder()) {
+  if (!auth.isKey()) {
     return apiError(req, res, {
       status_code: 403,
       api_error: {
         type: "workspace_auth_error",
+        message: "Workspace analytics export requires API key authentication.",
+      },
+    });
+  }
+  // TODO(api-key-scopes): tighten to admin-only once existing builder-scoped
+  // integrations have been migrated to admin keys. Builder is temporarily
+  // accepted to avoid breaking current callers.
+  if (!auth.isBuilder()) {
+    return apiError(req, res, {
+      status_code: 403,
+      api_error: {
+        type: "insufficient_key_scope",
         message:
-          "Requires an API key with at least builder role to access workspace analytics.",
+          "Workspace analytics export requires an API key with admin scope.",
       },
     });
   }
 
   switch (req.method) {
     case "GET": {
-      const { table, startDate, endDate, timezone } = req.query;
+      const { table, startDate, endDate, timezone, format } = req.query;
       const q = GetAnalyticsExportRequestSchema.safeParse({
         table,
         startDate,
         endDate,
         timezone,
+        format,
       });
       if (!q.success) {
         return apiError(req, res, {
@@ -110,22 +139,29 @@ async function handler(
       }
 
       const owner = auth.getNonNullableWorkspace();
-      const csv = await exportTable({
+      const result = await exportTable({
+        auth,
         table: q.data.table,
         startDate: q.data.startDate,
         endDate: q.data.endDate,
         timezone: q.data.timezone ?? "UTC",
         owner,
+        includeHiddenAgents: auth.isKey(),
       });
 
-      if (csv.isErr()) {
+      if (result.isErr()) {
         return apiError(req, res, {
           status_code: 500,
           api_error: {
             type: "internal_server_error",
-            message: csv.error.message,
+            message: result.error.message,
           },
         });
+      }
+
+      if (q.data.format === "json") {
+        res.setHeader("Content-Type", "application/json");
+        return res.status(200).json(result.value.rows);
       }
 
       res.setHeader("Content-Type", "text/csv");
@@ -133,7 +169,7 @@ async function handler(
         "Content-Disposition",
         `attachment; filename="dust_${q.data.table}_${q.data.startDate}_${q.data.endDate}.csv"`
       );
-      return res.status(200).send(csv.value);
+      return res.status(200).send(stringifyExportTableAsCsv(result.value));
     }
     default:
       return apiError(req, res, {

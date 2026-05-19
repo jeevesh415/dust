@@ -163,14 +163,11 @@ export type AgentFetchVariant = "light" | "full" | "extra_light";
 export type GlobalAgentContext = {
   userMessageRank: number;
   sidekickIsNewAgentFromScratch?: boolean;
-  reinforcedAgentNotification?: {
-    agentName: string;
-    agentConfigurationId: string;
-  };
-  reinforcedSkillNotification?: {
-    skillName: string;
-    skillId: string;
-  };
+  // Pre-formatted text that the Dust global agent should echo as its NOOP
+  // static reply for this turn. Set by `getStaticReplyForUserMessage` when the
+  // triggering user message is a system-posted bootstrap/status update that
+  // carries its own rendered content.
+  staticReply?: string;
 };
 
 export const LightAgentConfigurationSchema = z.object({
@@ -270,6 +267,7 @@ export function getMaxActionsPerStep(depth: number): number {
 export const AgentErrorCategories = [
   "retryable_model_error",
   "context_window_exceeded",
+  "empty_content",
   "provider_internal_error",
   "stream_error",
   "unknown_error",
@@ -372,6 +370,7 @@ export type AgentGenerationCancelledEvent = {
   created: number;
   configurationId: string;
   messageId: string;
+  status: "cancelled" | "interrupted";
 };
 
 // Event sent when the agent loop was gracefully stopped (current step completed, then exited).

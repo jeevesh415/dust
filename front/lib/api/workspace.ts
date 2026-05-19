@@ -1,5 +1,7 @@
+import { updateWorkOSOrganizationName } from "@app/lib/api/workos/organization";
 import type { Authenticator } from "@app/lib/auth";
 import { MAX_SEARCH_EMAILS } from "@app/lib/memberships";
+import { updateMetronomeCustomerName } from "@app/lib/metronome/client";
 import { PlanModel, SubscriptionModel } from "@app/lib/models/plan";
 import { getStripeSubscription } from "@app/lib/plans/stripe";
 import { getUsageToReportForSubscriptionItem } from "@app/lib/plans/usage";
@@ -56,6 +58,44 @@ export async function getWorkspaceInfos(
   }
 
   return renderLightWorkspaceType({ workspace });
+}
+
+/**
+ * Rename a workspace and propagate the new name to external systems
+ * (WorkOS organization, Metronome customer). All three updates must
+ * stay in sync — callers should always go through this helper.
+ */
+export async function renameWorkspace(
+  workspace: LightWorkspaceType,
+  newName: string
+): Promise<Result<void, Error>> {
+  const updateRes = await WorkspaceResource.updateName(workspace.id, newName);
+  if (updateRes.isErr()) {
+    return updateRes;
+  }
+
+  const renamedWorkspace = { ...workspace, name: newName };
+
+  const workOSRes = await updateWorkOSOrganizationName(renamedWorkspace);
+  const metronomeRes = await updateMetronomeCustomerName(renamedWorkspace);
+
+  if (workOSRes.isErr()) {
+    return new Err(
+      new Error(
+        `Failed to update WorkOS organization name: ${workOSRes.error.message}`
+      )
+    );
+  }
+
+  if (metronomeRes.isErr()) {
+    return new Err(
+      new Error(
+        `Failed to update Metronome customer name: ${metronomeRes.error.message}`
+      )
+    );
+  }
+
+  return new Ok(undefined);
 }
 
 export async function removeAllWorkspaceDomains(
@@ -146,41 +186,45 @@ export async function getMembers(
         transaction,
       });
 
-  const usersWithWorkspaces = await Promise.all(
-    memberships.map(async (m) => {
-      let role = "none" as RoleType;
-      let origin: MembershipOriginType | undefined = undefined;
-      if (!m.isRevoked()) {
-        switch (m.role) {
-          case "admin":
-          case "builder":
-          case "user":
-            role = m.role;
-            break;
-          default:
-            role = "none";
-        }
-      }
-      origin = m.origin;
+  // Batch-fetch users that weren't preloaded to avoid N+1 queries.
+  const missingUserModelIds = memberships
+    .filter((m) => !m.user)
+    .map((m) => m.userId);
+  const fetchedUsers = missingUserModelIds.length
+    ? await UserResource.fetchByModelIds(missingUserModelIds, { transaction })
+    : [];
+  const userByModelId = new Map(fetchedUsers.map((u) => [u.id, u]));
 
-      let user: UserResource | null;
-      if (!m.user) {
-        user = await UserResource.fetchByModelId(m.userId, transaction);
-      } else {
-        user = new UserResource(UserModel, m.user);
+  const usersWithWorkspaces = memberships.map((m) => {
+    let role = "none" as RoleType;
+    let origin: MembershipOriginType | undefined = undefined;
+    if (!m.isRevoked()) {
+      switch (m.role) {
+        case "admin":
+        case "builder":
+        case "user":
+          role = m.role;
+          break;
+        default:
+          role = "none";
       }
+    }
+    origin = m.origin;
 
-      if (!user) {
-        return null;
-      }
+    const user = m.user
+      ? new UserResource(UserModel, m.user)
+      : (userByModelId.get(m.userId) ?? null);
 
-      return {
-        ...user.toJSON(),
-        workspaces: [{ ...owner, role, flags: null }],
-        origin,
-      };
-    })
-  );
+    if (!user) {
+      return null;
+    }
+
+    return {
+      ...user.toJSON(),
+      workspaces: [{ ...owner, role, flags: null }],
+      origin,
+    };
+  });
 
   return {
     members: removeNulls(usersWithWorkspaces),
@@ -427,10 +471,22 @@ export interface WorkspaceMetadata {
   maintenance?: "relocation" | "relocation-done";
   killSwitched?: WorkspaceKillSwitchValue;
   allowContentCreationFileSharing?: boolean;
+  allowEmailAgents?: boolean;
   allowVoiceTranscription?: boolean;
+  allowOpenProjects?: boolean;
+  allowManualProjectKnowledgeManagement?: boolean;
+  allowReinforcement?: boolean;
+  allowReinforcementBatchMode?: boolean;
+  privateConversationUrlsByDefault?: boolean;
   autoCreateSpaceForProvisionedGroups?: boolean;
   disableManualInvitations?: boolean;
+  disableExtensionMcpTools?: boolean;
+  disableAuditLogs?: boolean;
+  isBusiness?: boolean;
   phoneCountry?: string;
+  sandboxAllowAgentEgressRequests?: boolean;
+  reinforcementCapMicroUsd?: number;
+  selfImprovementCapPerSkillMicroUsd?: number;
 }
 
 export async function updateWorkspaceMetadata(

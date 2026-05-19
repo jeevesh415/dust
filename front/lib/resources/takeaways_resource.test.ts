@@ -25,8 +25,6 @@ describe("TakeawaysResource", () => {
       expect(takeaway.sId).toMatch(/^tka_/);
       expect(takeaway.workspaceId).toBe(workspace.id);
       expect(takeaway.actionItems).toEqual([]);
-      expect(takeaway.notableFacts).toEqual([]);
-      expect(takeaway.keyDecisions).toEqual([]);
     });
 
     it("should compute the same sId as modelIdToSId", async () => {
@@ -42,54 +40,72 @@ describe("TakeawaysResource", () => {
   describe("updateWithVersion", () => {
     it("should update the content and preserve the sId", async () => {
       const takeaway = await TakeawaysFactory.create(auth, space);
-      const originalSId = takeaway.sId;
+      const originalId = takeaway.sId;
 
-      const fact = {
-        sId: "fact_001",
-        text: "A notable fact",
-        relevantUserIds: [],
-        sourceMessageRank: 1,
+      const actionItem = {
+        sId: "ai_001",
+        shortDescription: "Follow up with customer",
+        assigneeUserId: null,
+        assigneeName: null,
+        detectedCreationRationale: null,
       };
       const updated = await takeaway.updateWithVersion(auth, {
-        actionItems: [],
-        notableFacts: [fact],
-        keyDecisions: [],
+        actionItems: [actionItem],
       });
 
-      expect(updated.sId).toBe(originalSId);
-      expect(updated.notableFacts).toHaveLength(1);
-      expect(updated.notableFacts[0].text).toBe("A notable fact");
+      expect(updated.sId).toBe(originalId);
+      expect(updated.actionItems).toHaveLength(1);
+      expect(updated.actionItems[0].shortDescription).toBe(
+        "Follow up with customer"
+      );
+    });
+
+    it("should throw when called with a different workspace's auth", async () => {
+      const takeaway = await TakeawaysFactory.create(auth, space);
+      const otherSetup = await createResourceTest({ role: "user" });
+
+      await expect(
+        takeaway.updateWithVersion(otherSetup.authenticator, {
+          actionItems: [
+            {
+              sId: "ai_cross",
+              shortDescription: "Cross-tenant action item",
+              assigneeUserId: null,
+              assigneeName: null,
+              detectedCreationRationale: null,
+            },
+          ],
+        })
+      ).rejects.toThrow("Workspace mismatch");
     });
 
     it("should allow multiple successive updates", async () => {
       const takeaway = await TakeawaysFactory.create(auth, space);
 
-      const fact1 = {
-        sId: "fact_001",
-        text: "First fact",
-        relevantUserIds: [],
-        sourceMessageRank: 1,
+      const actionItem1 = {
+        sId: "ai_001",
+        shortDescription: "First action item",
+        assigneeUserId: null,
+        assigneeName: null,
+        detectedCreationRationale: null,
       };
-      const fact2 = {
-        sId: "fact_002",
-        text: "Second fact",
-        relevantUserIds: [],
-        sourceMessageRank: 2,
+      const actionItem2 = {
+        sId: "ai_002",
+        shortDescription: "Second action item",
+        assigneeUserId: null,
+        assigneeName: null,
+        detectedCreationRationale: null,
       };
 
       const v1 = await takeaway.updateWithVersion(auth, {
-        actionItems: [],
-        notableFacts: [fact1],
-        keyDecisions: [],
+        actionItems: [actionItem1],
       });
       const v2 = await v1.updateWithVersion(auth, {
-        actionItems: [],
-        notableFacts: [fact2],
-        keyDecisions: [],
+        actionItems: [actionItem2],
       });
 
       expect(v2.sId).toBe(takeaway.sId);
-      expect(v2.notableFacts[0].text).toBe("Second fact");
+      expect(v2.actionItems[0].shortDescription).toBe("Second action item");
     });
   });
 
@@ -101,8 +117,6 @@ describe("TakeawaysResource", () => {
         conversationId,
         spaceId: space.sId,
         actionItems: [],
-        notableFacts: [],
-        keyDecisions: [],
       });
 
       expect(takeaway.sId).toMatch(/^tka_/);
@@ -111,32 +125,31 @@ describe("TakeawaysResource", () => {
 
     it("should update the existing takeaway on subsequent calls for the same conversation", async () => {
       const conversationId = "conv_testupdate";
-      const fact = {
-        sId: "fact_001",
-        text: "Updated fact",
-        relevantUserIds: [],
-        sourceMessageRank: 1,
+      const actionItem = {
+        sId: "ai_001",
+        shortDescription: "Updated action item",
+        assigneeUserId: null,
+        assigneeName: null,
+        detectedCreationRationale: null,
       };
 
       const first = await TakeawaysResource.makeNewForConversation(auth, {
         conversationId,
         spaceId: space.sId,
         actionItems: [],
-        notableFacts: [],
-        keyDecisions: [],
       });
 
       const second = await TakeawaysResource.makeNewForConversation(auth, {
         conversationId,
         spaceId: space.sId,
-        actionItems: [],
-        notableFacts: [fact],
-        keyDecisions: [],
+        actionItems: [actionItem],
       });
 
       // Same stable identity — the main row was updated in place.
       expect(second.sId).toBe(first.sId);
-      expect(second.notableFacts[0].text).toBe("Updated fact");
+      expect(second.actionItems[0].shortDescription).toBe(
+        "Updated action item"
+      );
     });
   });
 
@@ -148,8 +161,6 @@ describe("TakeawaysResource", () => {
         conversationId,
         spaceId: space.sId,
         actionItems: [],
-        notableFacts: [],
-        keyDecisions: [],
       });
 
       const fetched = await TakeawaysResource.fetchLatestByConversationId(
@@ -176,8 +187,6 @@ describe("TakeawaysResource", () => {
         conversationId,
         spaceId: space.sId,
         actionItems: [],
-        notableFacts: [],
-        keyDecisions: [],
       });
 
       const otherSetup = await createResourceTest({ role: "user" });
@@ -198,8 +207,6 @@ describe("TakeawaysResource", () => {
         conversationId,
         spaceId: space.sId,
         actionItems: [],
-        notableFacts: [],
-        keyDecisions: [],
       });
 
       expect(takeaway).not.toBeNull();
@@ -217,26 +224,23 @@ describe("TakeawaysResource", () => {
 
     it("should also delete version snapshots created by updateWithVersion", async () => {
       const conversationId = "conv_testdeletewithversion";
-      const fact = {
-        sId: "fact_001",
-        text: "A fact",
-        relevantUserIds: [],
-        sourceMessageRank: 1,
+      const actionItem = {
+        sId: "ai_001",
+        shortDescription: "A versioned action item",
+        assigneeUserId: null,
+        assigneeName: null,
+        detectedCreationRationale: null,
       };
 
       const takeaway = await TakeawaysResource.makeNewForConversation(auth, {
         conversationId,
         spaceId: space.sId,
         actionItems: [],
-        notableFacts: [],
-        keyDecisions: [],
       });
 
       // Create a version snapshot.
       const updated = await takeaway.updateWithVersion(auth, {
-        actionItems: [],
-        notableFacts: [fact],
-        keyDecisions: [],
+        actionItems: [actionItem],
       });
 
       await updated.delete(auth, {});

@@ -211,13 +211,19 @@ const handlers: ToolHandlers<typeof MICROSOFT_TEAMS_TOOLS_METADATA> = {
   },
 
   list_messages: async (
-    { teamId, channelId, messageId, fromDate, toDate },
+    { chatId, teamId, channelId, messageId, fromDate, toDate },
     { authInfo }
   ) => {
     const client = await getGraphClient(authInfo);
     if (!client) {
       return new Err(
         new MCPError("Failed to authenticate with Microsoft Graph")
+      );
+    }
+
+    if (!chatId && (!teamId || !channelId)) {
+      return new Err(
+        new MCPError("Either chatId or both teamId and channelId are required.")
       );
     }
 
@@ -248,9 +254,10 @@ const handlers: ToolHandlers<typeof MICROSOFT_TEAMS_TOOLS_METADATA> = {
         );
       };
 
-      const baseEndpoint = messageId
-        ? `/teams/${teamId}/channels/${channelId}/messages/${messageId}/replies`
-        : `/teams/${teamId}/channels/${channelId}/messages`;
+      const messagesSuffix = messageId ? `/${messageId}/replies` : "";
+      const baseEndpoint = chatId
+        ? `/chats/${chatId}/messages${messagesSuffix}`
+        : `/teams/${teamId}/channels/${channelId}/messages${messagesSuffix}`;
 
       // First page
       let response = await client.api(baseEndpoint).top(50).get();
@@ -602,7 +609,18 @@ const handlers: ToolHandlers<typeof MICROSOFT_TEAMS_TOOLS_METADATA> = {
       }
 
       // Get the content of the most recent transcript in text format.
-      const transcriptId = transcripts[transcripts.length - 1].id;
+      // Transcripts are not returned in a guaranteed order, so sort by
+      // createdDateTime descending and pick the first.
+      const latestTranscript = [...transcripts].sort((a, b) => {
+        const aMs = a.createdDateTime
+          ? new Date(a.createdDateTime).getTime() || 0
+          : 0;
+        const bMs = b.createdDateTime
+          ? new Date(b.createdDateTime).getTime() || 0
+          : 0;
+        return bMs - aMs;
+      })[0];
+      const transcriptId = latestTranscript.id;
       const contentResponse = await client
         .api(
           `/me/onlineMeetings/${meetingId}/transcripts/${transcriptId}/content`

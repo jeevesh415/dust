@@ -8,10 +8,12 @@ import { SlackOAuthExtraConfig } from "@app/components/data_source/SlackOAuthExt
 import { SalesforceOauthExtraConfig } from "@app/components/data_source/salesforce/SalesforceOAuthExtractConfig";
 import { ZendeskConfigView } from "@app/components/data_source/ZendeskConfigView";
 import { ZendeskOAuthExtraConfig } from "@app/components/data_source/ZendeskOAuthExtraConfig";
+import { SensitivityLabelsConfig } from "@app/components/shared/labels/SensitivityLabelsConfig";
+import type { SensitivityLabelsController } from "@app/components/shared/labels/types";
 import type { ConnectorPermission } from "@app/types/connectors/connectors_api";
 import type { ConnectorProvider, DataSourceType } from "@app/types/data_source";
 import type { PlanType } from "@app/types/plan";
-import type { WorkspaceType } from "@app/types/user";
+import type { LightWorkspaceType, WorkspaceType } from "@app/types/user";
 import {
   BigQueryLogo,
   ConfluenceLogo,
@@ -32,6 +34,7 @@ import {
   ZendeskLogo,
   ZendeskWhiteLogo,
 } from "@dust-tt/sparkle";
+import type React from "react";
 import type { ComponentType } from "react";
 
 export interface ConnectorOptionsProps {
@@ -40,6 +43,12 @@ export interface ConnectorOptionsProps {
   isAdmin: boolean;
   dataSource: DataSourceType;
   plan: PlanType;
+}
+
+export interface ConnectorAdvancedOptionsProps {
+  owner: LightWorkspaceType;
+  readOnly: boolean;
+  controller: SensitivityLabelsController;
 }
 
 export interface ConnectorOauthExtraConfigProps {
@@ -67,6 +76,7 @@ export type ConnectorProviderUIDetails = {
     isDark?: boolean
   ) => (props: React.SVGProps<SVGSVGElement>) => React.JSX.Element;
   optionsComponent?: ComponentType<ConnectorOptionsProps>;
+  advancedOptionsComponent?: ComponentType<ConnectorAdvancedOptionsProps>;
   description: string;
   mismatchError: string;
   limitations: string | null;
@@ -296,6 +306,7 @@ export const CONNECTOR_UI_CONFIGURATIONS: Record<
     optionsComponent: createConnectorOptionsPdfEnabled(
       "When enabled, PDF documents from your Microsoft OneDrive and SharePoint will be synced and processed by Dust."
     ),
+    advancedOptionsComponent: SensitivityLabelsConfig,
     isNested: true,
     isTitleFilterEnabled: true,
     oauthExtraConfigComponent: MicrosoftOAuthExtraConfig,
@@ -429,9 +440,9 @@ export const CONNECTOR_UI_CONFIGURATIONS: Record<
   },
   dust_project: {
     hide: true,
-    description: "Use Dust project as a data source.",
+    description: "Use Dust Pod as a data source.",
     limitations: null,
-    mismatchError: `You cannot change the Dust project. Please add a new Dust project connection instead.`,
+    mismatchError: `You cannot change the Dust Pod. Please add a new Dust Pod connection instead.`,
     guideLink: null,
     getLogoComponent: () => {
       return DustLogoSquare;

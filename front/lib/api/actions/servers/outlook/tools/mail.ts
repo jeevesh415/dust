@@ -6,11 +6,31 @@ import {
   processAttachment,
 } from "@app/lib/actions/mcp_internal_actions/utils/attachment_processing";
 import { sanitizeFilename } from "@app/lib/actions/mcp_internal_actions/utils/file_utils";
+import { getAllowedLabelsForMCPServer } from "@app/lib/api/actions/servers/microsoft/utils";
 import { OUTLOOK_TOOLS_METADATA } from "@app/lib/api/actions/servers/outlook/mail_metadata";
 import { concurrentExecutor } from "@app/lib/utils/async_utils";
 import { Err, Ok } from "@app/types/shared/result";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import sanitizeHtml from "sanitize-html";
+
+const DEFAULT_MESSAGE_FIELDS = [
+  "id",
+  "conversationId",
+  "subject",
+  "bodyPreview",
+  "importance",
+  "receivedDateTime",
+  "sentDateTime",
+  "hasAttachments",
+  "isDraft",
+  "isRead",
+  "from",
+  "toRecipients",
+  "ccRecipients",
+  "bccRecipients",
+  "replyTo",
+  "parentFolderId",
+];
 
 const fetchFromOutlook = async (
   endpoint: string,
@@ -25,6 +45,13 @@ const fetchFromOutlook = async (
       ...options?.headers,
     },
   });
+};
+
+const getMailboxBasePath = (sharedMailboxAddress?: string): string => {
+  if (sharedMailboxAddress) {
+    return `/users/${encodeURIComponent(sharedMailboxAddress)}`;
+  }
+  return "/me";
 };
 
 const getErrorText = async (response: Response): Promise<string> => {
@@ -67,6 +94,12 @@ interface OutlookMessage {
     };
   }>;
   bccRecipients?: Array<{
+    emailAddress: {
+      address: string;
+      name?: string;
+    };
+  }>;
+  replyTo?: Array<{
     emailAddress: {
       address: string;
       name?: string;
@@ -120,19 +153,21 @@ interface OutlookFolder {
 
 const handlers: ToolHandlers<typeof OUTLOOK_TOOLS_METADATA> = {
   get_messages: async (
-    { search, folderName, top = 10, skip = 0, select },
-    { authInfo }
+    { search, folderName, top = 10, skip = 0, select, sharedMailboxAddress },
+    { authInfo, auth, agentLoopContext }
   ) => {
     const accessToken = authInfo?.token;
     if (!accessToken) {
       return new Err(new MCPError("Authentication required"));
     }
 
+    const basePath = getMailboxBasePath(sharedMailboxAddress);
+
     // If folderName is provided, search for the folder and get its ID
     let folderId: string | undefined;
     if (folderName) {
       const foldersResponse = await fetchFromOutlook(
-        "/me/mailFolders",
+        `${basePath}/mailFolders`,
         accessToken,
         {
           method: "GET",
@@ -167,6 +202,143 @@ const handlers: ToolHandlers<typeof OUTLOOK_TOOLS_METADATA> = {
       folderId = folder.id;
     }
 
+    const allowedLabels = await getAllowedLabelsForMCPServer(
+      auth,
+      agentLoopContext
+    );
+
+    if (allowedLabels.length > 0) {
+      // Two parallel requests:
+      // 1. /search/query with KQL to get messages that have an allowed label.
+      // 2. Regular messages endpoint expanded with the MIP MAPI property
+      //    (msip_labels). Messages where singleValueExtendedProperties is absent
+      //    have no sensitivity label and are safe to include.
+      // Results are merged and deduplicated by id.
+      const MIP_EXTENDED_PROP =
+        "String {00020386-0000-0000-C000-000000000046} Name msip_labels";
+
+      const labelQueryParts = allowedLabels.map(
+        (label) => `InformationProtectionLabelId:${label}`
+      );
+      const labelKql = labelQueryParts.join(" OR ");
+      const labeledQueryString = search
+        ? `(${search}) AND (${labelKql})`
+        : labelKql;
+
+      const searchRequest: Record<string, unknown> = {
+        entityTypes: ["message"],
+        query: { queryString: labeledQueryString },
+        from: skip,
+        size: Math.min(top, 100),
+        fields: select && select.length > 0 ? select : DEFAULT_MESSAGE_FIELDS,
+      };
+      if (sharedMailboxAddress) {
+        searchRequest.contentSources = [
+          `/users/${encodeURIComponent(sharedMailboxAddress)}/messages`,
+        ];
+      }
+
+      // Build the unlabeled messages request using the regular messages endpoint.
+      const unlabeledParams = new URLSearchParams();
+      // Over-fetch to compensate for labeled messages that will be filtered out client-side.
+      unlabeledParams.append("$top", Math.min(top * 2, 100).toString());
+      unlabeledParams.append("$skip", skip.toString());
+      unlabeledParams.append(
+        "$expand",
+        `singleValueExtendedProperties($filter=id eq '${MIP_EXTENDED_PROP}')`
+      );
+      if (search) {
+        unlabeledParams.append("$search", `"${search}"`);
+      }
+      if (select && select.length > 0) {
+        unlabeledParams.append("$select", select.join(","));
+      } else {
+        unlabeledParams.append("$select", DEFAULT_MESSAGE_FIELDS.join(","));
+      }
+      const unlabeledEndpoint = folderId
+        ? `${basePath}/mailFolders/${folderId}/messages?${unlabeledParams.toString()}`
+        : `${basePath}/messages?${unlabeledParams.toString()}`;
+
+      const [labeledResponse, unlabeledResponse] = await Promise.all([
+        fetchFromOutlook("/search/query", accessToken, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ requests: [searchRequest] }),
+        }),
+        fetchFromOutlook(unlabeledEndpoint, accessToken, { method: "GET" }),
+      ]);
+
+      if (!labeledResponse.ok) {
+        const errorText = await getErrorText(labeledResponse);
+        return new Err(
+          new MCPError(
+            `Failed to get messages: ${labeledResponse.status} ${labeledResponse.statusText} - ${errorText}`
+          )
+        );
+      }
+      if (!unlabeledResponse.ok) {
+        const errorText = await getErrorText(unlabeledResponse);
+        return new Err(
+          new MCPError(
+            `Failed to get messages: ${unlabeledResponse.status} ${unlabeledResponse.statusText} - ${errorText}`
+          )
+        );
+      }
+
+      const [labeledResult, unlabeledResult] = await Promise.all([
+        labeledResponse.json(),
+        unlabeledResponse.json(),
+      ]);
+
+      const labeledHits: Array<{ hitId: string; resource: OutlookMessage }> =
+        labeledResult?.value?.[0]?.hitsContainers?.[0]?.hits ?? [];
+      const allUnlabeled: Array<
+        OutlookMessage & {
+          singleValueExtendedProperties?: unknown[];
+        }
+      > = unlabeledResult?.value ?? [];
+      const unlabeledMessages = allUnlabeled.filter(
+        (m) =>
+          !m.singleValueExtendedProperties ||
+          m.singleValueExtendedProperties.length === 0
+      );
+
+      const messages: OutlookMessage[] = [
+        ...labeledHits.map((hit) => ({ ...hit.resource, id: hit.hitId })),
+        ...unlabeledMessages,
+      ]
+        .sort((a, b) => {
+          const aTime = a.sentDateTime ? new Date(a.sentDateTime).getTime() : 0;
+          const bTime = b.sentDateTime ? new Date(b.sentDateTime).getTime() : 0;
+          return bTime - aTime;
+        })
+        .slice(0, top);
+
+      const labeledContainer =
+        labeledResult?.value?.[0]?.hitsContainers?.[0] ?? {};
+
+      return new Ok([
+        { type: "text" as const, text: "Messages fetched successfully" },
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              messages,
+              totalCount:
+                (labeledContainer.total ?? 0) +
+                (unlabeledResult?.["@odata.count"] ?? 0),
+              moreResultsAvailable:
+                labeledContainer.moreResultsAvailable ||
+                !!unlabeledResult?.["@odata.nextLink"],
+            },
+            null,
+            2
+          ),
+        },
+      ]);
+    }
+
+    // Standard path: no sensitivity label filter configured.
     const params = new URLSearchParams();
     params.append("$top", Math.min(top, 100).toString());
 
@@ -179,16 +351,13 @@ const handlers: ToolHandlers<typeof OUTLOOK_TOOLS_METADATA> = {
     if (select && select.length > 0) {
       params.append("$select", select.join(","));
     } else {
-      params.append(
-        "$select",
-        "id,conversationId,subject,bodyPreview,importance,receivedDateTime,sentDateTime,hasAttachments,isDraft,isRead,from,toRecipients,ccRecipients,parentFolderId"
-      );
+      params.append("$select", DEFAULT_MESSAGE_FIELDS.join(","));
     }
 
     // Use different endpoint if folderId is provided
     const endpoint = folderId
-      ? `/me/mailFolders/${folderId}/messages?${params.toString()}`
-      : `/me/messages?${params.toString()}`;
+      ? `${basePath}/mailFolders/${folderId}/messages?${params.toString()}`
+      : `${basePath}/messages?${params.toString()}`;
 
     const response = await fetchFromOutlook(endpoint, accessToken, {
       method: "GET",
@@ -223,17 +392,21 @@ const handlers: ToolHandlers<typeof OUTLOOK_TOOLS_METADATA> = {
     ]);
   },
 
-  get_attachments: async ({ messageId }, { authInfo }) => {
+  get_attachments: async (
+    { messageId, sharedMailboxAddress },
+    { authInfo }
+  ) => {
     const accessToken = authInfo?.token;
     if (!accessToken) {
       return new Err(new MCPError("Authentication required"));
     }
 
+    const basePath = getMailboxBasePath(sharedMailboxAddress);
     const encodedMessageId = encodeURIComponent(messageId);
 
     // List all attachments for the message
     const listResponse = await fetchFromOutlook(
-      `/me/messages/${encodedMessageId}/attachments`,
+      `${basePath}/messages/${encodedMessageId}/attachments`,
       accessToken,
       { method: "GET" }
     );
@@ -340,11 +513,16 @@ const handlers: ToolHandlers<typeof OUTLOOK_TOOLS_METADATA> = {
     return new Ok(allContent);
   },
 
-  get_drafts: async ({ search, top = 10, skip = 0 }, { authInfo }) => {
+  get_drafts: async (
+    { search, top = 10, skip = 0, sharedMailboxAddress },
+    { authInfo }
+  ) => {
     const accessToken = authInfo?.token;
     if (!accessToken) {
       return new Err(new MCPError("Authentication required"));
     }
+
+    const basePath = getMailboxBasePath(sharedMailboxAddress);
 
     const params = new URLSearchParams();
     params.append("$filter", "isDraft eq true");
@@ -357,7 +535,7 @@ const handlers: ToolHandlers<typeof OUTLOOK_TOOLS_METADATA> = {
     }
 
     const response = await fetchFromOutlook(
-      `/me/messages?${params.toString()}`,
+      `${basePath}/messages?${params.toString()}`,
       accessToken,
       { method: "GET" }
     );
@@ -374,7 +552,7 @@ const handlers: ToolHandlers<typeof OUTLOOK_TOOLS_METADATA> = {
       result.value || [],
       async (draft: { id: string }): Promise<OutlookMessage | null> => {
         const draftResponse = await fetchFromOutlook(
-          `/me/messages/${draft.id}`,
+          `${basePath}/messages/${draft.id}`,
           accessToken,
           { method: "GET" }
         );
@@ -405,7 +583,7 @@ const handlers: ToolHandlers<typeof OUTLOOK_TOOLS_METADATA> = {
   },
 
   create_draft: async (
-    { to, cc, bcc, subject, contentType, body, importance = "normal" },
+    { to, cc, bcc, replyTo, subject, contentType, body, importance = "normal" },
     { authInfo }
   ) => {
     const accessToken = authInfo?.token;
@@ -435,6 +613,12 @@ const handlers: ToolHandlers<typeof OUTLOOK_TOOLS_METADATA> = {
 
     if (bcc && bcc.length > 0) {
       message.bccRecipients = bcc.map((email) => ({
+        emailAddress: { address: email },
+      }));
+    }
+
+    if (replyTo && replyTo.length > 0) {
+      message.replyTo = replyTo.map((email) => ({
         emailAddress: { address: email },
       }));
     }
@@ -623,6 +807,7 @@ const handlers: ToolHandlers<typeof OUTLOOK_TOOLS_METADATA> = {
       to,
       cc,
       bcc,
+      replyTo,
       subject,
       contentType = "text",
       body,
@@ -654,6 +839,12 @@ const handlers: ToolHandlers<typeof OUTLOOK_TOOLS_METADATA> = {
 
     if (bcc && bcc.length > 0) {
       message.bccRecipients = bcc.map((email) => ({
+        emailAddress: { address: email },
+      }));
+    }
+
+    if (replyTo && replyTo.length > 0) {
+      message.replyTo = replyTo.map((email) => ({
         emailAddress: { address: email },
       }));
     }

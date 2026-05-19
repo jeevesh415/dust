@@ -5,7 +5,15 @@ import {
   getAuditLogContext,
 } from "@app/lib/api/audit/workos_audit";
 import type { Authenticator } from "@app/lib/auth";
-import { syncSeatCount } from "@app/lib/metronome/seats";
+import { updateSubscriptionSeats } from "@app/lib/metronome/client";
+import type { CachedContract } from "@app/lib/metronome/plan_type";
+import { getActiveContract } from "@app/lib/metronome/plan_type";
+import {
+  getSubscriptionIdForSeatTypeFromContract,
+  handleSeatTransition,
+  hasContractSeatSubscription,
+  syncSeatCount,
+} from "@app/lib/metronome/seats";
 import { MembershipResource } from "@app/lib/resources/membership_resource";
 import { WorkspaceModel } from "@app/lib/resources/storage/models/workspace";
 import { SubscriptionResource } from "@app/lib/resources/subscription_resource";
@@ -19,8 +27,9 @@ import { launchUpdateUsageWorkflow } from "@app/temporal/usage_queue/client";
 import type {
   MembershipOriginType,
   MembershipRoleType,
+  MembershipSeatType,
 } from "@app/types/memberships";
-import { Ok, type Result } from "@app/types/shared/result";
+import { Err, Ok, type Result } from "@app/types/shared/result";
 import type {
   ActiveRoleType,
   LightWorkspaceType,
@@ -40,10 +49,23 @@ async function syncSeatCountForWorkspace(
   if (!subscription?.metronomeContractId) {
     return new Ok(undefined);
   }
+
+  const contract = await getActiveContract(workspace.sId);
+  if (!contract) {
+    return new Ok(undefined);
+  }
+
+  // Gate on seat subscription presence — contracts without a seat product (e.g. enterprise)
+  // should not trigger a seat sync.
+  if (!hasContractSeatSubscription(contract)) {
+    return new Ok(undefined);
+  }
+
   return await syncSeatCount({
     metronomeCustomerId: workspace.metronomeCustomerId,
     contractId: subscription.metronomeContractId,
     workspace,
+    contract,
   });
 }
 
@@ -178,7 +200,7 @@ export async function revokeAndTrackMembership(
       ],
       context: getAuditLogContext(auth),
       metadata: {
-        previousRole: revokeResult.value.role,
+        previous_role: revokeResult.value.role,
       },
     });
 
@@ -276,4 +298,195 @@ export async function updateMembershipRoleAndTrack({
   }
 
   return updateRes;
+}
+
+/**
+ * Schedules the inverse Metronome transition at the same future date,
+ * overriding the previously scheduled seat change. Returns Err if subscription
+ * IDs are missing.
+ */
+async function cancelScheduledSeatChangeInMetronome({
+  metronomeCustomerId,
+  contractId,
+  contract,
+  currentSeatType,
+  scheduledSeatType,
+  scheduledAt,
+  userId,
+}: {
+  metronomeCustomerId: string;
+  contractId: string;
+  contract: CachedContract;
+  currentSeatType: MembershipSeatType;
+  scheduledSeatType: MembershipSeatType;
+  scheduledAt: Date;
+  userId: string;
+}): Promise<Result<void, Error>> {
+  const fromSubId = getSubscriptionIdForSeatTypeFromContract(
+    contract,
+    scheduledSeatType
+  );
+  const toSubId = getSubscriptionIdForSeatTypeFromContract(
+    contract,
+    currentSeatType
+  );
+  if (!fromSubId || !toSubId) {
+    return new Err(
+      new Error(
+        `Missing subscription IDs to cancel scheduled change from ${scheduledSeatType} to ${currentSeatType}`
+      )
+    );
+  }
+  return updateSubscriptionSeats({
+    metronomeCustomerId,
+    contractId,
+    fromSubscriptionId: fromSubId,
+    toSubscriptionId: toSubId,
+    addSeatIds: [userId],
+    removeSeatIds: [userId],
+    startingAt: scheduledAt.toISOString(),
+  });
+}
+
+/**
+ * Update a membership's seat type and re-sync Metronome seat counts.
+ * Seat-based Metronome subscriptions (Pro / Max) bucket users by seat type,
+ * so any change must trigger a seat-count sync.
+ *
+ * Deferred transitions (Max → Pro at next billing period) close the current
+ * membership row at the scheduled date and insert a future row that takes
+ * effect at that date — no separate "pending" state is persisted.
+ */
+export async function updateMembershipSeatAndTrack({
+  user,
+  workspace,
+  newSeatType,
+  author,
+}: {
+  user: UserResource;
+  workspace: LightWorkspaceType;
+  newSeatType: MembershipSeatType;
+  author: UserType | "no-author";
+}): Promise<
+  Result<
+    {
+      previousSeatType: MembershipSeatType;
+      newSeatType: MembershipSeatType;
+      scheduledSeatChangeAt: Date | undefined;
+    },
+    { type: "not_found" | "metronome_error" }
+  >
+> {
+  const membership =
+    await MembershipResource.getActiveMembershipOfUserInWorkspace({
+      user,
+      workspace,
+    });
+  if (!membership) {
+    return new Err({ type: "not_found" });
+  }
+
+  const previousSeatType = membership.seatType;
+  const scheduledRow =
+    await MembershipResource.getScheduledMembershipOfUserInWorkspace({
+      user,
+      workspace,
+    });
+
+  let scheduledAt: Date | undefined;
+
+  if (workspace.metronomeCustomerId) {
+    const subscription =
+      await SubscriptionResource.fetchActiveByWorkspaceModelId(workspace.id);
+    const contract = await getActiveContract(workspace.sId);
+
+    if (
+      subscription?.metronomeContractId &&
+      contract &&
+      hasContractSeatSubscription(contract)
+    ) {
+      const metronomeCustomerId = workspace.metronomeCustomerId;
+      const contractId = subscription.metronomeContractId;
+
+      const transitionResult = await handleSeatTransition({
+        metronomeCustomerId,
+        contractId,
+        contract,
+        userId: user.sId,
+        previousSeatType,
+        newSeatType,
+      });
+      if (transitionResult.isErr()) {
+        logger.error(
+          {
+            workspaceId: workspace.sId,
+            userId: user.sId,
+            previousSeatType,
+            newSeatType,
+            error: transitionResult.error,
+          },
+          "[Metronome] Failed to handle seat transition"
+        );
+        return new Err({ type: "metronome_error" });
+      }
+
+      scheduledAt = transitionResult.value.scheduledAt;
+
+      if (!scheduledAt && scheduledRow) {
+        // Same-seat selection while a future row exists → cancel the scheduled change.
+        const cancelResult = await cancelScheduledSeatChangeInMetronome({
+          metronomeCustomerId,
+          contractId,
+          contract,
+          currentSeatType: membership.seatType,
+          scheduledSeatType: scheduledRow.seatType,
+          scheduledAt: scheduledRow.startAt,
+          userId: user.sId,
+        });
+        if (cancelResult.isErr()) {
+          logger.error(
+            {
+              workspaceId: workspace.sId,
+              userId: user.sId,
+              error: cancelResult.error,
+            },
+            "[Metronome] Failed to cancel scheduled seat change"
+          );
+          return new Err({ type: "metronome_error" });
+        }
+      }
+    }
+  }
+
+  if (scheduledAt) {
+    await membership.scheduleSeatChange({
+      user,
+      workspace,
+      newSeatType,
+      scheduledAt,
+      author,
+    });
+    return new Ok({
+      previousSeatType,
+      newSeatType: previousSeatType,
+      scheduledSeatChangeAt: scheduledAt,
+    });
+  }
+
+  if (scheduledRow) {
+    await membership.cancelScheduledSeatChange({ user, workspace, author });
+  } else if (previousSeatType !== newSeatType) {
+    await membership.updateMembershipSeat({
+      user,
+      workspace,
+      newSeatType,
+      author,
+    });
+  }
+
+  return new Ok({
+    previousSeatType,
+    newSeatType,
+    scheduledSeatChangeAt: undefined,
+  });
 }

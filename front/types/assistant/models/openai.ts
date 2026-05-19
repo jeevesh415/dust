@@ -6,6 +6,7 @@ import type { ModelConfigurationType } from "./types";
 export const GPT_3_5_TURBO_MODEL_ID = "gpt-3.5-turbo" as const;
 // Image generation model IDs (internal-only, not user-selectable)
 export const GPT_IMAGE_1_5_MODEL_ID = "gpt-image-1.5" as const;
+export const GPT_IMAGE_2_MODEL_ID = "gpt-image-2" as const;
 export const GPT_4_TURBO_MODEL_ID = "gpt-4-turbo" as const;
 export const GPT_4O_MODEL_ID = "gpt-4o" as const;
 export const GPT_4_1_MODEL_ID = "gpt-4.1-2025-04-14" as const;
@@ -16,6 +17,7 @@ export const GPT_5_MODEL_ID = "gpt-5" as const;
 export const GPT_5_1_MODEL_ID = "gpt-5.1" as const;
 export const GPT_5_2_MODEL_ID = "gpt-5.2" as const;
 export const GPT_5_4_MODEL_ID = "gpt-5.4" as const;
+export const GPT_5_5_MODEL_ID = "gpt-5.5" as const;
 export const GPT_5_MINI_MODEL_ID = "gpt-5-mini" as const;
 export const GPT_5_NANO_MODEL_ID = "gpt-5-nano" as const;
 export const O1_MODEL_ID = "o1" as const;
@@ -43,6 +45,10 @@ export const GPT_3_5_TURBO_MODEL_CONFIG: ModelConfigurationType = {
   defaultReasoningEffort: "none",
   supportsResponseFormat: false,
   tokenizer: { type: "tiktoken", base: "cl100k_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
 };
 export const GPT_4_TURBO_MODEL_CONFIG: ModelConfigurationType = {
   providerId: "openai",
@@ -64,6 +70,10 @@ export const GPT_4_TURBO_MODEL_CONFIG: ModelConfigurationType = {
   defaultReasoningEffort: "none",
   supportsResponseFormat: false,
   tokenizer: { type: "tiktoken", base: "cl100k_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
 };
 export const GPT_4O_MODEL_CONFIG: ModelConfigurationType = {
   providerId: "openai",
@@ -85,6 +95,10 @@ export const GPT_4O_MODEL_CONFIG: ModelConfigurationType = {
   supportsResponseFormat: true,
   supportsBatchProcessing: true,
   tokenizer: { type: "tiktoken", base: "o200k_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
 };
 export const GPT_4_1_MINI_MODEL_CONFIG: ModelConfigurationType = {
   providerId: "openai",
@@ -106,6 +120,10 @@ export const GPT_4_1_MINI_MODEL_CONFIG: ModelConfigurationType = {
   supportsResponseFormat: true,
   supportsBatchProcessing: true,
   tokenizer: { type: "tiktoken", base: "o200k_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
 };
 export const GPT_4_1_MODEL_CONFIG: ModelConfigurationType = {
   providerId: "openai",
@@ -127,6 +145,10 @@ export const GPT_4_1_MODEL_CONFIG: ModelConfigurationType = {
   supportsResponseFormat: true,
   supportsBatchProcessing: true,
   tokenizer: { type: "tiktoken", base: "o200k_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
 };
 export const GPT_4O_20240806_MODEL_CONFIG: ModelConfigurationType = {
   providerId: "openai",
@@ -148,6 +170,10 @@ export const GPT_4O_20240806_MODEL_CONFIG: ModelConfigurationType = {
   supportsResponseFormat: true,
   supportsBatchProcessing: true,
   tokenizer: { type: "tiktoken", base: "o200k_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
 };
 export const GPT_4O_MINI_MODEL_CONFIG: ModelConfigurationType = {
   providerId: "openai",
@@ -170,6 +196,10 @@ export const GPT_4O_MINI_MODEL_CONFIG: ModelConfigurationType = {
   supportsResponseFormat: false,
   supportsBatchProcessing: true,
   tokenizer: { type: "tiktoken", base: "o200k_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
 };
 export const OPENAI_FORMATTING_META_PROMPT = `# Response Formats
 SYSTEM STYLE: Rich Markdown by default
@@ -227,6 +257,10 @@ export const GPT_5_MODEL_CONFIG: ModelConfigurationType = {
   formattingMetaPrompt: OPENAI_FORMATTING_META_PROMPT,
   toolUseMetaPrompt: OPENAI_TOOL_USE_META_PROMPT,
   tokenizer: { type: "tiktoken", base: "r50k_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
 };
 export const GPT_5_1_MODEL_CONFIG: ModelConfigurationType = {
   providerId: "openai",
@@ -251,6 +285,10 @@ export const GPT_5_1_MODEL_CONFIG: ModelConfigurationType = {
   formattingMetaPrompt: OPENAI_FORMATTING_META_PROMPT,
   toolUseMetaPrompt: OPENAI_TOOL_USE_META_PROMPT,
   tokenizer: { type: "tiktoken", base: "r50k_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
 };
 export const GPT_5_2_MODEL_CONFIG: ModelConfigurationType = {
   providerId: "openai",
@@ -276,6 +314,10 @@ export const GPT_5_2_MODEL_CONFIG: ModelConfigurationType = {
   formattingMetaPrompt: OPENAI_FORMATTING_META_PROMPT,
   toolUseMetaPrompt: OPENAI_TOOL_USE_META_PROMPT,
   tokenizer: { type: "tiktoken", base: "r50k_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
 };
 export const GPT_5_4_MODEL_CONFIG: ModelConfigurationType = {
   providerId: "openai",
@@ -287,6 +329,35 @@ export const GPT_5_4_MODEL_CONFIG: ModelConfigurationType = {
   largeModel: true,
   description:
     "OpenAI's GPT 5.4 model for complex reasoning and agentic tasks (1M context).",
+  shortDescription: "OpenAI's previous flagship model.",
+  isLegacy: false,
+  isLatest: false,
+  generationTokensCount: 128_000,
+  supportsVision: true,
+  minimumReasoningEffort: "none",
+  maximumReasoningEffort: "high",
+  defaultReasoningEffort: "medium",
+  useNativeLightReasoning: true,
+  supportsResponseFormat: true,
+  supportsBatchProcessing: true,
+  formattingMetaPrompt: OPENAI_FORMATTING_META_PROMPT,
+  toolUseMetaPrompt: OPENAI_TOOL_USE_META_PROMPT,
+  tokenizer: { type: "tiktoken", base: "r50k_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
+};
+export const GPT_5_5_MODEL_CONFIG: ModelConfigurationType = {
+  providerId: "openai",
+  modelId: GPT_5_5_MODEL_ID,
+  displayName: "GPT 5.5",
+  contextSize: 1_000_000,
+  recommendedTopK: 32,
+  recommendedExhaustiveTopK: 64,
+  largeModel: true,
+  description:
+    "OpenAI's GPT 5.5 model for complex reasoning, coding, and agentic tasks (1M context).",
   shortDescription: "OpenAI's latest flagship model.",
   isLegacy: false,
   isLatest: true,
@@ -301,6 +372,10 @@ export const GPT_5_4_MODEL_CONFIG: ModelConfigurationType = {
   formattingMetaPrompt: OPENAI_FORMATTING_META_PROMPT,
   toolUseMetaPrompt: OPENAI_TOOL_USE_META_PROMPT,
   tokenizer: { type: "tiktoken", base: "r50k_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
 };
 export const GPT_5_MINI_MODEL_CONFIG: ModelConfigurationType = {
   providerId: "openai",
@@ -326,6 +401,10 @@ export const GPT_5_MINI_MODEL_CONFIG: ModelConfigurationType = {
   formattingMetaPrompt: OPENAI_FORMATTING_META_PROMPT,
   toolUseMetaPrompt: OPENAI_TOOL_USE_META_PROMPT,
   tokenizer: { type: "tiktoken", base: "r50k_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
 };
 export const GPT_5_NANO_MODEL_CONFIG: ModelConfigurationType = {
   providerId: "openai",
@@ -350,6 +429,10 @@ export const GPT_5_NANO_MODEL_CONFIG: ModelConfigurationType = {
   formattingMetaPrompt: OPENAI_FORMATTING_META_PROMPT,
   toolUseMetaPrompt: OPENAI_TOOL_USE_META_PROMPT,
   tokenizer: { type: "tiktoken", base: "r50k_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
 };
 export const O1_MODEL_CONFIG: ModelConfigurationType = {
   providerId: "openai",
@@ -377,6 +460,10 @@ export const O1_MODEL_CONFIG: ModelConfigurationType = {
   },
   supportsResponseFormat: false,
   tokenizer: { type: "tiktoken", base: "o200k_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
 };
 export const O1_MINI_MODEL_CONFIG: ModelConfigurationType = {
   providerId: "openai",
@@ -401,6 +488,10 @@ export const O1_MINI_MODEL_CONFIG: ModelConfigurationType = {
   },
   supportsResponseFormat: false,
   tokenizer: { type: "tiktoken", base: "o200k_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
 };
 export const O3_MODEL_CONFIG: ModelConfigurationType = {
   providerId: "openai",
@@ -425,6 +516,10 @@ export const O3_MODEL_CONFIG: ModelConfigurationType = {
   formattingMetaPrompt: OPENAI_FORMATTING_META_PROMPT,
   toolUseMetaPrompt: OPENAI_TOOL_USE_META_PROMPT,
   tokenizer: { type: "tiktoken", base: "o200k_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
 };
 export const O3_MINI_MODEL_CONFIG: ModelConfigurationType = {
   providerId: "openai",
@@ -449,6 +544,10 @@ export const O3_MINI_MODEL_CONFIG: ModelConfigurationType = {
   formattingMetaPrompt: OPENAI_FORMATTING_META_PROMPT,
   toolUseMetaPrompt: OPENAI_TOOL_USE_META_PROMPT,
   tokenizer: { type: "tiktoken", base: "o200k_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
 };
 export const O4_MINI_MODEL_CONFIG: ModelConfigurationType = {
   providerId: "openai",
@@ -472,4 +571,8 @@ export const O4_MINI_MODEL_CONFIG: ModelConfigurationType = {
   formattingMetaPrompt: OPENAI_FORMATTING_META_PROMPT,
   toolUseMetaPrompt: OPENAI_TOOL_USE_META_PROMPT,
   tokenizer: { type: "tiktoken", base: "o200k_base" },
+  regionalAvailability: {
+    "us-central1": true,
+    "europe-west1": true,
+  },
 };

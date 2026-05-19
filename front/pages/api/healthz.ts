@@ -1,3 +1,5 @@
+// @migration-status: MIGRATED_TO_HONO
+
 /** @ignoreswagger */
 import { getStatsDClient } from "@app/lib/utils/statsd";
 import type { NextApiRequest, NextApiResponse } from "next";

@@ -1,11 +1,9 @@
-import type {
-  ConversationAttachmentRow,
-  FilePanelCategory,
-} from "@app/components/assistant/conversation/files_panel/types";
+import type { ConversationAttachmentRow } from "@app/components/assistant/conversation/files_panel/types";
+import type { FilePanelCategory } from "@app/components/file_explorer/types";
 import {
   CATEGORY_CONFIG,
   MIN_FILES_FOR_SEARCH,
-} from "@app/components/assistant/conversation/files_panel/utils";
+} from "@app/components/file_explorer/utils";
 import { useDebounce } from "@app/hooks/useDebounce";
 import { getFileTypeIcon } from "@app/lib/file_icon_utils";
 import { getFileProcessedUrl } from "@app/lib/swr/files";
@@ -149,7 +147,7 @@ function FileCards({
                     {row.isInProjectContext && (
                       <Tooltip
                         tooltipTriggerAsChild
-                        label="Saved to Project"
+                        label="Saved to Pod"
                         trigger={
                           <span className="inline-flex">
                             <Icon visual={SpaceClosedIcon} size="md" />
@@ -194,7 +192,7 @@ function FileCards({
                   {row.isInProjectContext && (
                     <Tooltip
                       tooltipTriggerAsChild
-                      label="Saved to Project"
+                      label="Saved to Pod"
                       trigger={
                         <span className="inline-flex">
                           <Icon

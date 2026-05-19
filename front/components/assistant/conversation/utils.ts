@@ -2,15 +2,33 @@ import { removeDiacritics, subFilter } from "@app/lib/utils";
 import type {
   AgentMessageType,
   CompactionMessageType,
+  ConversationForkedFromType,
+  ConversationListItemType,
   ConversationWithoutContentType,
   LightAgentMessageType,
   UserMessageType,
   UserMessageTypeWithContentFragments,
 } from "@app/types/assistant/conversation";
+import {
+  getConversationDisplayTitle,
+  isReinforcedSkillNotificationMetadata,
+} from "@app/types/assistant/conversation";
 import type { ContentFragmentType } from "@app/types/content_fragment";
+import { truncate } from "@app/types/shared/utils/string_utils";
 import moment from "moment";
 
 import type { VirtuosoMessage } from "./types";
+
+const MAX_SOURCE_CONVERSATION_TITLE_LENGTH = 50;
+const UNNAMED_PARENT_CONVERSATION_TITLE = "Unnamed parent conversation";
+
+function isReinforcedSkillConversation(
+  conversation: ConversationListItemType
+): boolean {
+  return isReinforcedSkillNotificationMetadata(
+    conversation.metadata?.reinforcedSkillNotification
+  );
+}
 
 type GroupLabel =
   | "Today"
@@ -22,8 +40,11 @@ type GroupLabel =
 
 // We treat the conversations as unread if they are unread or have an action required
 // (note that action required conversations are never marked as unread).
+// Unread reinforced-skill-notification conversations are split out into their own bucket so
+// the sidebar can show them in a dedicated "Skill suggestions" section above the Inbox; once
+// read they fall back into the date-grouped Conversations list like any other read conversation.
 export function getGroupConversationsByUnreadAndActionRequired(
-  conversations: ConversationWithoutContentType[],
+  conversations: ConversationListItemType[],
   titleFilter: string
 ) {
   return (
@@ -36,14 +57,20 @@ export function getGroupConversationsByUnreadAndActionRequired(
             titleFilter &&
             !subFilter(
               removeDiacritics(titleFilter).toLowerCase(),
-              removeDiacritics(conversation.title ?? "").toLowerCase()
+              removeDiacritics(
+                getConversationDisplayTitle(conversation)
+              ).toLowerCase()
             )
           ) {
             return acc;
           }
 
           if (conversation.unread || conversation.actionRequired) {
-            acc.inboxConversations.push(conversation);
+            if (isReinforcedSkillConversation(conversation)) {
+              acc.skillSuggestionConversations.push(conversation);
+            } else {
+              acc.inboxConversations.push(conversation);
+            }
             return acc;
           }
 
@@ -53,28 +80,26 @@ export function getGroupConversationsByUnreadAndActionRequired(
         {
           readConversations: [],
           inboxConversations: [],
+          skillSuggestionConversations: [],
         } as {
-          readConversations: ConversationWithoutContentType[];
-          inboxConversations: ConversationWithoutContentType[];
+          readConversations: ConversationListItemType[];
+          inboxConversations: ConversationListItemType[];
+          skillSuggestionConversations: ConversationListItemType[];
         }
       )
   );
 }
 
-export function getGroupConversationsByDate({
-  conversations,
-  titleFilter,
-}: {
-  conversations: ConversationWithoutContentType[];
-  titleFilter: string;
-}) {
+export function getGroupConversationsByDate<
+  T extends ConversationListItemType,
+>({ conversations, titleFilter }: { conversations: T[]; titleFilter: string }) {
   const today = moment().startOf("day");
   const yesterday = moment().subtract(1, "days").startOf("day");
   const lastWeek = moment().subtract(1, "weeks").startOf("day");
   const lastMonth = moment().subtract(1, "months").startOf("day");
   const lastYear = moment().subtract(1, "years").startOf("day");
 
-  const groups: Record<GroupLabel, ConversationWithoutContentType[]> = {
+  const groups: Record<GroupLabel, T[]> = {
     Today: [],
     Yesterday: [],
     "Last Week": [],
@@ -83,12 +108,14 @@ export function getGroupConversationsByDate({
     Older: [],
   };
 
-  conversations.forEach((conversation: ConversationWithoutContentType) => {
+  conversations.forEach((conversation: T) => {
     if (
       titleFilter &&
       !subFilter(
         removeDiacritics(titleFilter).toLowerCase(),
-        removeDiacritics(conversation.title ?? "").toLowerCase()
+        removeDiacritics(
+          getConversationDisplayTitle(conversation)
+        ).toLowerCase()
       )
     ) {
       return;
@@ -114,9 +141,9 @@ export function getGroupConversationsByDate({
 }
 
 export function filterTriggeredConversations(
-  conversations: ConversationWithoutContentType[],
+  conversations: ConversationListItemType[],
   hideTriggered: boolean
-): ConversationWithoutContentType[] {
+): ConversationListItemType[] {
   if (!hideTriggered) {
     return conversations;
   }
@@ -164,4 +191,94 @@ export function isMessageUnread(
     return true;
   }
   return false;
+}
+
+type CompactionConversationInput = Pick<
+  ConversationWithoutContentType,
+  "forkingData" | "sId"
+>;
+
+export function getParentConversationTitleLabel(
+  parentConversation: Pick<
+    ConversationForkedFromType,
+    "parentConversationTitle"
+  >
+): string {
+  return (
+    parentConversation.parentConversationTitle ??
+    UNNAMED_PARENT_CONVERSATION_TITLE
+  );
+}
+
+function getCompactionParentConversation(
+  message: CompactionMessageType,
+  conversation: CompactionConversationInput
+): ConversationForkedFromType | null {
+  if (
+    !message.sourceConversationId ||
+    message.sourceConversationId === conversation.sId
+  ) {
+    return null;
+  }
+
+  const parentConversation = conversation.forkingData?.forkedFrom;
+  if (
+    parentConversation?.parentConversationId !== message.sourceConversationId
+  ) {
+    return null;
+  }
+
+  return parentConversation;
+}
+
+export function getCompactionInProgressLabel(
+  message: CompactionMessageType,
+  conversation: CompactionConversationInput
+): string {
+  const parentConversation = getCompactionParentConversation(
+    message,
+    conversation
+  );
+
+  if (!parentConversation) {
+    return "Compacting context, this may take a moment…";
+  }
+
+  const parentConversationTitle =
+    getParentConversationTitleLabel(parentConversation);
+  const truncatedParentConversationTitle = truncate(
+    parentConversationTitle,
+    MAX_SOURCE_CONVERSATION_TITLE_LENGTH
+  );
+
+  return `Summarizing '${truncatedParentConversationTitle}', this may take a moment…`;
+}
+
+export function getCompactionSuccessLabel(
+  message: CompactionMessageType,
+  conversation: CompactionConversationInput
+): string {
+  if (
+    !message.sourceConversationId ||
+    message.sourceConversationId === conversation.sId
+  ) {
+    return "Context compacted";
+  }
+
+  const parentConversation = getCompactionParentConversation(
+    message,
+    conversation
+  );
+  if (parentConversation) {
+    const parentConversationTitle =
+      getParentConversationTitleLabel(parentConversation);
+    const truncatedParentConversationTitle = truncate(
+      parentConversationTitle,
+      MAX_SOURCE_CONVERSATION_TITLE_LENGTH
+    );
+
+    return `Summarized '${truncatedParentConversationTitle}' here`;
+  }
+
+  return "Summarized another conversation here";
 }

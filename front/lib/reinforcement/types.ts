@@ -5,14 +5,19 @@ export const DESCRIBE_MCP_TOOL_NAME = "describe_mcp" as const;
 
 export type ExploratoryToolName =
   | "get_available_tools"
+  | "search_knowledge"
   | typeof DESCRIBE_MCP_TOOL_NAME;
 
-export type TerminalToolName = "edit_skill";
+export type TerminalToolName = "edit_skill" | "reject_suggestion";
 
-export const TERMINAL_TOOLS: TerminalToolName[] = ["edit_skill"];
+export const TERMINAL_TOOLS: TerminalToolName[] = [
+  "edit_skill",
+  "reject_suggestion",
+];
 
 export const EXPLORATORY_TOOLS: ExploratoryToolName[] = [
   "get_available_tools",
+  "search_knowledge",
   DESCRIBE_MCP_TOOL_NAME,
 ];
 
@@ -32,21 +37,17 @@ export function isExploratoryToolName(
 }
 
 const SkillInstructionEditArgSchema = z.object({
-  old_string: z
+  targetBlockId: z
     .string()
-    .min(1)
-    .describe("Exact text to find in the current skill instructions."),
-  new_string: z
-    .string()
-    .describe("Replacement text. Empty string deletes the matched span."),
-  expected_occurrences: z
-    .number()
-    .int()
-    .min(1)
-    .default(1)
     .describe(
-      "How many times old_string is expected to appear. Used to validate the edit is still applicable."
+      'The data-block-id of the block to replace. Use "instructions-root" to replace all instructions.'
     ),
+  content: z
+    .string()
+    .describe(
+      "Full replacement content for the block, including its wrapping tag. Must be a single-line string with no literal newlines."
+    ),
+  type: z.literal("replace"),
 });
 
 export const TOOL_SCHEMAS: Record<
@@ -59,7 +60,7 @@ export const TOOL_SCHEMAS: Record<
       .array(SkillInstructionEditArgSchema)
       .optional()
       .describe(
-        "Sequential search-and-replace operations applied to the skill instructions."
+        "Block-targeted edits to the skill instructions. Each item targets one block by its data-block-id."
       ),
     toolEdits: z
       .array(
@@ -74,10 +75,46 @@ export const TOOL_SCHEMAS: Record<
       )
       .optional()
       .describe("Tools to add or remove from the skill."),
+    agentFacingDescriptionEdit: z
+      .object({
+        content: z
+          .string()
+          .min(1)
+          .describe(
+            "The full new agent-facing description (replaces the current one)."
+          ),
+      })
+      .optional()
+      .describe(
+        "Replacement for the skill's agent-facing description. Should typically be its own suggestion, not bundled with instruction or tool edits."
+      ),
     analysis: z
       .string()
       .optional()
       .describe("Why this change improves the skill"),
+    title: z
+      .string()
+      .max(25)
+      .optional()
+      .describe(
+        "A short, action-oriented user-facing title for this suggestion (MUST be at most 25 characters). " +
+          "Only set this when producing final aggregated suggestions; leave unset for synthetic suggestions."
+      ),
+    sourceSuggestionIds: z
+      .array(z.string())
+      .min(1)
+      .optional()
+      .describe(
+        "The sIds of the source suggestions consolidated into this suggestion."
+      ),
+  }),
+  reject_suggestion: z.object({
+    sourceSuggestionIds: z
+      .array(z.string())
+      .min(1)
+      .describe(
+        "The sIds of the source suggestions to reject. Must include at least one suggestion sId."
+      ),
   }),
 };
 
@@ -113,6 +150,8 @@ export interface TerminalToolCallFailure {
 
 export interface ProcessReinforcedSkillsEventsResult {
   suggestionsCreated: number;
+  suggestionsRejected: number;
+  approvedSourceSuggestionIds: string[];
   successfulToolCalls: TerminalToolCallSuccess[];
   failedToolCalls: TerminalToolCallFailure[];
 }

@@ -6,7 +6,10 @@ import {
 import { useSendNotification } from "@app/hooks/useNotification";
 import { clientFetch } from "@app/lib/egress/client";
 import { getErrorFromResponse } from "@app/lib/swr/swr";
-import type { ConversationWithoutContentType } from "@app/types/assistant/conversation";
+import {
+  type ConversationListItemType,
+  getConversationDisplayTitle,
+} from "@app/types/assistant/conversation";
 import type { SpaceType } from "@app/types/space";
 import type { LightWorkspaceType } from "@app/types/user";
 import { useCallback, useContext } from "react";
@@ -15,7 +18,10 @@ export function useMoveConversationToProject(owner: LightWorkspaceType) {
   const sendNotification = useSendNotification();
   const confirm = useContext(ConfirmContext);
 
-  const { mutateConversations } = useConversations({ workspaceId: owner.sId });
+  const { mutateConversations } = useConversations({
+    workspaceId: owner.sId,
+    options: { disabled: true },
+  });
 
   const { mutate: mutateSpaceSummary } = useSpaceConversationsSummary({
     workspaceId: owner.sId,
@@ -24,16 +30,16 @@ export function useMoveConversationToProject(owner: LightWorkspaceType) {
 
   return useCallback(
     async (
-      conversation: ConversationWithoutContentType,
+      conversation: ConversationListItemType,
       space: SpaceType
     ): Promise<boolean> => {
       const confirmed = await confirm({
-        title: "Move conversation to project",
+        title: "Move conversation to Pod",
         message: (
           <div>
             The content of the conversation{" "}
-            <strong>{conversation.title}</strong> will be available to all
-            members of the project <strong>{space.name}</strong>.
+            <strong>{getConversationDisplayTitle(conversation)}</strong> will be
+            available to all members of the Pod <strong>{space.name}</strong>.
           </div>
         ),
         validateLabel: "Move",
@@ -66,11 +72,13 @@ export function useMoveConversationToProject(owner: LightWorkspaceType) {
       }
 
       // Revalidate conversations list to reflect the move
-      void mutateConversations();
+      void mutateConversations((prev) =>
+        prev?.filter((c) => c.sId !== conversation.sId)
+      );
       void mutateSpaceSummary();
       void sendNotification({
         title: "Conversation moved.",
-        description: "The conversation has been moved to the project.",
+        description: "The conversation has been moved to the Pod.",
         type: "success",
       });
 

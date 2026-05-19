@@ -1,12 +1,14 @@
 import type { InternalMCPServerNameType } from "@app/lib/actions/mcp_internal_actions/constants";
 import type { MCPApproveExecutionEvent } from "@app/lib/actions/mcp_internal_actions/events";
 import type { ActionGeneratedFileType } from "@app/lib/actions/types";
+import type { AgentMessageFeedbackDirection } from "@app/lib/api/assistant/conversation/feedbacks";
 import type { AgentMCPActionWithOutputType } from "@app/types/actions";
 import type { AgentContentItemType } from "@app/types/assistant/agent_message_content";
-
+import moment from "moment";
 import type { ContentFragmentType } from "../content_fragment";
 import type { AllSupportedWithDustSpecificFileContentType } from "../files";
 import type { ModelId } from "../shared/model_id";
+import { assertNeverAndIgnore } from "../shared/utils/assert_never";
 import type { UserType, WorkspaceType } from "../user";
 import type {
   AgentConfigurationStatus,
@@ -32,6 +34,11 @@ export type MessageReactionType = {
     username: string;
     fullName: string | null;
   }[];
+};
+
+export type MessageFeedback = {
+  thumbDirection: AgentMessageFeedbackDirection;
+  content: string | null;
 };
 
 export type MessageType =
@@ -81,7 +88,6 @@ export type ClientMessageOrigin =
   | "project_kickoff"
   | "extension"
   | "agent_sidekick"
-  | "reinforced_agent_notification"
   | "reinforced_skill_notification";
 
 export type UserMessageOrigin =
@@ -104,6 +110,7 @@ export type UserMessageOrigin =
   | "transcript"
   | "triggered_programmatic"
   | "triggered"
+  | "wakeup"
   | "zapier"
   | "zendesk"
   // TODO onboarding_conversation, agent_sidekick, and project_kickoff aren't message origins. They
@@ -111,7 +118,10 @@ export type UserMessageOrigin =
   // (to be created).
   | "onboarding_conversation"
   // for internal use, for reinforced agent batch LLM operations
-  | "reinforcement";
+  | "reinforcement"
+  // Internal anchor user message inserted at the start of an empty conversation so
+  // a branch can be created before any user-visible message exists.
+  | "branch_anchor";
 
 /**
  * @swaggerschema Context (swagger_schemas.ts), PrivateUserMessageContext (swagger_private_schemas.ts)
@@ -198,6 +208,29 @@ export function isUserMessageTypeWithContentFragments(
   return arg.type === "user_message" && "contentFragments" in arg;
 }
 
+export function isHiddenMessageOrigin(origin: UserMessageOrigin): boolean {
+  return (
+    origin === "onboarding_conversation" ||
+    origin === "project_kickoff" ||
+    origin === "reinforced_skill_notification" ||
+    origin === "branch_anchor" ||
+    origin === "wakeup"
+  );
+}
+
+export function isVisibleMessage(m: LightMessageType): boolean {
+  return (
+    m.visibility !== "deleted" &&
+    !(
+      isUserMessageTypeWithContentFragments(m) &&
+      isHiddenMessageOrigin(m.context.origin)
+    ) &&
+    // Compaction message will possibly be first messages of a conversation (forking) but they are
+    // not "visible" per se. `firstVisibleMessage` should null until a first user message is posted.
+    !isCompactionMessageType(m)
+  );
+}
+
 /**
  * Agent messages
  */
@@ -206,13 +239,35 @@ export type AgentMessageStatus =
   | "succeeded"
   | "failed"
   | "cancelled"
+  | "interrupted"
   | "gracefully_stopped";
 
 export const AGENT_MESSAGE_STATUSES_TO_TRACK: AgentMessageStatus[] = [
+  // Message can be in "created" status when we stop the loop to ask for user permission for instance.
+  "created",
   "succeeded",
   "cancelled",
+  "interrupted",
   "gracefully_stopped",
 ];
+
+export function isTerminalAgentMessageStatus(
+  status: AgentMessageStatus
+): boolean {
+  switch (status) {
+    case "succeeded":
+    case "failed":
+    case "cancelled":
+    case "interrupted":
+    case "gracefully_stopped":
+      return true;
+    case "created":
+      return false;
+    default:
+      assertNeverAndIgnore(status);
+      return false;
+  }
+}
 
 export interface CitationType {
   description?: string;
@@ -259,6 +314,7 @@ export type InlineActivityStep =
       id: string;
       actionId: string;
       internalMCPServerName: InternalMCPServerNameType | null;
+      toolName: string | null;
     };
 
 export type ParsedContentItem =
@@ -315,6 +371,14 @@ export function isLightAgentMessageWithActionsType(
   return "actions" in message;
 }
 
+// An agent message enriched with user feedback
+export type AgentMessageWithFeedbackType = (
+  | AgentMessageType
+  | LightAgentMessageType
+) & {
+  feedback: MessageFeedback[];
+};
+
 export function isAgentMessageType(arg: MessageType): arg is AgentMessageType {
   return arg.type === "agent_message";
 }
@@ -345,6 +409,7 @@ export type CompactionMessageType = {
   version: number;
   rank: number;
   branchId: string | null;
+  sourceConversationId?: string | null;
   status: CompactionMessageStatus; // Lifecycle: created → succeeded | failed.
   content: string | null; // null while status is "created".
 };
@@ -373,40 +438,137 @@ export function isCompactionMessageType(
  */
 export type ConversationVisibility = "unlisted" | "deleted" | "test";
 
-export type ConversationMetadata = Record<string, unknown>;
+export const CONVERSATION_URL_ACCESS_MODES = [
+  "participants_only",
+  "workspace_members",
+] as const;
 
+export type ConversationUrlAccessMode =
+  (typeof CONVERSATION_URL_ACCESS_MODES)[number];
+
+export const CONVERSATION_METADATA_URL_ACCESS_MODE_KEY = "urlAccessMode";
+
+export type ConversationMetadata = Record<string, unknown> & {
+  urlAccessMode?: ConversationUrlAccessMode;
+  projectTaskId?: string;
+  useFileSystem?: boolean;
+};
+
+export function isConversationUrlAccessMode(
+  value: unknown
+): value is ConversationUrlAccessMode {
+  return value === "participants_only" || value === "workspace_members";
+}
+
+export function getConversationUrlAccessMode(
+  metadata: ConversationMetadata | null | undefined
+): ConversationUrlAccessMode | null {
+  const accessMode = metadata?.[CONVERSATION_METADATA_URL_ACCESS_MODE_KEY];
+  return isConversationUrlAccessMode(accessMode) ? accessMode : null;
+}
+
+export function isReinforcedSkillNotificationMetadata(
+  value: unknown
+): value is { skillName: string; skillId: string } {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  return (
+    "skillName" in value &&
+    typeof value.skillName === "string" &&
+    "skillId" in value &&
+    typeof value.skillId === "string"
+  );
+}
+
+/**
+ * @swaggerschema PrivateConversationForkedFrom (swagger_private_schemas.ts)
+ */
 export type ConversationForkedFromType = {
   parentConversationId: string;
+  parentConversationTitle: string | null;
   sourceMessageId: string;
   branchedAt: number;
   user: UserType;
 };
 
 /**
+ * @swaggerschema PrivateConversationForkedChild (swagger_private_schemas.ts)
+ */
+export type ConversationForkedChildType = {
+  childConversationId: string;
+  childConversationTitle: string | null;
+  sourceMessageId: string;
+  branchedAt: number;
+  user: UserType;
+};
+
+/**
+ * Fields needed to render a conversation row in the sidebar list. Served
+ * directly from Elasticsearch. No DB hydration required.
+ */
+export type ConversationListItemType = {
+  actionRequired: boolean;
+  created: number;
+  hasError: boolean;
+  lastReadMs: number | null;
+  metadata: ConversationMetadata;
+  nextWakeupAt?: number | null;
+  requestedSpaceIds: string[];
+  sId: string;
+  spaceId: string | null;
+  title: string | null;
+  triggerId: string | null;
+  unread: boolean;
+  updated: number;
+  isRunningAgentLoop: boolean;
+};
+
+/**
+ * @swaggerschema PrivateConversationForkingData (swagger_private_schemas.ts)
+ */
+export type ConversationForkingDataType = {
+  forkedFrom?: ConversationForkedFromType;
+  forkedChildren?: ConversationForkedChildType[];
+};
+
+/**
  * A lighter version of Conversation without the content (for menu display).
+ * Extends ConversationListItemType with DB-layer fields used when the full conversation context is
+ * available (individual conversation pages, mutations).
  *
  * @swaggerschema PrivateConversation (swagger_private_schemas.ts)
  */
-export type ConversationWithoutContentType = {
+export type ConversationWithoutContentType = ConversationListItemType & {
   id: ModelId;
-  created: number;
-  updated: number;
-  unread: boolean;
-  lastReadMs: number | null;
-  actionRequired: boolean;
-  hasError: boolean;
-  sId: string;
-  title: string | null;
-  spaceId: string | null;
-  triggerId: string | null;
   depth: number;
-  metadata: ConversationMetadata;
   branchId: string | null;
-  forkedFrom?: ConversationForkedFromType;
-
-  // Ideally, this property should be moved to the ConversationType.
-  requestedSpaceIds: string[];
+  forkingData?: ConversationForkingDataType;
 };
+
+type ConversationDisplayTitleInput = Pick<
+  ConversationWithoutContentType,
+  "created" | "title" | "forkingData"
+>;
+export function getConversationDisplayTitle(
+  conversation: ConversationDisplayTitleInput,
+  now = new Date()
+): string {
+  if (conversation.title) {
+    return conversation.title;
+  }
+
+  const forkedFrom = conversation.forkingData?.forkedFrom;
+  if (forkedFrom) {
+    return forkedFrom.parentConversationTitle
+      ? `Branched from '${forkedFrom.parentConversationTitle}'`
+      : "Branched conversation";
+  }
+
+  return moment(conversation.created).isSame(now, "day")
+    ? "New Conversation"
+    : `Conversation from ${new Date(conversation.created).toLocaleDateString()}`;
+}
 
 /**
  * content [][] structure is intended to allow retries (of agent messages) or edits (of user
@@ -447,7 +609,7 @@ export function isLightConversationType(
   return "content" in conversation && !Array.isArray(conversation.content[0]);
 }
 
-export const isProjectConversation = <T extends ConversationWithoutContentType>(
+export const isProjectConversation = <T extends ConversationListItemType>(
   conversation: T
 ): conversation is T & { spaceId: string } => !!conversation.spaceId;
 
@@ -507,6 +669,7 @@ export type SubmitMessageError = {
     | "attachment_upload_error"
     | "message_send_error"
     | "plan_limit_reached_error"
+    | "credits_exhausted_error"
     | "content_too_large";
   title: string;
   message: string;
@@ -571,6 +734,19 @@ export type ConversationTitleEvent = {
   type: "conversation_title";
   created: number;
   title: string;
+};
+
+// Event sent when the conversation's plan.md is created, edited, approved, or closed. Carries
+// only metadata (id, version, status flags) — the UI refetches the full file contents via the
+// plan_mode GET endpoint on receipt.
+export type PlanUpdatedEvent = {
+  type: "plan_updated";
+  created: number;
+  conversationId: string;
+  planFileId: string;
+  version: number;
+  isClosed: boolean;
+  hasApproval: boolean;
 };
 
 export const ConversationMCPServerViewOrigins = [

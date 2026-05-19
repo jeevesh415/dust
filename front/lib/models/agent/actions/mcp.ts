@@ -207,7 +207,7 @@ export class AgentMCPActionModel extends WorkspaceAwareModel<AgentMCPActionModel
   declare updatedAt: CreationOptional<Date>;
 
   declare mcpServerConfigurationId: string;
-  declare version: number;
+  declare version?: number;
   declare agentMessageId: ForeignKey<AgentMessageModel["id"]>;
   declare stepContentId: ForeignKey<AgentStepContentModel["id"]>;
 
@@ -319,13 +319,13 @@ AgentMessageModel.hasMany(AgentMCPActionModel, {
 });
 
 AgentMCPActionModel.belongsTo(AgentStepContentModel, {
-  foreignKey: { name: "stepContentId", allowNull: false },
+  foreignKey: { name: "stepContentId", allowNull: true },
   as: "stepContent",
   onDelete: "RESTRICT",
 });
 
 AgentStepContentModel.hasMany(AgentMCPActionModel, {
-  foreignKey: { name: "stepContentId", allowNull: false },
+  foreignKey: { name: "stepContentId", allowNull: true },
   as: "agentMCPActions",
 });
 
@@ -399,7 +399,6 @@ AgentMCPActionOutputItemModel.init(
         concurrently: true,
       },
       { fields: ["workspaceId", "id"], concurrently: true },
-      // TODO(2025-11-24 fabien) Remove this useless index when the one on ("workspaceId", "agentMCPActionId") is created.
       {
         fields: ["agentMCPActionId"],
         concurrently: true,
@@ -407,11 +406,6 @@ AgentMCPActionOutputItemModel.init(
       {
         fields: ["fileId"],
         concurrently: true,
-      },
-      {
-        fields: ["workspaceId", "agentMCPActionId"],
-        concurrently: true,
-        name: "agent_mcp_action_output_items_workspace_id_agent_mcp_action_id",
       },
       {
         fields: ["workspaceId", "agentMCPActionId", "contentGcsPath"],

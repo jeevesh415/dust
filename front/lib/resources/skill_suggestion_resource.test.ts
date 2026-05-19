@@ -1,4 +1,6 @@
+import { createConversation } from "@app/lib/api/assistant/conversation";
 import { Authenticator } from "@app/lib/auth";
+import { ConversationResource } from "@app/lib/resources/conversation_resource";
 import type { SkillResource } from "@app/lib/resources/skill/skill_resource";
 import { SkillSuggestionResource } from "@app/lib/resources/skill_suggestion_resource";
 import { createResourceTest } from "@app/tests/utils/generic_resource_tests";
@@ -6,6 +8,7 @@ import { MembershipFactory } from "@app/tests/utils/MembershipFactory";
 import { SkillFactory } from "@app/tests/utils/SkillFactory";
 import { SkillSuggestionFactory } from "@app/tests/utils/SkillSuggestionFactory";
 import { UserFactory } from "@app/tests/utils/UserFactory";
+import type { ConversationType } from "@app/types/assistant/conversation";
 import type { WorkspaceType } from "@app/types/user";
 import { beforeEach, describe, expect, it } from "vitest";
 
@@ -66,9 +69,9 @@ describe("SkillSuggestionResource", () => {
           suggestion: {
             instructionEdits: [
               {
-                old_string: "original",
-                new_string: "Be more detailed",
-                expected_occurrences: 1,
+                targetBlockId: "abc12345",
+                content: "<p>Be more detailed</p>",
+                type: "replace",
               },
             ],
           },
@@ -221,9 +224,9 @@ describe("SkillSuggestionResource", () => {
             suggestion: {
               instructionEdits: [
                 {
-                  old_string: "old",
-                  new_string: `instruction-${i}`,
-                  expected_occurrences: 1,
+                  targetBlockId: "abc12345",
+                  content: `<p>instruction-${i}</p>`,
+                  type: "replace",
                 },
               ],
             },
@@ -534,6 +537,106 @@ describe("SkillSuggestionResource", () => {
     });
   });
 
+  describe("bulkSetNotificationConversation", () => {
+    it("should set the notification conversation on every given suggestion", async () => {
+      const s1 = await SkillSuggestionFactory.create(authenticator, skill);
+      const s2 = await SkillSuggestionFactory.create(authenticator, skill);
+
+      const conversation = await createConversation(authenticator, {
+        title: "Notification",
+        visibility: "unlisted",
+        spaceId: null,
+      });
+
+      await SkillSuggestionResource.bulkSetNotificationConversation(
+        authenticator,
+        [s1, s2],
+        conversation.id
+      );
+
+      const fetched = await SkillSuggestionResource.fetchByIds(authenticator, [
+        s1.sId,
+        s2.sId,
+      ]);
+      expect(fetched).toHaveLength(2);
+      expect(
+        fetched.every((s) => s.notificationConversationId === conversation.sId)
+      ).toBe(true);
+      expect(
+        fetched.every(
+          (s) => s.toJSON().notificationConversationId === conversation.sId
+        )
+      ).toBe(true);
+    });
+
+    it("should not affect other suggestions", async () => {
+      const s1 = await SkillSuggestionFactory.create(authenticator, skill);
+      const s2 = await SkillSuggestionFactory.create(authenticator, skill);
+
+      const conversation = await createConversation(authenticator, {
+        title: "Notification",
+        visibility: "unlisted",
+        spaceId: null,
+      });
+
+      await SkillSuggestionResource.bulkSetNotificationConversation(
+        authenticator,
+        [s1],
+        conversation.id
+      );
+
+      const fetchedS2 = await SkillSuggestionResource.fetchById(
+        authenticator,
+        s2.sId
+      );
+      expect(fetchedS2?.notificationConversationId).toBeNull();
+    });
+
+    it("should be a no-op for empty array", async () => {
+      const conversation = await createConversation(authenticator, {
+        title: "Notification",
+        visibility: "unlisted",
+        spaceId: null,
+      });
+
+      await SkillSuggestionResource.bulkSetNotificationConversation(
+        authenticator,
+        [],
+        conversation.id
+      );
+      // No error thrown.
+    });
+  });
+
+  describe("sourceConversationIds", () => {
+    it("should store and retrieve sourceConversationIds", async () => {
+      const suggestion = await SkillSuggestionFactory.create(
+        authenticator,
+        skill,
+        {
+          sourceConversationIds: [100, 200],
+        }
+      );
+
+      expect(suggestion.sourceConversationIds).toEqual([100, 200]);
+
+      const fetched = await SkillSuggestionResource.fetchById(
+        authenticator,
+        suggestion.sId
+      );
+      expect(fetched?.sourceConversationIds).toEqual([100, 200]);
+    });
+
+    it("should default sourceConversationIds to null", async () => {
+      const suggestion = await SkillSuggestionFactory.create(
+        authenticator,
+        skill
+      );
+
+      expect(suggestion.sourceConversationIds).toBeNull();
+    });
+  });
+
   describe("toJSON", () => {
     it("should return a properly formatted JSON object", async () => {
       const suggestion = await SkillSuggestionFactory.create(
@@ -543,9 +646,9 @@ describe("SkillSuggestionResource", () => {
           suggestion: {
             instructionEdits: [
               {
-                old_string: "old text",
-                new_string: "New instructions",
-                expected_occurrences: 1,
+                targetBlockId: "abc12345",
+                content: "<p>New instructions</p>",
+                type: "replace",
               },
             ],
           },
@@ -560,19 +663,199 @@ describe("SkillSuggestionResource", () => {
       expect(json.suggestion).toMatchObject({
         instructionEdits: [
           {
-            old_string: "old text",
-            new_string: "New instructions",
-            expected_occurrences: 1,
+            targetBlockId: "abc12345",
+            content: "<p>New instructions</p>",
+            type: "replace",
           },
         ],
       });
       expect(json.analysis).toBe("Improved clarity");
+      expect(json.title).toBeNull();
       expect(json.state).toBe("pending");
       expect(json.source).toBe("reinforcement");
       expect(json.skillConfigurationId).toBe(skill.sId);
-      expect(json.sourceConversationId).toBeNull();
+      expect(json.sourceConversationsCount).toBe(0);
+      expect(json.visibleSourceConversationIds).toEqual([]);
       expect(typeof json.createdAt).toBe("number");
       expect(typeof json.updatedAt).toBe("number");
+    });
+
+    it("should include sourceConversationsCount and empty visibleSourceConversationIds for non-existent conversations", async () => {
+      const suggestion = await SkillSuggestionFactory.create(
+        authenticator,
+        skill,
+        {
+          sourceConversationIds: [100, 200],
+        }
+      );
+
+      const json = suggestion.toJSON();
+
+      expect(json.sourceConversationsCount).toBe(2);
+      // Non-existent conversation model IDs are not resolved.
+      expect(json.visibleSourceConversationIds).toEqual([]);
+    });
+
+    it("should round-trip a title through create, fetch, and toJSON", async () => {
+      const title = "Clarify response tone";
+
+      const suggestion = await SkillSuggestionFactory.create(
+        authenticator,
+        skill,
+        { title }
+      );
+      expect(suggestion.toJSON().title).toBe(title);
+
+      const fetched = await SkillSuggestionResource.fetchById(
+        authenticator,
+        suggestion.sId
+      );
+      expect(fetched?.toJSON().title).toBe(title);
+    });
+  });
+
+  describe("visibleSourceConversationIds", () => {
+    let conversation1: ConversationType;
+    let conversation2: ConversationType;
+
+    beforeEach(async () => {
+      conversation1 = await createConversation(authenticator, {
+        title: "Test Conversation 1",
+        visibility: "unlisted",
+        spaceId: null,
+      });
+      conversation2 = await createConversation(authenticator, {
+        title: "Test Conversation 2",
+        visibility: "unlisted",
+        spaceId: null,
+      });
+
+      // Register the user as a participant in both conversations.
+      for (const conversation of [conversation1, conversation2]) {
+        await ConversationResource.upsertParticipation(authenticator, {
+          conversation,
+          action: "posted",
+          user: authenticator.getNonNullableUser().toJSON(),
+        });
+      }
+    });
+
+    it("should expose visible conversation IDs when user is a participant", async () => {
+      const suggestion = await SkillSuggestionFactory.create(
+        authenticator,
+        skill,
+        {
+          sourceConversationIds: [conversation1.id, conversation2.id],
+        }
+      );
+
+      const fetched = await SkillSuggestionResource.fetchById(
+        authenticator,
+        suggestion.sId
+      );
+
+      const json = fetched!.toJSON();
+      expect(json.sourceConversationsCount).toBe(2);
+      // The user created both conversations so is a participant.
+      expect(json.visibleSourceConversationIds.sort()).toEqual(
+        [conversation1.sId, conversation2.sId].sort()
+      );
+    });
+
+    it("should filter out conversations the user cannot access", async () => {
+      // Create a second user who can edit the skill but is not a participant
+      // of conversation2.
+      const otherUser = await UserFactory.basic();
+      await MembershipFactory.associate(workspace, otherUser, {
+        role: "builder",
+      });
+      const otherAuth = await Authenticator.fromUserIdAndWorkspaceId(
+        otherUser.sId,
+        workspace.sId
+      );
+
+      // Create a conversation as the other user (they'll be a participant).
+      const otherConversation = await createConversation(otherAuth, {
+        title: "Other Conversation",
+        visibility: "unlisted",
+        spaceId: null,
+      });
+
+      // Create suggestion with both conversations.
+      const suggestion = await SkillSuggestionFactory.create(
+        authenticator,
+        skill,
+        {
+          sourceConversationIds: [conversation1.id, otherConversation.id],
+        }
+      );
+
+      // Fetch as the original user - they should only see conversation1.
+      const fetched = await SkillSuggestionResource.fetchById(
+        authenticator,
+        suggestion.sId
+      );
+
+      const json = fetched!.toJSON();
+      expect(json.sourceConversationsCount).toBe(2);
+      expect(json.visibleSourceConversationIds).toEqual([conversation1.sId]);
+    });
+
+    it("should bypass access check with dangerouslyBypassConversationsVisibilityCheck", async () => {
+      // Create a second user's conversation.
+      const otherUser = await UserFactory.basic();
+      await MembershipFactory.associate(workspace, otherUser, {
+        role: "builder",
+      });
+      const otherAuth = await Authenticator.fromUserIdAndWorkspaceId(
+        otherUser.sId,
+        workspace.sId
+      );
+      const otherConversation = await createConversation(otherAuth, {
+        title: "Other Conversation",
+        visibility: "unlisted",
+        spaceId: null,
+      });
+
+      const suggestion = await SkillSuggestionFactory.create(
+        authenticator,
+        skill,
+        {
+          sourceConversationIds: [conversation1.id, otherConversation.id],
+        }
+      );
+
+      // Fetch with bypass - should see all conversations.
+      const fetched = await SkillSuggestionResource.fetchById(
+        authenticator,
+        suggestion.sId,
+        { dangerouslyBypassConversationsVisibilityCheck: true }
+      );
+
+      const json = fetched!.toJSON();
+      expect(json.sourceConversationsCount).toBe(2);
+      expect(json.visibleSourceConversationIds.sort()).toEqual(
+        [conversation1.sId, otherConversation.sId].sort()
+      );
+    });
+
+    it("should return empty visibleSourceConversationIds when sourceConversationIds is null", async () => {
+      const suggestion = await SkillSuggestionFactory.create(
+        authenticator,
+        skill,
+        {
+          sourceConversationIds: null,
+        }
+      );
+
+      const fetched = await SkillSuggestionResource.fetchById(
+        authenticator,
+        suggestion.sId
+      );
+
+      const json = fetched!.toJSON();
+      expect(json.sourceConversationsCount).toBe(0);
+      expect(json.visibleSourceConversationIds).toEqual([]);
     });
   });
 });

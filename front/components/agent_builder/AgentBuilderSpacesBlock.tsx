@@ -1,5 +1,5 @@
 import type { AgentBuilderFormData } from "@app/components/agent_builder/AgentBuilderFormContext";
-import { SpaceSelectionPageContent } from "@app/components/agent_builder/capabilities/capabilities_sheet/SpaceSelectionPage";
+import { SpaceSelectionSheet } from "@app/components/agent_builder/capabilities/capabilities_sheet/SpaceSelectionPage";
 import { useSpacesContext } from "@app/components/agent_builder/SpacesContext";
 import { getSpaceIdToActionsMap } from "@app/components/shared/getSpaceIdToActionsMap";
 import { useRemoveSpaceConfirm } from "@app/components/shared/RemoveSpaceDialog";
@@ -10,19 +10,7 @@ import { useFeatureFlags } from "@app/lib/auth/AuthContext";
 import { useSpaceProjectsLookup } from "@app/lib/swr/spaces";
 import { removeNulls } from "@app/types/shared/utils/general";
 import type { SpaceType } from "@app/types/space";
-import {
-  Button,
-  ContentMessage,
-  PlanetIcon,
-  SearchInput,
-  Sheet,
-  SheetContainer,
-  SheetContent,
-  SheetDescription,
-  SheetFooter,
-  SheetHeader,
-  SheetTitle,
-} from "@dust-tt/sparkle";
+import { Button, ContentMessage, PlanetIcon } from "@dust-tt/sparkle";
 import { useMemo, useState } from "react";
 import { useFormContext, useWatch } from "react-hook-form";
 
@@ -65,7 +53,6 @@ export function AgentBuilderSpacesBlock({
 
   const [isSheetOpen, setIsSheetOpen] = useState(false);
   const [draftSelectedSpaces, setDraftSelectedSpaces] = useState<string[]>([]);
-  const [spaceSearchQuery, setSpaceSearchQuery] = useState("");
 
   const selectedSkills = useWatch<AgentBuilderFormData, "skills">({
     name: "skills",
@@ -190,7 +177,7 @@ export function AgentBuilderSpacesBlock({
       <div className="flex items-start justify-between">
         <div>
           <h2 className="heading-lg text-foreground dark:text-foreground-night">
-            {isProjectsEnabled ? "Spaces and Projects" : "Spaces"}
+            {isProjectsEnabled ? "Spaces and Pods" : "Spaces"}
           </h2>
           <p className="text-sm text-muted-foreground dark:text-muted-foreground-night">
             Set what knowledge and capabilities the agent can access.
@@ -217,52 +204,16 @@ export function AgentBuilderSpacesBlock({
       )}
       <SpaceChips spaces={spacesToDisplay} onRemoveSpace={handleRemoveSpace} />
 
-      <Sheet open={isSheetOpen} onOpenChange={handleCloseSheet}>
-        <SheetContent>
-          <SheetHeader>
-            <SheetTitle>
-              {isProjectsEnabled ? "Add Spaces and Projects" : "Add Spaces"}
-            </SheetTitle>
-            <SheetDescription>
-              {isProjectsEnabled
-                ? "Choose the spaces and projects you want the agent to have access to."
-                : "Choose the spaces you want the agent to have access to."}
-            </SheetDescription>
-            <SearchInput
-              name="space"
-              onChange={(s) => setSpaceSearchQuery(s)}
-              value={spaceSearchQuery}
-              placeholder={
-                isProjectsEnabled
-                  ? "Search spaces and projects"
-                  : "Search spaces"
-              }
-              className="mt-4"
-            />
-          </SheetHeader>
-          <SheetContainer isListSelector>
-            <SpaceSelectionPageContent
-              alreadyRequestedSpaceIds={actionsAndSkillsRequestedSpaceIds}
-              selectedSpaces={draftSelectedSpaces}
-              setSelectedSpaces={setDraftSelectedSpaces}
-              searchQuery={spaceSearchQuery}
-              missingSpaceIds={missingSpaceIds}
-            />
-          </SheetContainer>
-          <SheetFooter
-            leftButtonProps={{
-              label: "Cancel",
-              variant: "outline",
-              onClick: handleCloseSheet,
-            }}
-            rightButtonProps={{
-              label: "Save",
-              variant: "primary",
-              onClick: handleSaveSpaces,
-            }}
-          />
-        </SheetContent>
-      </Sheet>
+      <SpaceSelectionSheet
+        alreadyRequestedSpaceIds={actionsAndSkillsRequestedSpaceIds}
+        entityName="agent"
+        missingSpaceIds={missingSpaceIds}
+        onClose={handleCloseSheet}
+        onSave={handleSaveSpaces}
+        open={isSheetOpen}
+        selectedSpaces={draftSelectedSpaces}
+        setSelectedSpaces={setDraftSelectedSpaces}
+      />
     </div>
   );
 }

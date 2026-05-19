@@ -30,6 +30,7 @@ export class ConversationModel extends WorkspaceAwareModel<ConversationModel> {
   declare title: string | null;
   declare visibility: CreationOptional<ConversationVisibility>;
   declare depth: CreationOptional<number>;
+  declare isRunningAgentLoop: CreationOptional<boolean>;
   declare triggerId: ForeignKey<TriggerModel["id"]> | null;
   declare hasError: CreationOptional<boolean>;
   declare metadata: CreationOptional<ConversationMetadata>;
@@ -71,6 +72,11 @@ ConversationModel.init(
       type: DataTypes.INTEGER,
       allowNull: false,
       defaultValue: 0,
+    },
+    isRunningAgentLoop: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
     },
     requestedSpaceIds: {
       type: DataTypes.ARRAY(DataTypes.BIGINT),
@@ -146,7 +152,6 @@ export class ConversationParticipantModel extends WorkspaceAwareModel<Conversati
   declare updatedAt: CreationOptional<Date>;
 
   declare action: ParticipantActionType;
-  declare unread?: boolean;
   declare actionRequired: boolean;
 
   declare conversationId: ForeignKey<ConversationModel["id"]>;
@@ -171,11 +176,6 @@ ConversationParticipantModel.init(
       type: DataTypes.STRING,
       allowNull: false,
     },
-    unread: {
-      type: DataTypes.BOOLEAN,
-      allowNull: false,
-      defaultValue: false,
-    },
     actionRequired: {
       type: DataTypes.BOOLEAN,
       allowNull: false,
@@ -189,9 +189,6 @@ ConversationParticipantModel.init(
       {
         fields: ["workspaceId", "userId", "conversationId"],
         unique: true,
-      },
-      {
-        fields: ["workspaceId", "conversationId"],
       },
       {
         fields: ["workspaceId", "userId", "action"],
@@ -244,7 +241,9 @@ UserConversationReadsModel.init(
         unique: true,
       },
       {
-        fields: ["workspaceId", "conversationId"],
+        fields: ["conversationId"],
+        name: "user_conversation_reads_conversation_id",
+        concurrently: true,
       },
       {
         fields: ["workspaceId", "userId"],
@@ -634,7 +633,11 @@ AgentMessageFeedbackModel.init(
         name: "agent_message_feedbacks_agent_configuration_id_agent_message_id",
       },
       { fields: ["workspaceId"], concurrently: true },
-      { fields: ["workspaceId", "conversationId"], concurrently: true },
+      {
+        fields: ["conversationId"],
+        name: "agent_message_feedbacks_conversation_id",
+        concurrently: true,
+      },
     ],
   }
 );
@@ -665,6 +668,8 @@ AgentMessageFeedbackModel.belongsTo(AgentMessageModel, {
 export class CompactionMessageModel extends WorkspaceAwareModel<CompactionMessageModel> {
   declare createdAt: CreationOptional<Date>;
   declare updatedAt: CreationOptional<Date>;
+  declare runIds: string[] | null;
+  declare sourceConversationId: string | null;
 
   declare status: CompactionMessageStatus;
   declare content: string | null;
@@ -681,6 +686,14 @@ CompactionMessageModel.init(
       type: DataTypes.DATE,
       allowNull: false,
       defaultValue: DataTypes.NOW,
+    },
+    runIds: {
+      type: DataTypes.ARRAY(DataTypes.STRING),
+      allowNull: true,
+    },
+    sourceConversationId: {
+      type: DataTypes.STRING,
+      allowNull: true,
     },
     status: {
       type: DataTypes.STRING,
@@ -825,6 +838,11 @@ MessageModel.init(
       },
       {
         fields: ["branchId"],
+        concurrently: true,
+      },
+      {
+        fields: ["conversationId"],
+        name: "messages_conversation_id",
         concurrently: true,
       },
       {

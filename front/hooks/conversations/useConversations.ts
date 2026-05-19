@@ -4,7 +4,7 @@ import {
   useSWRInfiniteWithDefaults,
 } from "@app/lib/swr/swr";
 import type { GetConversationsResponseBody } from "@app/pages/api/w/[wId]/assistant/conversations";
-import type { ConversationWithoutContentType } from "@app/types/assistant/conversation";
+import type { ConversationListItemType } from "@app/types/assistant/conversation";
 import { useCallback, useMemo } from "react";
 import type { Fetcher } from "swr";
 import type { SWRInfiniteMutatorOptions } from "swr/infinite";
@@ -12,8 +12,8 @@ import type { SWRInfiniteMutatorOptions } from "swr/infinite";
 const DEFAULT_LIMIT = 100;
 
 type ConversationsUpdater = (
-  prevData: ConversationWithoutContentType[] | undefined
-) => ConversationWithoutContentType[] | undefined;
+  prevData: ConversationListItemType[] | undefined
+) => ConversationListItemType[] | undefined;
 
 type MutateOptions = {
   revalidate?: boolean;
@@ -22,9 +22,11 @@ type MutateOptions = {
 export function useConversations({
   workspaceId,
   limit = DEFAULT_LIMIT,
+  options,
 }: {
   workspaceId: string;
   limit?: number;
+  options?: { disabled?: boolean };
 }) {
   const { fetcher } = useFetcher();
   const conversationsFetcher: Fetcher<GetConversationsResponseBody> = fetcher;
@@ -53,12 +55,13 @@ export function useConversations({
         revalidateFirstPage: false,
         revalidateOnFocus: false,
         revalidateOnReconnect: false,
+        disabled: options?.disabled,
       }
     );
 
   const conversations = useMemo(() => {
     if (!data) {
-      return emptyArray<ConversationWithoutContentType>();
+      return emptyArray<ConversationListItemType>();
     }
     return data.flatMap((page) => page.conversations);
   }, [data]);
@@ -114,7 +117,7 @@ export function useConversations({
 
   return {
     conversations,
-    isConversationsLoading: !error && !data,
+    isConversationsLoading: !error && !data && !options?.disabled,
     isConversationsError: error,
     mutateConversations,
     hasMore,

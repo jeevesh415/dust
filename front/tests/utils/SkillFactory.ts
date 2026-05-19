@@ -1,7 +1,8 @@
 import type { Authenticator } from "@app/lib/auth";
 import { AgentSkillModel } from "@app/lib/models/agent/agent_skill";
 import type { MCPServerViewResource } from "@app/lib/resources/mcp_server_view_resource";
-import type { GlobalSkillId } from "@app/lib/resources/skill/global/registry";
+import type { GlobalSkillId } from "@app/lib/resources/skill/code_defined/global_registry";
+import type { SystemSkillId } from "@app/lib/resources/skill/code_defined/system_registry";
 import type { SkillAttachedKnowledge } from "@app/lib/resources/skill/skill_resource";
 import { SkillResource } from "@app/lib/resources/skill/skill_resource";
 import { SKILL_ICON } from "@app/lib/skill";
@@ -10,6 +11,13 @@ import type { ModelId } from "@app/types/shared/model_id";
 import assert from "assert";
 
 export class SkillFactory {
+  static withExtendedSkill(
+    skill: SkillResource,
+    extendedSkill: SkillResource | null = null
+  ): SkillResource & { extendedSkill: SkillResource | null } {
+    return Object.assign(Object.create(skill), { extendedSkill });
+  }
+
   static async create(
     auth: Authenticator,
     overrides: Partial<{
@@ -17,9 +25,11 @@ export class SkillFactory {
       agentFacingDescription: string;
       userFacingDescription: string;
       instructions: string;
+      instructionsHtml: string | null;
       status: SkillStatus;
       version: number;
       requestedSpaceIds: ModelId[];
+      addCurrentUserAsEditor: boolean;
       attachedKnowledge: SkillAttachedKnowledge[];
       mcpServerViews: MCPServerViewResource[];
     }> = {}
@@ -46,6 +56,7 @@ export class SkillFactory {
         agentFacingDescription,
         userFacingDescription,
         instructions,
+        instructionsHtml: overrides.instructionsHtml,
         name,
         requestedSpaceIds,
         status,
@@ -54,6 +65,7 @@ export class SkillFactory {
       },
       {
         mcpServerViews,
+        addCurrentUserAsEditor: overrides.addCurrentUserAsEditor,
         attachedKnowledge,
       }
     );
@@ -87,7 +99,7 @@ export class SkillFactory {
       globalSkillId,
       agentConfigurationId,
     }: {
-      globalSkillId: GlobalSkillId;
+      globalSkillId: GlobalSkillId | SystemSkillId;
       agentConfigurationId: ModelId;
     }
   ): Promise<AgentSkillModel> {

@@ -68,7 +68,10 @@ import type {
   LightAgentConfigurationType,
 } from "@app/types/assistant/agent";
 import { MAX_STEPS_USE_PER_RUN_LIMIT } from "@app/types/assistant/agent";
-import { isGlobalAgentId } from "@app/types/assistant/assistant";
+import {
+  GLOBAL_AGENTS_SID,
+  isGlobalAgentId,
+} from "@app/types/assistant/assistant";
 import { CLAUDE_SONNET_4_6_DEFAULT_MODEL_CONFIG } from "@app/types/assistant/models/anthropic";
 import { validateResponseFormat } from "@app/types/assistant/models/utils";
 import { CoreAPI } from "@app/types/core/core_api";
@@ -408,6 +411,40 @@ export async function searchAgentConfigurationsByName(
   });
 
   return removeNulls(agents);
+}
+
+/**
+ * Resolve an agent configuration sId from a name. Searches workspace agents and
+ * global agents (case-insensitive substring), preferring an exact match. Returns
+ * null when no agent matches.
+ */
+export async function resolveAgentConfigurationIdByName(
+  auth: Authenticator,
+  agentName: string
+): Promise<string | null> {
+  const normalizedAgentName = agentName.trim().toLowerCase();
+  if (normalizedAgentName === "dust" || normalizedAgentName === "dust agent") {
+    return GLOBAL_AGENTS_SID.DUST;
+  }
+
+  const workspaceMatches = await searchAgentConfigurationsByName(
+    auth,
+    agentName
+  );
+  const globalAgents = await getGlobalAgents(auth, undefined, "light");
+  const globalMatches = globalAgents.filter((a) =>
+    a.name.toLowerCase().includes(normalizedAgentName)
+  );
+  const matches = [...workspaceMatches, ...globalMatches];
+  if (matches.length === 0) {
+    return null;
+  }
+
+  // Prefer exact case-insensitive match, otherwise fallback to first result.
+  const exactMatch = matches.find(
+    (a) => a.name.trim().toLowerCase() === normalizedAgentName
+  );
+  return exactMatch?.sId ?? matches[0].sId;
 }
 
 export async function createAgentConfiguration(
@@ -867,7 +904,7 @@ export async function createAgentConfiguration(
         ],
         context: getAuditLogContext(auth),
         metadata: {
-          agentName: agentConfiguration.name,
+          agent_name: agentConfiguration.name,
           scope: scope,
           model: `${model.providerId}/${model.modelId}`,
         },
@@ -1280,7 +1317,7 @@ export async function archiveAgentConfiguration(
       ],
       context: getAuditLogContext(auth),
       metadata: {
-        agentName: agentConfig.name,
+        agent_name: agentConfig.name,
       },
     });
   }
@@ -1293,7 +1330,10 @@ export async function restoreAgentConfiguration(
   auth: Authenticator,
   agentConfigurationId: string
 ): Promise<
-  Result<{ restored: boolean }, DustError<"name_conflict" | "internal_error">>
+  Result<
+    { restored: boolean },
+    DustError<"name_conflict" | "internal_error" | "unauthorized">
+  >
 > {
   const owner = auth.getNonNullableWorkspace();
 
@@ -1314,6 +1354,19 @@ export async function restoreAgentConfiguration(
     return new Err(
       new DustError("internal_error", "Agent configuration is not archived")
     );
+  }
+
+  // Check publishing restrictions: restoring a visible agent is equivalent to publishing it.
+  if (latestConfig.scope === "visible") {
+    const { canPublish, message } = await canPublishAgent(auth);
+    if (!canPublish) {
+      return new Err(
+        new DustError(
+          "unauthorized",
+          message ?? "Publishing agents is restricted."
+        )
+      );
+    }
   }
 
   // Check for an active agent with the same name to avoid a unique constraint violation on
@@ -1401,7 +1454,7 @@ export async function restoreAgentConfiguration(
       ],
       context: getAuditLogContext(auth),
       metadata: {
-        agentName: latestConfig.name,
+        agent_name: latestConfig.name,
       },
     });
   }
@@ -1677,100 +1730,139 @@ async function canPublishAgent(auth: Authenticator): Promise<{
   return { canPublish: false, message: PUBLISHING_RESTRICTIONS[level].message };
 }
 
-export async function updateAgentConfigurationScope(
+export async function updateAgentConfigurationsScope(
   auth: Authenticator,
-  agentConfigurationId: string,
+  agentIds: string[],
   scope: Exclude<AgentConfigurationScope, "global">
 ): Promise<Result<void, Error>> {
-  const agentConfig = await getAgentConfiguration(auth, {
-    agentId: agentConfigurationId,
+  if (agentIds.length === 0) {
+    return new Ok(undefined);
+  }
+
+  const agentConfigs = await getAgentConfigurations(auth, {
+    agentIds,
     variant: "light",
   });
 
-  if (!agentConfig) {
-    return new Err(new Error(`Could not find agent ${agentConfigurationId}`));
+  const editableAgents = agentConfigs.filter(
+    (a) => a.canEdit || auth.isAdmin()
+  );
+  if (editableAgents.length === 0) {
+    return new Ok(undefined);
   }
 
   const { canPublish, message } = await canPublishAgent(auth);
-  if (
-    !canPublish &&
-    agentConfig.scope !== "visible" &&
-    scope === "visible" &&
-    agentConfig.status === "active"
-  ) {
-    return new Err(new Error(message ?? "Publishing agents is restricted."));
+  if (scope === "visible" && !canPublish) {
+    if (
+      editableAgents.some((a) => a.scope !== "visible" && a.status === "active")
+    ) {
+      return new Err(new Error(message ?? "Publishing agents is restricted."));
+    }
   }
 
-  const previousScope = agentConfig.scope;
+  // Snapshot previous scopes before the bulk UPDATE so downstream logic doesn't depend on
+  // the in-memory agent objects being untouched by the static Sequelize update.
+  const previousScopeByAgentId = new Map(
+    editableAgents.map((a) => [a.sId, a.scope])
+  );
+
   await AgentConfigurationModel.update(
     { scope },
     {
       where: {
-        id: agentConfig.id,
+        id: { [Op.in]: editableAgents.map((a) => a.id) },
       },
     }
   );
 
-  void emitAuditLogEvent({
-    auth,
-    action: "agent.scope_changed",
-    targets: [
-      buildAuditLogTarget("workspace", auth.getNonNullableWorkspace()),
-      buildAuditLogTarget("agent", agentConfig),
-    ],
-    context: getAuditLogContext(auth),
-    metadata: {
-      agentName: agentConfig.name,
-      previousScope: previousScope,
-      newScope: scope,
-    },
-  });
+  for (const agentConfig of editableAgents) {
+    void emitAuditLogEvent({
+      auth,
+      action: "agent.scope_changed",
+      targets: [
+        buildAuditLogTarget("workspace", auth.getNonNullableWorkspace()),
+        buildAuditLogTarget("agent", agentConfig),
+      ],
+      context: getAuditLogContext(auth),
+      metadata: {
+        agent_name: agentConfig.name,
+        previous_scope:
+          previousScopeByAgentId.get(agentConfig.sId) ?? agentConfig.scope,
+        new_scope: scope,
+      },
+    });
+  }
 
   // When scope changes from visible to hidden, disable triggers for non-editors.
   // Non-editors will no longer have access to the hidden agent.
-  if (previousScope === "visible" && scope === "hidden") {
-    const triggers = await TriggerResource.listByAgentConfigurationId(
-      auth,
-      agentConfigurationId
+  if (scope === "hidden") {
+    const transitioningAgents = editableAgents.filter(
+      (a) => previousScopeByAgentId.get(a.sId) === "visible"
     );
-
-    if (triggers.length > 0) {
-      // Get the editor group to find who can still access the agent
-      const editorGroupRes = await GroupResource.findEditorGroupForAgent(
-        auth,
-        agentConfig
-      );
-
-      let editorIds: Set<ModelId> = new Set();
-      if (editorGroupRes.isOk()) {
-        const members = await editorGroupRes.value.getActiveMembers(auth);
-        editorIds = new Set(members.map((m) => m.id));
-      }
-
-      // Disable triggers for users who are not editors
-      for (const trigger of triggers) {
-        if (!editorIds.has(trigger.editor)) {
-          const disableResult = await trigger.disable(auth);
-          if (disableResult.isErr()) {
-            logger.error(
-              {
-                workspaceId: auth.getNonNullableWorkspace().sId,
-                agentConfigurationId,
-                triggerId: trigger.sId,
-                error: disableResult.error,
-              },
-              `Failed to disable trigger ${trigger.sId} when changing agent ${agentConfigurationId} scope to hidden`
-            );
-          }
-        }
-      }
+    if (transitioningAgents.length > 0) {
+      await disableTriggersForNonEditors(auth, transitioningAgents);
     }
   }
 
   return new Ok(undefined);
 }
 
-export { updateAgentRequirements } from "@app/lib/api/assistant/configuration/agent_requirements";
+async function disableTriggersForNonEditors(
+  auth: Authenticator,
+  agents: LightAgentConfigurationType[]
+): Promise<void> {
+  const triggers = await TriggerResource.listByAgentConfigurationIds(
+    auth,
+    agents.map((a) => a.sId)
+  );
+  if (triggers.length === 0) {
+    return;
+  }
+
+  const editorGroupsRes = await GroupResource.findEditorGroupsForAgents(
+    auth,
+    agents
+  );
+  const editorGroupsByAgentId = editorGroupsRes.isOk()
+    ? editorGroupsRes.value
+    : {};
+
+  // Fetch members once per unique editor group.
+  const editorModelIdsByGroupModelId = new Map<ModelId, Set<ModelId>>();
+  for (const group of Object.values(editorGroupsByAgentId)) {
+    if (editorModelIdsByGroupModelId.has(group.id)) {
+      continue;
+    }
+    const members = await group.getActiveMembers(auth);
+    editorModelIdsByGroupModelId.set(
+      group.id,
+      new Set(members.map((m) => m.id))
+    );
+  }
+
+  const triggersToDisable = triggers.filter((trigger) => {
+    const group = editorGroupsByAgentId[trigger.agentConfigurationId];
+    const editorModelIds = group
+      ? editorModelIdsByGroupModelId.get(group.id)
+      : null;
+    return !editorModelIds || !editorModelIds.has(trigger.editor);
+  });
+
+  if (triggersToDisable.length === 0) {
+    return;
+  }
+
+  const res = await TriggerResource.disableMany(auth, triggersToDisable);
+  if (res.isErr()) {
+    logger.error(
+      {
+        workspaceId: auth.getNonNullableWorkspace().sId,
+        error: res.error,
+      },
+      "Failed to disable triggers when changing agent scope to hidden"
+    );
+  }
+}
 
 export async function filterAgentsByRequestedSpaces(
   auth: Authenticator,

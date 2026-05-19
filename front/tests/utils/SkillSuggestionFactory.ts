@@ -17,8 +17,10 @@ export class SkillSuggestionFactory {
       kind: SkillSuggestionKind;
       suggestion: SkillSuggestionPayload;
       analysis: string | null;
+      title: string | null;
       state: SkillSuggestionState;
       source: SkillSuggestionSource;
+      sourceConversationIds: number[] | null;
     }> = {}
   ): Promise<SkillSuggestionResource> {
     return SkillSuggestionResource.createSuggestionForSkill(auth, skill, {
@@ -26,15 +28,17 @@ export class SkillSuggestionFactory {
       suggestion: overrides.suggestion ?? {
         instructionEdits: [
           {
-            old_string: "original text",
-            new_string: "updated skill instructions",
-            expected_occurrences: 1,
+            targetBlockId: "abc12345",
+            content: "<p>Updated skill instructions</p>",
+            type: "replace",
           },
         ],
       },
       analysis: overrides.analysis ?? "Improved instructions",
+      title: overrides.title ?? null,
       state: overrides.state ?? "pending",
       source: overrides.source ?? "reinforcement",
+      sourceConversationIds: overrides.sourceConversationIds ?? null,
     });
   }
 
@@ -44,13 +48,15 @@ export class SkillSuggestionFactory {
     overrides: Partial<{
       suggestion: {
         instructionEdits?: {
-          old_string: string;
-          new_string: string;
-          expected_occurrences: number;
+          targetBlockId: string;
+          content: string;
+          type: "replace";
         }[];
         toolEdits?: { action: "add" | "remove"; toolId: string }[];
+        agentFacingDescriptionEdit?: { content: string };
       };
       analysis: string | null;
+      title: string | null;
       state: SkillSuggestionState;
       source: SkillSuggestionSource;
     }> = {}
@@ -60,13 +66,14 @@ export class SkillSuggestionFactory {
       suggestion: overrides.suggestion ?? {
         instructionEdits: [
           {
-            old_string: "original text",
-            new_string: "updated skill instructions",
-            expected_occurrences: 1,
+            targetBlockId: "abc12345",
+            content: "<p>Updated skill instructions</p>",
+            type: "replace",
           },
         ],
       },
       analysis: overrides.analysis,
+      title: overrides.title,
       state: overrides.state,
       source: overrides.source,
     });

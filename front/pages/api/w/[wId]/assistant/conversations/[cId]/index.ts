@@ -1,3 +1,4 @@
+// @migration-status: MIGRATED_TO_HONO
 /**
  * @swagger
  * /api/w/{wId}/assistant/conversations/{cId}:
@@ -60,7 +61,7 @@
  *         description: Unauthorized
  *   patch:
  *     summary: Update a conversation
- *     description: Update a conversation's title, mark it as read, or move it to a different space.
+ *     description: Update a conversation's title, mark it as read, move it to a different space, or control URL access mode.
  *     tags:
  *       - Private Conversations
  *     parameters:
@@ -102,6 +103,15 @@
  *                 properties:
  *                   spaceId:
  *                     type: string
+ *               - type: object
+ *                 required:
+ *                   - accessMode
+ *                 properties:
+ *                   accessMode:
+ *                     type: string
+ *                     enum:
+ *                       - participants_only
+ *                       - workspace_members
  *     responses:
  *       200:
  *         description: Successfully updated conversation
@@ -124,35 +134,41 @@ import {
   getAuditLogContext,
 } from "@app/lib/api/audit/workos_audit";
 import { withSessionAuthenticationForWorkspace } from "@app/lib/api/auth_wrappers";
-import { moveConversationToProject } from "@app/lib/api/projects/conversations";
+import {
+  moveConversationOutOfProject,
+  moveConversationToProject,
+} from "@app/lib/api/projects/conversations";
 import type { Authenticator } from "@app/lib/auth";
 import { ConversationResource } from "@app/lib/resources/conversation_resource";
 import { apiError } from "@app/logger/withlogging";
-import {
-  ConversationError,
-  type ConversationWithoutContentType,
-} from "@app/types/assistant/conversation";
+import type { ConversationWithoutContentType } from "@app/types/assistant/conversation";
+import { ConversationError } from "@app/types/assistant/conversation";
 import type { WithAPIErrorResponse } from "@app/types/error";
 import { assertNever } from "@app/types/shared/utils/assert_never";
 import { isString } from "@app/types/shared/utils/general";
-import { isLeft } from "fp-ts/lib/Either";
-import * as t from "io-ts";
-import * as reporter from "io-ts-reporters";
 import type { NextApiRequest, NextApiResponse } from "next";
+import { z } from "zod";
+import { fromError } from "zod-validation-error";
 
-const PatchConversationsRequestBodySchema = t.union([
-  t.type({
-    title: t.string,
+const PatchConversationsRequestBodySchema = z.union([
+  z.object({
+    title: z.string(),
   }),
-  t.type({
-    read: t.boolean,
+  z.object({
+    read: z.boolean(),
   }),
-  t.type({
-    spaceId: t.string,
+  z.object({
+    spaceId: z.string(),
+  }),
+  z.object({
+    accessMode: z.enum(["participants_only", "workspace_members"]),
+  }),
+  z.object({
+    removeFromProject: z.literal(true),
   }),
 ]);
 
-export type PatchConversationsRequestBody = t.TypeOf<
+export type PatchConversationsRequestBody = z.infer<
   typeof PatchConversationsRequestBodySchema
 >;
 
@@ -187,7 +203,9 @@ async function handler(
   switch (req.method) {
     case "GET": {
       const conversationRes =
-        await ConversationResource.fetchConversationWithoutContent(auth, cId);
+        await ConversationResource.fetchConversationWithoutContent(auth, cId, {
+          includeForkingData: true,
+        });
 
       if (conversationRes.isErr()) {
         // Distinguish between "not found" and "access restricted" for the UI.
@@ -213,7 +231,7 @@ async function handler(
         ],
         context: getAuditLogContext(auth, req),
         metadata: {
-          conversationId: conversation.sId,
+          conversation_id: conversation.sId,
         },
       });
 
@@ -245,14 +263,12 @@ async function handler(
         }
 
         const conversation = conversationRes.value;
-        const bodyValidation = PatchConversationsRequestBodySchema.decode(
+        const bodyValidation = PatchConversationsRequestBodySchema.safeParse(
           req.body
         );
 
-        if (isLeft(bodyValidation)) {
-          const pathError = reporter.formatValidationErrors(
-            bodyValidation.left
-          );
+        if (!bodyValidation.success) {
+          const pathError = fromError(bodyValidation.error).toString();
 
           return apiError(req, res, {
             status_code: 400,
@@ -263,10 +279,10 @@ async function handler(
           });
         }
 
-        if ("title" in bodyValidation.right) {
+        if ("title" in bodyValidation.data) {
           const result = await updateConversationTitle(auth, {
             conversationId: conversation.sId,
-            title: bodyValidation.right.title,
+            title: bodyValidation.data.title,
           });
           await ConversationResource.markAsReadForAuthUser(auth, {
             conversation,
@@ -276,8 +292,8 @@ async function handler(
             return apiErrorForConversation(req, res, result.error);
           }
           return res.status(200).json({ success: true });
-        } else if ("read" in bodyValidation.right) {
-          if (bodyValidation.right.read) {
+        } else if ("read" in bodyValidation.data) {
+          if (bodyValidation.data.read) {
             await ConversationResource.markAsReadForAuthUser(auth, {
               conversation,
             });
@@ -288,10 +304,65 @@ async function handler(
           }
 
           return res.status(200).json({ success: true });
-        } else if ("spaceId" in bodyValidation.right) {
+        } else if ("spaceId" in bodyValidation.data) {
           const r = await moveConversationToProject(auth, {
             conversation,
-            spaceId: bodyValidation.right.spaceId,
+            spaceId: bodyValidation.data.spaceId,
+          });
+          if (r.isOk()) {
+            return res.status(200).json({ success: true });
+          } else {
+            switch (r.error.code) {
+              case "unauthorized":
+                return apiError(req, res, {
+                  status_code: 404,
+                  api_error: {
+                    type: "user_not_found",
+                    message: r.error.message,
+                  },
+                });
+              case "space_not_found":
+                return apiError(req, res, {
+                  status_code: 404,
+                  api_error: {
+                    type: "space_not_found",
+                    message: "Space not found",
+                  },
+                });
+              case "conversation_not_found":
+                return apiError(req, res, {
+                  status_code: 404,
+                  api_error: {
+                    type: "conversation_not_found",
+                    message: "Conversation not found",
+                  },
+                });
+              case "internal_error":
+                return apiError(req, res, {
+                  status_code: 500,
+                  api_error: {
+                    type: "internal_server_error",
+                    message: "Internal server error",
+                  },
+                });
+              default:
+                assertNever(r.error.code);
+            }
+          }
+        } else if ("accessMode" in bodyValidation.data) {
+          const result = await ConversationResource.updateUrlAccessMode(
+            auth,
+            conversation.sId,
+            bodyValidation.data.accessMode
+          );
+          if (result.isErr()) {
+            return apiErrorForConversation(req, res, result.error);
+          }
+
+          return res.status(200).json({ success: true });
+        } else if ("removeFromProject" in bodyValidation.data) {
+          const r = await moveConversationOutOfProject(auth, {
+            conversation,
           });
           if (r.isOk()) {
             return res.status(200).json({ success: true });

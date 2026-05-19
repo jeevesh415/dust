@@ -6,7 +6,10 @@ import {
   parseDataAsMessageIdAndActionId,
   useConversationSidePanelContext,
 } from "@app/components/assistant/conversation/ConversationSidePanelContext";
-import type { AgentMessageWithStreaming } from "@app/components/assistant/conversation/types";
+import type {
+  ActionProgressState,
+  AgentMessageWithStreaming,
+} from "@app/components/assistant/conversation/types";
 import { getIcon } from "@app/components/resources/resources_icons";
 import {
   useAgentMessageSkills,
@@ -273,7 +276,7 @@ function AgentActionsPanelContent({
       el.scrollHeight - el.clientHeight <= el.scrollTop + threshold;
   };
 
-  const streamActionProgress =
+  const streamActionProgress: ActionProgressState =
     messageStreamState?.streaming.actionProgress ?? new Map();
   const pendingToolCalls = messageStreamState?.streaming.pendingToolCalls ?? [];
   return (
@@ -398,13 +401,26 @@ function AgentSingleActionPanel({
   closeIcon = XMarkIcon,
   onClose,
 }: AgentSingleActionPanelProps) {
-  const { action, messageStatus, isActionLoading } =
-    useConversationMessageAction({
-      conversationId: conversation.sId,
-      workspaceId: owner.sId,
-      messageId,
-      actionId,
-    });
+  const {
+    action: fetchedAction,
+    messageStatus,
+    isActionLoading,
+  } = useConversationMessageAction({
+    conversationId: conversation.sId,
+    workspaceId: owner.sId,
+    messageId,
+    actionId,
+  });
+
+  // While the agent is streaming, the SWR-fetched action snapshot can lag the
+  // live state held in the Virtuoso message (e.g. status / executionDurationMs
+  // arrive via stream events). Prefer the streaming action when available so
+  // the panel reflects completion as soon as it happens.
+  const liveAction =
+    virtuosoMsg?.sId === messageId
+      ? (virtuosoMsg.actions.find((a) => a.sId === actionId) ?? null)
+      : null;
+  const action = liveAction ?? fetchedAction;
 
   // Extract streaming progress for the action from the Virtuoso message state.
   const lastNotification =
@@ -412,7 +428,7 @@ function AgentSingleActionPanel({
       ? (virtuosoMsg.streaming.actionProgress.get(action.id)?.progress ?? null)
       : null;
 
-  if (isActionLoading) {
+  if (isActionLoading && !action) {
     return (
       <AgentActionsPanelHeader
         title="Tool detail"

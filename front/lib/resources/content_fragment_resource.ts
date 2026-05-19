@@ -1,16 +1,22 @@
 import { isPastedFile } from "@app/components/assistant/conversation/input_bar/pasted_utils";
-import type {
-  ConversationAttachmentType,
-  LargePasteType,
-} from "@app/lib/api/assistant/conversation/attachments";
+import type { ConversationAttachmentType } from "@app/lib/api/assistant/conversation/attachments";
 import {
   conversationAttachmentId,
   getAttachmentFromContentFragment,
+  isContentNodeAttachmentType,
+  isFileAttachmentType,
   renderAttachmentXml,
   renderLargePasteXml,
 } from "@app/lib/api/assistant/conversation/attachments";
 import appConfig from "@app/lib/api/config";
 import config from "@app/lib/api/config";
+import { getConversationFilesBasePath } from "@app/lib/api/files/mount_path";
+import {
+  PASTED_CONTENT_MAX_CHARACTERS,
+  TRUNCATED_SNIPPET_SIZE,
+  TRUNCATED_SUFFIX,
+  TRUNCATED_TEXT_SIZE,
+} from "@app/lib/api/files/snippet";
 import { getFileContent } from "@app/lib/api/files/utils";
 import type { Authenticator } from "@app/lib/auth";
 import { getPrivateUploadBucket } from "@app/lib/file_storage";
@@ -27,6 +33,7 @@ import { ContentFragmentModel } from "@app/lib/resources/storage/models/content_
 import type { ReadonlyAttributesType } from "@app/lib/resources/storage/types";
 import { getResourceNameAndIdFromSId } from "@app/lib/resources/string_ids";
 import { generateRandomModelSId } from "@app/lib/resources/string_ids_server";
+import { concurrentExecutor } from "@app/lib/utils/async_utils";
 import logger from "@app/logger/logger";
 import type { ContentFragmentMessageTypeModel } from "@app/types/assistant/generation";
 import type { ModelConfigurationType } from "@app/types/assistant/models/types";
@@ -63,6 +70,7 @@ export type RenderContentFragmentToTypeSource =
       conversationId: string;
       message: MessageModel;
       file?: FileResource;
+      dataSourceView?: DataSourceViewResource;
     }
   | {
       kind: "project_context";
@@ -71,6 +79,31 @@ export type RenderContentFragmentToTypeSource =
 
 export const CONTENT_OUTDATED_MSG =
   "Content is outdated. Please refer to the latest version of this content.";
+
+function getConversationFilePath({
+  conversationId,
+  mountFilePath,
+  workspaceId,
+}: {
+  conversationId: string | null | undefined;
+  mountFilePath: string | null;
+  workspaceId: string;
+}): string | null {
+  if (!mountFilePath || !conversationId) {
+    return null;
+  }
+
+  const prefix = getConversationFilesBasePath({
+    workspaceId,
+    conversationId,
+  });
+
+  if (!mountFilePath.startsWith(prefix)) {
+    return null;
+  }
+
+  return `conversation/${mountFilePath.slice(prefix.length)}`;
+}
 
 // Attributes are marked as read-only to reflect the stateless nature of our Resource.
 // This design will be moved up to BaseResource once we transition away from Sequelize.
@@ -600,23 +633,47 @@ export class ContentFragmentResource extends BaseResource<ContentFragmentModel> 
     const fileIds = removeNulls(
       messagesWithContentFragment.map((m) => m.contentFragment?.fileId)
     );
-    const files = await FileResource.fetchByModelIdsWithAuth(auth, fileIds);
+    const nodeDataSourceViewIds = [
+      ...new Set(
+        removeNulls(
+          messagesWithContentFragment.map(
+            (m) => m.contentFragment?.nodeDataSourceViewId
+          )
+        )
+      ),
+    ];
+
+    const [files, dataSourceViews] = await Promise.all([
+      FileResource.fetchByModelIdsWithAuth(auth, fileIds),
+      nodeDataSourceViewIds.length > 0
+        ? DataSourceViewResource.fetchByModelIds(auth, nodeDataSourceViewIds)
+        : Promise.resolve([]),
+    ]);
     const filesByModelId = new Map(files.map((f) => [f.id, f]));
+    const dataSourceViewsByModelId = new Map(
+      dataSourceViews.map((dsv) => [dsv.id, dsv])
+    );
 
     // Render all content fragments with pre-fetched files.
-    return Promise.all(
-      messagesWithContentFragment.map(async (message: MessageModel) => {
+    return concurrentExecutor(
+      messagesWithContentFragment,
+      async (message: MessageModel) => {
         const contentFragment = ContentFragmentResource.fromMessage(message);
         const file = contentFragment.fileId
           ? filesByModelId.get(contentFragment.fileId)
+          : undefined;
+        const dataSourceView = contentFragment.nodeDataSourceViewId
+          ? dataSourceViewsByModelId.get(contentFragment.nodeDataSourceViewId)
           : undefined;
 
         return contentFragment.renderFromMessage(auth, {
           conversationId,
           message,
           file,
+          dataSourceView,
         });
-      })
+      },
+      { concurrency: 4 }
     );
   }
 
@@ -750,6 +807,8 @@ export class ContentFragmentResource extends BaseResource<ContentFragmentModel> 
           ...baseContentFragment,
           contentFragmentType: "file",
           expiredReason: fr.expiredReason,
+          path: null,
+          skipFileProcessing: false,
           fileId: null,
           snippet: null,
           generatedTables: [],
@@ -798,6 +857,7 @@ export class ContentFragmentResource extends BaseResource<ContentFragmentModel> 
               : null))
           : source.file;
 
+      let title: string = fr.title;
       let fileStringId: string | null = null;
       let snippet: string | null = null;
       let generatedTables: string[] = [];
@@ -805,8 +865,11 @@ export class ContentFragmentResource extends BaseResource<ContentFragmentModel> 
       let sourceIcon: string | null = null;
       let isInProjectContext = false;
       let hidden = true;
+      let path: string | null = null;
+      let skipFileProcessing = false;
 
       if (fileResource) {
+        title = fileResource.fileName;
         fileStringId = fileResource.sId;
         snippet = fileResource.snippet;
         generatedTables = fileResource.useCaseMetadata?.generatedTables ?? [];
@@ -814,6 +877,13 @@ export class ContentFragmentResource extends BaseResource<ContentFragmentModel> 
         sourceIcon = fileResource.useCaseMetadata?.sourceIcon ?? null;
         isInProjectContext = !!fileResource.useCaseMetadata?.spaceId;
         hidden = !!fileResource.useCaseMetadata?.hideFromUser;
+        skipFileProcessing =
+          fileResource.useCaseMetadata?.skipFileProcessing === true;
+        path = getConversationFilePath({
+          workspaceId: workspace.sId,
+          conversationId: fileResource.useCaseMetadata?.conversationId,
+          mountFilePath: fileResource.mountFilePath,
+        });
       }
 
       if (source.kind === "project_context") {
@@ -825,8 +895,11 @@ export class ContentFragmentResource extends BaseResource<ContentFragmentModel> 
 
       return {
         ...baseContentFragment,
+        title,
         contentFragmentType: "file",
         expiredReason: null,
+        path,
+        skipFileProcessing,
         fileId: fileStringId,
         snippet,
         generatedTables,
@@ -860,15 +933,19 @@ export class ContentFragmentResource extends BaseResource<ContentFragmentModel> 
       });
       const nodeType: ContentNodeType = fr.nodeType;
 
-      const dsViews = await DataSourceViewResource.fetchByModelIds(auth, [
-        fr.nodeDataSourceViewId,
-      ]);
+      const dsView =
+        (source.kind === "conversation_message"
+          ? source.dataSourceView
+          : undefined) ??
+        (
+          await DataSourceViewResource.fetchByModelIds(auth, [
+            fr.nodeDataSourceViewId,
+          ])
+        )[0];
       assert(
-        dsViews.length === 1,
+        dsView,
         `Data source view not found for content node content fragment (sId: ${fr.sId})`
       );
-
-      const [dsView] = dsViews;
 
       const contentNodeData = {
         nodeId,
@@ -901,10 +978,12 @@ export class ContentFragmentResource extends BaseResource<ContentFragmentModel> 
       conversationId,
       message,
       file,
+      dataSourceView,
     }: {
       conversationId: string;
       message: MessageModel;
       file?: FileResource;
+      dataSourceView?: DataSourceViewResource;
     }
   ): Promise<ContentFragmentType> {
     return ContentFragmentResource.renderToContentFragmentType(auth, this, {
@@ -912,6 +991,7 @@ export class ContentFragmentResource extends BaseResource<ContentFragmentModel> 
       conversationId,
       message,
       file,
+      dataSourceView,
     });
   }
 }
@@ -1083,10 +1163,10 @@ export async function getContentFragmentFromAttachmentFile(
 
     // Check if this is a pasted content (large paste) - use simplified XML format
     if (isPastedFile(attachment.contentType)) {
-      const largePaste: LargePasteType = {
-        fileId: fileStringId,
-        title: attachment.title,
-      };
+      const truncated = content.length > PASTED_CONTENT_MAX_CHARACTERS;
+      const truncatedContent = truncated
+        ? content.slice(0, TRUNCATED_TEXT_SIZE) + TRUNCATED_SUFFIX
+        : content;
 
       return new Ok({
         role: "content_fragment",
@@ -1095,8 +1175,15 @@ export async function getContentFragmentFromAttachmentFile(
           {
             type: "text",
             text: renderLargePasteXml({
-              largePaste,
-              content,
+              largePaste: { title: attachment.title },
+              content: truncatedContent,
+              truncated,
+              // Show path only when truncated so the model can read the full file.
+              path: truncated
+                ? ((isFileAttachmentType(attachment)
+                    ? attachment.path
+                    : null) ?? `conversation/${attachment.title}`)
+                : undefined,
             }),
           },
         ],
@@ -1123,6 +1210,36 @@ export async function getContentFragmentFromAttachmentFile(
   }
 }
 
+function renderFileOrAttachmentXml(
+  attachment: ConversationAttachmentType,
+  {
+    content,
+    isNewFileExplorer,
+  }: {
+    content?: string | null;
+    isNewFileExplorer: boolean;
+  }
+): string {
+  if (isNewFileExplorer) {
+    const explicitPath = "path" in attachment ? attachment.path : null;
+    const path = explicitPath ?? `conversation/${attachment.title}`;
+    if (!explicitPath) {
+      logger.warn(
+        {
+          fileId: "fileId" in attachment ? attachment.fileId : null,
+          title: attachment.title,
+        },
+        "Falling back to file title for new file explorer path."
+      );
+    }
+    return content
+      ? `<file name="${attachment.title}" path="${path}">${content}\n</file>`
+      : `<file name="${attachment.title}" path="${path}"/>`;
+  }
+
+  return renderAttachmentXml({ attachment, content: content ?? null });
+}
+
 // Render only a tag to specify that a content fragment was injected at a given position except for
 // images when the model support them.
 export async function renderLightContentFragmentForModel(
@@ -1131,8 +1248,10 @@ export async function renderLightContentFragmentForModel(
   model: ModelConfigurationType,
   {
     excludeImages,
+    useFileSystem,
   }: {
     excludeImages: boolean;
+    useFileSystem: boolean;
   }
 ): Promise<ContentFragmentMessageTypeModel | null> {
   const { contentType } = message;
@@ -1159,13 +1278,14 @@ export async function renderLightContentFragmentForModel(
   const fileStringId =
     message.contentFragmentType === "file" ? message.fileId : null;
 
-  // Check if this is pasted content - render with simplified format
-  if (fileStringId && isPastedFile(contentType)) {
-    const largePaste: LargePasteType = {
-      fileId: fileStringId,
-      title: attachment.title,
-    };
+  const isNewFileExplorer = fileStringId ? useFileSystem : false;
 
+  // Pasted content is always inlined regardless of feature flags.
+  if (fileStringId && isPastedFile(contentType)) {
+    const snippet = attachment.snippet ?? "";
+    const truncated =
+      snippet.length === TRUNCATED_SNIPPET_SIZE &&
+      snippet.endsWith(TRUNCATED_SUFFIX);
     return {
       role: "content_fragment",
       name: `attach_pasted_content`,
@@ -1173,14 +1293,22 @@ export async function renderLightContentFragmentForModel(
         {
           type: "text",
           text: renderLargePasteXml({
-            largePaste,
-            content: attachment.snippet ?? "",
+            largePaste: { title: attachment.title },
+            content: snippet,
+            truncated,
+            // Show path only when truncated so the model can read the full file.
+            path: truncated
+              ? ((isFileAttachmentType(attachment) ? attachment.path : null) ??
+                `conversation/${attachment.title}`)
+              : undefined,
           }),
         },
       ],
     };
   }
 
+  // Images: send pixel data to vision models, always include a <file> tag so the model
+  // can reference the path in subsequent tool calls (e.g. generate_image referenceImages).
   if (fileStringId && isLLMVisionSupportedImageContentType(contentType)) {
     if (excludeImages || !model.supportsVision) {
       return {
@@ -1189,8 +1317,8 @@ export async function renderLightContentFragmentForModel(
         content: [
           {
             type: "text",
-            text: renderAttachmentXml({
-              attachment,
+            text: renderFileOrAttachmentXml(attachment, {
+              isNewFileExplorer,
               content:
                 "[Image content interpreted by a vision-enabled model. " +
                 "Description not available in this context.",
@@ -1218,9 +1346,31 @@ export async function renderLightContentFragmentForModel(
           },
         },
         {
+          type: "text" as const,
+          text: renderFileOrAttachmentXml(attachment, { isNewFileExplorer }),
+        },
+      ],
+    };
+  }
+
+  // When the conversation uses the new file system, regular file attachments are accessible via
+  // the `files` server (path-based). Emit a slim <file> tag so the model knows the file exists
+  // and how to reach it. Queryable tables and content nodes are excluded: they rely on legacy
+  // attachment XML for query_tables_v2 and include_file wiring.
+  if (
+    isNewFileExplorer &&
+    !attachment.isQueryable &&
+    !isContentNodeAttachmentType(attachment)
+  ) {
+    return {
+      role: "content_fragment",
+      name: `attach_${contentType}`,
+      content: [
+        {
           type: "text",
-          text: renderAttachmentXml({
-            attachment,
+          text: renderFileOrAttachmentXml(attachment, {
+            isNewFileExplorer,
+            content: attachment.snippet,
           }),
         },
       ],

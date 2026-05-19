@@ -78,6 +78,7 @@ describe("getJITServers", () => {
       const attachments: ConversationAttachmentType[] = [
         {
           fileId: file.sId,
+          path: null,
           source: "user",
           title: "test.csv",
           contentType: "text/csv",
@@ -156,10 +157,55 @@ describe("getJITServers", () => {
 
       expect(skillManagementServer).toBeUndefined();
     });
+
+    it("should not include skill_management server when agent only has system skills", async () => {
+      await MCPServerViewResource.ensureAllAutoToolsAreCreated(auth);
+      await SkillFactory.linkGlobalSkillToAgent(auth, {
+        globalSkillId: "discover_tools",
+        agentConfigurationId: agentConfig.id,
+      });
+      const { servers: jitServers } = await getJITServers(auth, {
+        agentConfiguration: agentConfig,
+        conversation,
+        attachments: [],
+      });
+
+      const skillManagementServer = jitServers.find(
+        (server) => server.name === "skill_management"
+      );
+
+      expect(skillManagementServer).toBeUndefined();
+    });
+
+    it("should return system skills separately from equipped skills", async () => {
+      await SkillFactory.linkGlobalSkillToAgent(auth, {
+        globalSkillId: "discover_tools",
+        agentConfigurationId: agentConfig.id,
+      });
+
+      const customSkill = await SkillFactory.create(auth, {
+        name: "Test Skill",
+      });
+      await SkillFactory.linkToAgent(auth, {
+        skillId: customSkill.id,
+        agentConfigurationId: agentConfig.id,
+      });
+
+      const { enabledSkills, systemSkills, equippedSkills } =
+        await SkillResource.listForAgentLoop(auth, {
+          agentConfiguration: agentConfig,
+          conversation,
+        });
+
+      expect(systemSkills.map((s) => s.sId)).toContain("discover_tools");
+      expect(enabledSkills.map((s) => s.sId)).not.toContain("discover_tools");
+      expect(equippedSkills.map((s) => s.sId)).toContain(customSkill.sId);
+      expect(equippedSkills.map((s) => s.sId)).not.toContain("discover_tools");
+    });
   });
 
   describe("projects feature", () => {
-    it("should not include legacy project_context_and_conversations JIT server (search is on project_manager)", async () => {
+    it("should not include legacy project_context_and_conversations JIT server (search is on pod_manager)", async () => {
       await FeatureFlagFactory.basic(auth, "projects");
       await MCPServerViewResource.ensureAllAutoToolsAreCreated(auth);
 
@@ -207,7 +253,7 @@ describe("getJITServers", () => {
         const json = c.view.toJSON();
         return json.name ?? json.server.name;
       });
-      expect(viewNames).toContain("project_manager");
+      expect(viewNames).toContain("pod_manager");
     });
 
     it("should not enable projects skill in listForAgentLoop when feature flag is disabled", async () => {
@@ -292,6 +338,7 @@ describe("getJITServers", () => {
       const attachments: ConversationAttachmentType[] = [
         {
           fileId: file.sId,
+          path: null,
           source: "user",
           title: "test.csv",
           contentType: "text/csv",
@@ -347,6 +394,7 @@ describe("getJITServers", () => {
       const attachments: ConversationAttachmentType[] = [
         {
           fileId: file.sId,
+          path: null,
           source: "user",
           title: "test.txt",
           contentType: "text/plain",
@@ -398,6 +446,7 @@ describe("getJITServers", () => {
       const attachments: ConversationAttachmentType[] = [
         {
           fileId: file.sId,
+          path: null,
           source: "user",
           title: "test.txt",
           contentType: "text/plain",
@@ -440,6 +489,7 @@ describe("getJITServers", () => {
       const attachments: ConversationAttachmentType[] = [
         {
           fileId: file.sId,
+          path: null,
           source: "user",
           title: "test.csv",
           contentType: "text/csv",
@@ -485,6 +535,7 @@ describe("getJITServers", () => {
       const attachments: ConversationAttachmentType[] = [
         {
           fileId: file.sId,
+          path: null,
           source: "user",
           title: "test.csv",
           contentType: "text/csv",
@@ -538,6 +589,7 @@ describe("getJITServers", () => {
       const attachments: ConversationAttachmentType[] = [
         {
           fileId: file.sId,
+          path: null,
           source: "user",
           title: "test.csv",
           contentType: "text/csv",
@@ -619,6 +671,7 @@ describe("getJITServers", () => {
       const attachments: ConversationAttachmentType[] = [
         {
           fileId: file.sId,
+          path: null,
           source: "user",
           title: "test.csv",
           contentType: "text/csv",
@@ -641,10 +694,10 @@ describe("getJITServers", () => {
       });
 
       const sIds = jitServers.map((s) => s.sId);
-      const uniqueSIds = new Set(sIds);
+      const uniqueIds = new Set(sIds);
 
       // All sIds should be unique.
-      expect(sIds.length).toBe(uniqueSIds.size);
+      expect(sIds.length).toBe(uniqueIds.size);
     });
   });
 });

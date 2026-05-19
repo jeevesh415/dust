@@ -1,4 +1,5 @@
 import config from "@app/lib/api/config";
+import { getMetronomeCustomerStripeCustomerId } from "@app/lib/metronome/client";
 import { PlanModel, SubscriptionModel } from "@app/lib/models/plan";
 import { isOldFreePlan } from "@app/lib/plans/plan_codes";
 import { PHONE_TRIAL_ENABLED } from "@app/lib/plans/trial/constants";
@@ -10,6 +11,7 @@ import {
 } from "@app/lib/plans/usage/types";
 import { MembershipResource } from "@app/lib/resources/membership_resource";
 import logger from "@app/logger/logger";
+import type { SupportedCurrency } from "@app/types/currency";
 import { SUPPORTED_CURRENCIES } from "@app/types/currency";
 import type { BillingPeriod, SubscriptionType } from "@app/types/plan";
 import { isDevelopment } from "@app/types/shared/env";
@@ -234,7 +236,7 @@ export const createStripeSubscriptionCheckoutSession = async ({
     },
     metadata: {
       planCode: planCode,
-      userId: `${user.id}`,
+      userId: user.sId,
       ...(metronomePackageAlias ? { metronomePackageAlias } : {}),
     },
     line_items: [
@@ -270,42 +272,64 @@ export const createStripeSubscriptionCheckoutSession = async ({
 };
 
 /**
- * Creates a Stripe Checkout session in "setup" mode for Metronome-billed workspaces.
+ * Creates an Embedded Stripe Checkout session in "setup" mode for Metronome-billed workspaces.
  * This captures the payment method without creating a Stripe subscription.
  * After checkout, the webhook provisions a Metronome customer + contract.
  */
-export const createMetronomeSetupCheckoutSession = async ({
+export const createEmbeddedMetronomeSetupCheckoutSession = async ({
   allowedPaymentMethods = ["card"],
   metronomePackageAlias,
   owner,
   planCode,
+  billingPeriod,
+  seatCount,
+  pricePerSeatCents,
+  couponCode,
   user,
 }: {
   allowedPaymentMethods?: SupportedPaymentMethod[];
   metronomePackageAlias: string;
   owner: WorkspaceType;
   planCode: string;
+  billingPeriod: string;
+  seatCount?: number;
+  pricePerSeatCents?: number;
+  couponCode?: string;
   user: UserType;
-}): Promise<string | null> => {
+}): Promise<{ clientSecret: string; sessionId: string }> => {
   const stripe = getStripeClient();
 
+  const metadata: Record<string, string> = {
+    planCode,
+    userId: user.sId,
+    metronomePackageAlias,
+    billingPeriod,
+  };
+
+  if (seatCount !== undefined) {
+    metadata.seatCount = String(seatCount);
+  }
+  if (pricePerSeatCents !== undefined) {
+    metadata.pricePerSeatCents = String(pricePerSeatCents);
+  }
+  if (couponCode) {
+    metadata.couponCode = couponCode;
+  }
+
   const session = await stripe.checkout.sessions.create({
+    ui_mode: "embedded",
     mode: "setup",
     client_reference_id: owner.sId,
     customer_email: user.email,
     customer_creation: "always",
     payment_method_types: allowedPaymentMethods,
-    metadata: {
-      planCode,
-      userId: `${user.id}`,
-      metronomePackageAlias,
-    },
+    metadata,
     billing_address_collection: "auto",
     tax_id_collection: {
       enabled: true,
     },
-    success_url: `${config.getAppUrl()}/w/${owner.sId}/subscription/payment_processing?type=succeeded&session_id={CHECKOUT_SESSION_ID}&plan_code=${planCode}`,
-    cancel_url: `${config.getAppUrl()}/w/${owner.sId}/subscription?type=cancelled`,
+    redirect_on_completion: "if_required",
+    return_url: `${config.getAppUrl()}/w/${owner.sId}/subscription/checkout?billingPeriod=${billingPeriod}&setup_session_id={CHECKOUT_SESSION_ID}`,
     consent_collection: {
       terms_of_service: "required",
     },
@@ -317,8 +341,196 @@ export const createMetronomeSetupCheckoutSession = async ({
     },
   });
 
-  return session.url;
+  if (!session.client_secret) {
+    throw new Error("Stripe embedded checkout session missing client_secret.");
+  }
+
+  return { clientSecret: session.client_secret, sessionId: session.id };
 };
+
+export async function calculateTax({
+  stripeCustomerId,
+  amountCents,
+  currency,
+}: {
+  stripeCustomerId: string;
+  amountCents: number;
+  currency: SupportedCurrency;
+}): Promise<
+  Result<{ taxCents: number; totalCents: number }, { error_message: string }>
+> {
+  const stripe = getStripeClient();
+  try {
+    const calculation = await stripe.tax.calculations.create({
+      currency,
+      customer: stripeCustomerId,
+      line_items: [{ amount: amountCents, reference: "subscription" }],
+    });
+    return new Ok({
+      taxCents: calculation.tax_amount_exclusive,
+      totalCents: calculation.amount_total,
+    });
+  } catch (error) {
+    logger.error(
+      {
+        stripeCustomerId,
+        stripeError: true,
+        error: normalizeError(error).message,
+      },
+      "[Stripe] Failed to calculate tax"
+    );
+    return new Err({
+      error_message: `Failed to calculate tax: ${normalizeError(error).message}`,
+    });
+  }
+}
+
+async function makeFirstPeriodInvoiceForCustomer({
+  stripeCustomerId,
+  paymentMethodId,
+  subtotalCents,
+  seatCount,
+  setupSessionId,
+  workspaceId,
+  currency,
+}: {
+  stripeCustomerId: string;
+  paymentMethodId: string;
+  subtotalCents: number;
+  seatCount: number;
+  setupSessionId: string;
+  workspaceId: string;
+  currency: SupportedCurrency;
+}): Promise<Result<Stripe.Invoice, { error_message: string }>> {
+  const stripe = getStripeClient();
+  try {
+    const invoice = await stripe.invoices.create(
+      {
+        customer: stripeCustomerId,
+        collection_method: "charge_automatically",
+        default_payment_method: paymentMethodId,
+        currency,
+        automatic_tax: { enabled: true },
+        auto_advance: false,
+        metadata: {
+          metronome_first_period: "true",
+          setup_session_id: setupSessionId,
+          workspace_id: workspaceId,
+        },
+      },
+      { idempotencyKey: `first-period-invoice-${setupSessionId}` }
+    );
+
+    await stripe.invoiceItems.create({
+      customer: stripeCustomerId,
+      amount: subtotalCents,
+      currency,
+      description: `Workspace seat — ${seatCount} seat${seatCount > 1 ? "s" : ""}`,
+      invoice: invoice.id,
+    });
+
+    return new Ok(invoice);
+  } catch (error) {
+    logger.error(
+      {
+        stripeCustomerId,
+        stripeError: true,
+        error: normalizeError(error).message,
+      },
+      "[Stripe] Failed to create first-period invoice"
+    );
+    return new Err({
+      error_message: `Failed to create invoice: ${normalizeError(error).message}`,
+    });
+  }
+}
+
+export async function chargeFirstPeriodInvoice({
+  stripeCustomerId,
+  paymentMethodId,
+  subtotalCents,
+  seatCount,
+  setupSessionId,
+  workspaceId,
+  currency,
+}: {
+  stripeCustomerId: string;
+  paymentMethodId: string;
+  subtotalCents: number;
+  seatCount: number;
+  setupSessionId: string;
+  workspaceId: string;
+  currency: SupportedCurrency;
+}): Promise<Result<void, { error_message: string }>> {
+  const invoiceResult = await makeFirstPeriodInvoiceForCustomer({
+    stripeCustomerId,
+    paymentMethodId,
+    subtotalCents,
+    seatCount,
+    setupSessionId,
+    workspaceId,
+    currency,
+  });
+  if (invoiceResult.isErr()) {
+    logger.error(
+      {
+        workspaceId,
+        error: normalizeError(invoiceResult.error).message,
+      },
+      "[Checkout] Failed to create first-period invoice"
+    );
+    return invoiceResult;
+  }
+
+  const finalizeResult = await finalizeInvoice(invoiceResult.value);
+  if (finalizeResult.isErr()) {
+    logger.error(
+      {
+        workspaceId,
+        error: normalizeError(finalizeResult.error).message,
+        invoiceId: invoiceResult.value.id,
+      },
+      "[Checkout] Failed to finalize first-period invoice"
+    );
+    return finalizeResult;
+  }
+
+  const stripe = getStripeClient();
+  try {
+    const payResult = await stripe.invoices.pay(finalizeResult.value.id, {
+      expand: ["payment_intent"],
+    });
+
+    const paymentIntent = payResult.payment_intent;
+    if (payResult.status !== "paid") {
+      logger.error(
+        {
+          workspaceId,
+          invoiceId: finalizeResult.value.id,
+          invoiceStatus: payResult.status,
+          paymentIntentStatus:
+            paymentIntent && !isString(paymentIntent)
+              ? paymentIntent.status
+              : paymentIntent,
+        },
+        "[Checkout] First-period invoice payment failed"
+      );
+      return new Err({ error_message: "Invoice payment failed" });
+    }
+  } catch (payError) {
+    logger.error(
+      {
+        workspaceId,
+        error: normalizeError(payError).message,
+        invoiceId: finalizeResult.value.id,
+      },
+      "[Checkout] First-period invoice payment failed"
+    );
+    return new Err({ error_message: normalizeError(payError).message });
+  }
+
+  return new Ok(undefined);
+}
 
 /**
  * Calls the Stripe API to create a customer portal session for a given workspace/plan.
@@ -333,27 +545,45 @@ export const createCustomerPortalSession = async ({
 }): Promise<string | null> => {
   const stripe = getStripeClient();
 
-  if (!subscription.stripeSubscriptionId) {
-    throw new Error(
-      `No stripeSubscriptionId ID found for the workspace: ${owner.sId}`
+  // Resolve the Stripe customer: prefer the Stripe subscription's customer
+  // when available; for Metronome-only billed workspaces (no Stripe sub),
+  // read the linked Stripe customer from the Metronome billing config.
+  let stripeCustomerId: string | null = null;
+
+  if (subscription.stripeSubscriptionId) {
+    const stripeSubscription = await getStripeSubscription(
+      subscription.stripeSubscriptionId
     );
-  }
-
-  const stripeSubscription = await getStripeSubscription(
-    subscription.stripeSubscriptionId
-  );
-
-  if (!stripeSubscription) {
-    throw new Error(
-      `No stripeSubscription found for the workspace: ${owner.sId}`
+    if (!stripeSubscription) {
+      throw new Error(
+        `No stripeSubscription found for the workspace: ${owner.sId}`
+      );
+    }
+    const customer = stripeSubscription.customer;
+    if (typeof customer !== "string") {
+      throw new Error(
+        `No stripeCustomerId found for the workspace: ${owner.sId}`
+      );
+    }
+    stripeCustomerId = customer;
+  } else if (owner.metronomeCustomerId) {
+    const result = await getMetronomeCustomerStripeCustomerId(
+      owner.metronomeCustomerId
     );
-  }
-
-  const stripeCustomerId = stripeSubscription.customer;
-
-  if (!stripeCustomerId || typeof stripeCustomerId !== "string") {
+    if (result.isErr()) {
+      throw new Error(
+        `Failed to resolve Stripe customer for Metronome-only workspace ${owner.sId}: ${result.error.message}`
+      );
+    }
+    if (!result.value) {
+      throw new Error(
+        `No Stripe billing configuration found for Metronome customer of workspace ${owner.sId}`
+      );
+    }
+    stripeCustomerId = result.value;
+  } else {
     throw new Error(
-      `No stripeCustomerId found for the workspace: ${owner.sId}`
+      `No Stripe subscription or Metronome customer for the workspace: ${owner.sId}`
     );
   }
 
@@ -395,6 +625,25 @@ export const getStripeSubscription = async (
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     // biome-ignore lint/correctness/noUnusedVariables: ignored using `--suppress`
   } catch (error) {
+    return null;
+  }
+};
+
+/**
+ * Calls the Stripe API to retrieve a customer by its ID. Returns `null` when
+ * the customer cannot be retrieved or has been deleted.
+ */
+export const getStripeCustomer = async (
+  stripeCustomerId: string
+): Promise<Stripe.Customer | null> => {
+  const stripe = getStripeClient();
+  try {
+    const customer = await stripe.customers.retrieve(stripeCustomerId);
+    if (customer.deleted) {
+      return null;
+    }
+    return customer;
+  } catch {
     return null;
   }
 };
@@ -544,6 +793,25 @@ export async function cancelSubscriptionAtPeriodEnd({
 }
 
 /**
+ * Cancel a subscription immediately without generating any additional invoice.
+ * Pending proration items (e.g. from mid-period seat changes) are discarded.
+ * Used to handle takeover to Metronome, Metronome will handle the proration items.
+ */
+export async function cancelSubscriptionImmediatelyNoInvoice({
+  stripeSubscriptionId,
+}: {
+  stripeSubscriptionId: string;
+}) {
+  const stripe = getStripeClient();
+  await stripe.subscriptions.cancel(stripeSubscriptionId, {
+    invoice_now: false,
+    prorate: false,
+  });
+
+  return true;
+}
+
+/**
  * Creates a new Stripe Business subscription for upgrading Pro → Business.
  * The old subscription is cancelled separately after the DB flip.
  */
@@ -575,12 +843,6 @@ export async function createStripeBusinessSubscription({
 
   const defaultPaymentMethodId =
     getDefaultPaymentMethodId(existingSubscription);
-
-  if (!defaultPaymentMethodId) {
-    return new Err(
-      new Error("Existing subscription has no default payment method")
-    );
-  }
 
   const quantity = await MembershipResource.countActiveSeatsInWorkspace(
     owner.sId
@@ -665,17 +927,31 @@ export function getCustomerId(subscription: Stripe.Subscription): string {
 
 export function getDefaultPaymentMethodId(
   subscription: Stripe.Subscription
-): string | null {
+): string | undefined {
   return isString(subscription.default_payment_method)
     ? subscription.default_payment_method
-    : (subscription.default_payment_method?.id ?? null);
+    : subscription.default_payment_method?.id;
 }
 
 /**
- * Checks if a Stripe invoice is for a credit purchase.
+ * Checks if a Stripe invoice is for a programmatic credit purchase.
  */
 export function isCreditPurchaseInvoice(invoice: Stripe.Invoice): boolean {
   return invoice.metadata?.credit_purchase === "true";
+}
+
+/**
+ * Checks if a Stripe invoice is for a Metronome first-period charge.
+ */
+export function isFirstPeriodInvoice(invoice: Stripe.Invoice): boolean {
+  return invoice.metadata?.metronome_first_period === "true";
+}
+
+/**
+ * Checks if a Stripe invoice is for an AWU credit pool purchase.
+ */
+export function isAwuPurchaseInvoice(invoice: Stripe.Invoice): boolean {
+  return invoice.metadata?.awu_purchase === "true";
 }
 
 /**
@@ -782,15 +1058,29 @@ export type CustomerFacingInvoiceInfo = {
   purchaseOrderId?: string;
 };
 
+/**
+ * Target of an invoice: either an existing Stripe subscription (the invoice
+ * gets attached to it and inherits its currency) or a Stripe customer
+ * directly (used for Metronome-only billed workspaces with no Stripe
+ * subscription, where the currency must be passed explicitly).
+ */
+type InvoiceTarget =
+  | { kind: "subscription"; stripeSubscription: Stripe.Subscription }
+  | {
+      kind: "customer";
+      stripeCustomerId: string;
+      currency: SupportedCurrency;
+    };
+
 async function makeInvoice({
-  stripeSubscription,
+  target,
   metadata,
   lineItem,
   idempotencyKey,
   customerFacingInfo,
   ...collectionParams
 }: {
-  stripeSubscription: Stripe.Subscription;
+  target: InvoiceTarget;
   metadata: Record<string, string>;
   lineItem: InvoiceLineItem;
   idempotencyKey?: string;
@@ -802,11 +1092,16 @@ async function makeInvoice({
   >
 > {
   const stripe = getStripeClient();
-  const customerId = getCustomerId(stripeSubscription);
+  const customerId =
+    target.kind === "subscription"
+      ? getCustomerId(target.stripeSubscription)
+      : target.stripeCustomerId;
 
   const invoiceParams: Stripe.InvoiceCreateParams = {
     customer: customerId,
-    subscription: stripeSubscription.id,
+    ...(target.kind === "subscription"
+      ? { subscription: target.stripeSubscription.id }
+      : { currency: target.currency }),
     collection_method: collectionParams.collectionMethod,
     metadata,
     auto_advance: true,
@@ -846,6 +1141,7 @@ async function makeInvoice({
     await stripe.invoiceItems.create({
       customer: customerId,
       price: lineItem.priceId,
+      ...(target.kind === "customer" ? { currency: target.currency } : {}),
       quantity: lineItem.quantity,
       description: lineItem.description,
       invoice: invoice.id,
@@ -867,8 +1163,10 @@ async function makeInvoice({
 
     logger.error(
       {
-        stripeSubscriptionId: stripeSubscription.id,
         stripeError: true,
+        ...(target.kind === "subscription"
+          ? { stripeSubscriptionId: target.stripeSubscription.id }
+          : { stripeCustomerId: target.stripeCustomerId }),
       },
       "[Stripe] Failed to create invoice"
     );
@@ -978,7 +1276,7 @@ export async function reportActiveSeats(
   );
 }
 
-export async function makeCreditPurchaseOneOffInvoice({
+export async function makeCreditPurchaseOneOffInvoiceForSubscription({
   stripeSubscriptionId,
   amountMicroUsd,
   couponId,
@@ -1003,10 +1301,58 @@ export async function makeCreditPurchaseOneOffInvoice({
   const amountDollars = amountCents / 100;
 
   return makeInvoice({
-    stripeSubscription: subscription,
+    target: { kind: "subscription", stripeSubscription: subscription },
     metadata: {
       credit_purchase: "true",
       credit_amount_cents: amountCents.toString(),
+    },
+    lineItem: {
+      priceId: getCreditPurchasePriceId(),
+      quantity: amountCents,
+      description: `Programmatic usage credit: $${amountDollars.toFixed(2)}`,
+      couponId,
+    },
+    customerFacingInfo,
+    ...collectionParams,
+  });
+}
+
+/**
+ * Variant for Metronome-only billed customers: no Stripe subscription, just a
+ * Stripe customer (linked via the Metronome billing config). Issues a one-off
+ * invoice directly on the customer in the requested currency.
+ */
+export async function makeCreditPurchaseOneOffInvoiceForCustomer({
+  stripeCustomerId,
+  workspaceId,
+  currency,
+  amountMicroUsd,
+  couponId,
+  customerFacingInfo,
+  ...collectionParams
+}: {
+  stripeCustomerId: string;
+  // Stamped on the invoice metadata so the Stripe webhook can route
+  // subscription-less invoice events (paid / payment_failed / voided)
+  // back to the originating workspace without going through Metronome.
+  workspaceId: string;
+  // Currency to bill in — must match the contract / Stripe customer.
+  currency: SupportedCurrency;
+  amountMicroUsd: number;
+  couponId?: string;
+  customerFacingInfo?: CustomerFacingInvoiceInfo;
+} & InvoiceCollectionParams): Promise<
+  Result<Stripe.Invoice, { error_message: string }>
+> {
+  const amountCents = Math.ceil(amountMicroUsd / 10_000);
+  const amountDollars = amountCents / 100;
+
+  return makeInvoice({
+    target: { kind: "customer", stripeCustomerId, currency },
+    metadata: {
+      credit_purchase: "true",
+      credit_amount_cents: amountCents.toString(),
+      workspace_id: workspaceId,
     },
     lineItem: {
       priceId: getCreditPurchasePriceId(),
@@ -1131,7 +1477,7 @@ export async function makeAndFinalizeCreditsPAYGInvoice({
   const amountDollars = amountCents / 100;
 
   const invoiceResult = await makeInvoice({
-    stripeSubscription,
+    target: { kind: "subscription", stripeSubscription },
     metadata: {
       credits_payg: "true",
       arrears_invoice: "true",

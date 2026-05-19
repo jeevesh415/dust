@@ -1,5 +1,4 @@
 import type { BlockedToolExecution } from "@app/lib/actions/mcp";
-import { getAgentConfigurationsForView } from "@app/lib/api/assistant/configuration/views";
 import {
   createConversation,
   postNewContentFragment,
@@ -13,6 +12,7 @@ import { generateValidationToken } from "@app/lib/api/email/validation_token";
 import { processAndStoreFile } from "@app/lib/api/files/processing";
 import type { RedisUsageTagsType } from "@app/lib/api/redis";
 import { getRedisStreamClient } from "@app/lib/api/redis";
+import { config as regionsConfig } from "@app/lib/api/regions/config";
 import type { Authenticator } from "@app/lib/auth";
 import { serializeMention } from "@app/lib/mentions/format";
 import { isFreePlan, isUpgraded } from "@app/lib/plans/plan_codes";
@@ -507,31 +507,24 @@ export async function userAndWorkspaceFromEmail({
   });
 }
 
-export async function emailAssistantMatcher({
-  auth,
+export function emailAssistantMatcher({
   targetEmail,
+  allAgentConfigurations,
 }: {
-  auth: Authenticator;
   targetEmail: string;
-}): Promise<
-  Result<
-    {
-      agentConfiguration: LightAgentConfigurationType;
-    },
-    EmailTriggerError
-  >
+  allAgentConfigurations: LightAgentConfigurationType[];
+}): Result<
+  {
+    agentConfiguration: LightAgentConfigurationType;
+  },
+  EmailTriggerError
 > {
-  const agentConfigurations = await getAgentConfigurationsForView({
-    auth,
-    agentsGetView: "list",
-    variant: "light",
-    limit: undefined,
-    sort: undefined,
-  });
-
   const agentPrefix = targetEmail.split("@")[0];
 
-  const matchingAgents = filterAndSortAgents(agentConfigurations, agentPrefix);
+  const matchingAgents = filterAndSortAgents(
+    allAgentConfigurations,
+    agentPrefix
+  );
   if (matchingAgents.length === 0) {
     return new Err({
       type: "assistant_not_found",
@@ -582,15 +575,16 @@ export async function splitThreadContent(content: string) {
  * Stores email context in Redis and the reply is sent by the agent loop
  * finalization activity when the message completes.
  */
-export async function triggerFromEmail({
-  auth,
-  agentConfigurations,
-  email,
-}: {
-  auth: Authenticator;
-  agentConfigurations: LightAgentConfigurationType[];
-  email: InboundEmail;
-}): Promise<
+export async function triggerFromEmail(
+  auth: Authenticator,
+  {
+    agentConfigurations,
+    email,
+  }: {
+    agentConfigurations: LightAgentConfigurationType[];
+    email: InboundEmail;
+  }
+): Promise<
   Result<
     {
       conversation: ConversationType;
@@ -632,6 +626,7 @@ export async function triggerFromEmail({
 
   if (restOfThread.length > 0) {
     const cfRes = await toFileContentFragment(auth, {
+      conversation,
       contentFragment: {
         title: `Email thread: ${email.subject}`,
         content: restOfThread,
@@ -885,7 +880,8 @@ export async function sendToolValidationEmail({
     ? email.subject
     : `Re: ${email.subject}`;
 
-  const baseUrl = config.getClientFacingUrl();
+  const baseUrl = config.getAppUrl();
+  const currentRegion = regionsConfig.getCurrentRegion();
   const conversationUrl = getConversationRoute(
     workspace.sId,
     conversation.sId,
@@ -898,8 +894,13 @@ export async function sendToolValidationEmail({
     const approveToken = generateValidationToken(action.actionId, "approved");
     const rejectToken = generateValidationToken(action.actionId, "rejected");
 
-    const approveUrl = `${baseUrl}/email/validation?token=${encodeURIComponent(approveToken)}`;
-    const rejectUrl = `${baseUrl}/email/validation?token=${encodeURIComponent(rejectToken)}`;
+    const approveUrl = new URL("/email/validation", baseUrl);
+    approveUrl.searchParams.set("token", approveToken);
+    approveUrl.searchParams.set("region", currentRegion);
+
+    const rejectUrl = new URL("/email/validation", baseUrl);
+    rejectUrl.searchParams.set("token", rejectToken);
+    rejectUrl.searchParams.set("region", currentRegion);
 
     const inputsJson = JSON.stringify(action.inputs, null, 2)
       .replace(/</g, "&lt;")
@@ -919,8 +920,8 @@ export async function sendToolValidationEmail({
         <h3 style="margin: 0 0 8px 0; color: #333;">Allow ${serverName} to ${toolName}?</h3>
         <pre style="background-color: #fff; padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 12px; border: 1px solid #eee;">${inputsJson}</pre>
         <div style="margin-top: 12px;">
-          <a href="${approveUrl}" style="display: inline-block; padding: 10px 20px; background-color: #22c55e; color: white; text-decoration: none; border-radius: 4px; margin-right: 8px; font-weight: 500;">Allow</a>
-          <a href="${rejectUrl}" style="display: inline-block; padding: 10px 20px; background-color: #ef4444; color: white; text-decoration: none; border-radius: 4px; font-weight: 500;">Decline</a>
+          <a href="${approveUrl.toString()}" style="display: inline-block; padding: 10px 20px; background-color: #22c55e; color: white; text-decoration: none; border-radius: 4px; margin-right: 8px; font-weight: 500;">Allow</a>
+          <a href="${rejectUrl.toString()}" style="display: inline-block; padding: 10px 20px; background-color: #ef4444; color: white; text-decoration: none; border-radius: 4px; font-weight: 500;">Decline</a>
         </div>
       </div>
     `;

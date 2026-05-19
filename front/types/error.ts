@@ -49,6 +49,7 @@ const API_ERROR_TYPES = [
   "action_unknown_error",
   "action_api_error",
   "membership_not_found",
+  "membership_revoked",
   "invitation_not_found",
   "plan_limit_error",
   "template_not_found",
@@ -70,6 +71,7 @@ const API_ERROR_TYPES = [
   "unprocessable_entity",
   "message_not_found",
   "plan_message_limit_exceeded",
+  "credits_exhausted",
   "model_disabled",
   "global_agent_error",
   "stripe_invalid_product_id_error",
@@ -101,6 +103,7 @@ const API_ERROR_TYPES = [
   "dust_app_secret_not_found",
   // Key:
   "key_not_found",
+  "insufficient_key_scope",
   // Labs:
   "transcripts_configuration_not_found",
   "transcripts_configuration_default_not_allowed",
@@ -116,9 +119,13 @@ const API_ERROR_TYPES = [
   "space_already_exists",
   "space_not_found",
   // Project todos:
-  "project_todo_not_found",
+  "project_task_not_found",
   // Groups:
   "group_not_found",
+  // Coupons:
+  "coupon_not_found",
+  "coupon_not_redeemable",
+  "coupon_already_redeemed",
   // Plugins:
   "plugin_not_found",
   "plugin_execution_failed",
@@ -158,6 +165,8 @@ const API_ERROR_TYPES = [
   "project_metadata_not_found",
   // Suggestions
   "agent_suggestion_not_found",
+  // Wake-ups
+  "wakeup_not_found",
 ] as const;
 
 export type RegionRedirectError = {

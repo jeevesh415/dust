@@ -7,6 +7,7 @@ import { coolCommand } from "./commands/cool";
 import { destroyCommand } from "./commands/destroy";
 import { doctorCommand, setupCommand } from "./commands/doctor";
 import { downCommand } from "./commands/down";
+import { envGetCommand, envListCommand, envSetCommand, envUnsetCommand } from "./commands/env";
 import { feedCommand } from "./commands/feed";
 import { flagCommand } from "./commands/flag";
 import { forwardCommand, forwardStatusCommand, forwardStopCommand } from "./commands/forward";
@@ -309,7 +310,7 @@ cli.command("forward stop", "Stop the port forwarder").action(async () => {
 
 cli
   .command("forward [name]", "Forward OAuth ports to environment")
-  .example("dust-hive forward          # Forward to last warmed env")
+  .example("dust-hive forward          # Forward to current env (or prompt)")
   .example("dust-hive forward my-env   # Forward to specific env")
   .example("dust-hive forward status   # Show forwarding status")
   .example("dust-hive forward stop     # Stop port forwarding")
@@ -345,6 +346,40 @@ cli
   .action(async (name: string | undefined, scenario: string | undefined) => {
     await prepareAndRun(feedCommand(name, scenario));
   });
+
+cli
+  .command(
+    "env [subcommand] [key] [value]",
+    "Manage config.env vars: list | get <KEY> | set <KEY> <VALUE> | unset <KEY> | <KEY>"
+  )
+  .action(
+    async (subcommand: string | undefined, key: string | undefined, value: string | undefined) => {
+      if (!subcommand || subcommand === "list") {
+        await prepareAndRun(envListCommand());
+      } else if (subcommand === "get") {
+        if (!key) {
+          logger.error("Usage: dust-hive env get <KEY>");
+          process.exit(1);
+        }
+        await prepareAndRun(envGetCommand(key));
+      } else if (subcommand === "set") {
+        if (!key || value === undefined) {
+          logger.error("Usage: dust-hive env set <KEY> <VALUE>");
+          process.exit(1);
+        }
+        await prepareAndRun(envSetCommand(key, value));
+      } else if (subcommand === "unset") {
+        if (!key) {
+          logger.error("Usage: dust-hive env unset <KEY>");
+          process.exit(1);
+        }
+        await prepareAndRun(envUnsetCommand(key));
+      } else {
+        // dh env KEY — shorthand for get
+        await prepareAndRun(envGetCommand(subcommand));
+      }
+    }
+  );
 
 cli
   .command("flag [name] [flagName]", "Toggle a feature flag on the workspace")

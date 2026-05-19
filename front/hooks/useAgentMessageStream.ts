@@ -24,39 +24,39 @@ import { assertNeverAndIgnore } from "@app/types/shared/utils/assert_never";
 import type { LightWorkspaceType } from "@app/types/user";
 import type { VirtuosoMessageListMethods } from "@virtuoso.dev/message-list";
 import { useVirtuosoMethods } from "@virtuoso.dev/message-list";
-// biome-ignore lint/plugin/noBulkLodash: existing usage
-import _ from "lodash";
-import { useCallback, useMemo, useRef } from "react";
+import throttle from "lodash/throttle";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 
-// Throttle the update of the message to avoid excessive re-renders.
-const updateMessageThrottled = _.throttle(
-  ({
-    chainOfThought,
-    content,
-    methods,
-    sId,
-  }: {
-    chainOfThought: string;
-    content: string;
-    methods: VirtuosoMessageListMethods<
-      VirtuosoMessage,
-      VirtuosoMessageListContext
-    >;
-    sId: string;
-  }) => {
-    methods.data.map((m) => {
-      if (isAgentMessageWithStreaming(m) && m.sId === sId) {
-        return {
-          ...m,
-          content,
-          chainOfThought,
-        };
-      }
-      return m;
-    });
-  },
-  100
-);
+function createUpdateMessageThrottled() {
+  return throttle(
+    ({
+      chainOfThought,
+      content,
+      methods,
+      sId,
+    }: {
+      chainOfThought: string;
+      content: string;
+      methods: VirtuosoMessageListMethods<
+        VirtuosoMessage,
+        VirtuosoMessageListContext
+      >;
+      sId: string;
+    }) => {
+      methods.data.map((m) => {
+        if (isAgentMessageWithStreaming(m) && m.sId === sId) {
+          return {
+            ...m,
+            content,
+            chainOfThought,
+          };
+        }
+        return m;
+      });
+    },
+    100
+  );
+}
 
 export function upsertPendingToolCall(
   pendingToolCalls: PendingToolCall[],
@@ -203,7 +203,7 @@ export function updateProgress(
  * Append a thinking step to the inline activity steps if the content
  * is new (not a duplicate of the last thinking step).
  */
-function appendThinkingStep(
+export function appendThinkingStep(
   steps: InlineActivityStep[],
   cotContent: string,
   id: string
@@ -231,9 +231,8 @@ function appendContentStep(
 /**
  * Flush the current pending segment (CoT or content) as an activity step.
  *
- * In inline activity mode, a pending "tokens" segment is flushed as a content
- * step and `content.current` is cleared so the next segment starts fresh.
- * In non-inline mode, content is left untouched (it accumulates as the body).
+ * A pending "tokens" segment is flushed as a content step and
+ * `content.current` is cleared so the next segment starts fresh.
  *
  * Returns the updated steps and whether the body content was cleared.
  */
@@ -241,14 +240,12 @@ function flushPendingSegment({
   lastClassification,
   chainOfThought,
   content,
-  isInlineActivityEnabled,
   steps,
   suffix,
 }: {
   lastClassification: { current: "tokens" | "chain_of_thought" | null };
   chainOfThought: { current: string };
   content: { current: string };
-  isInlineActivityEnabled: boolean;
   steps: InlineActivityStep[];
   suffix: string;
 }): { steps: InlineActivityStep[]; contentCleared: boolean } {
@@ -261,7 +258,7 @@ function flushPendingSegment({
       contentCleared: false,
     };
   }
-  if (cls === "tokens" && content.current && isInlineActivityEnabled) {
+  if (cls === "tokens" && content.current) {
     const textToFlush = content.current;
     content.current = "";
     return {
@@ -275,20 +272,17 @@ function flushPendingSegment({
 interface UseAgentMessageStreamParams {
   agentMessage: AgentMessageWithStreaming;
   conversationId: string | null;
-  isInlineActivityEnabled: boolean;
   owner: LightWorkspaceType;
   onEventCallback?: (event: {
     eventId: string;
     data: AgentMessageStateWithControlEvent;
   }) => void;
   streamId: string;
-  useFullChainOfThought: boolean;
 }
 
 export function useAgentMessageStream({
   agentMessage,
   conversationId,
-  isInlineActivityEnabled,
   owner,
   onEventCallback: customOnEventCallback,
   streamId,
@@ -297,11 +291,44 @@ export function useAgentMessageStream({
   const { mutateContextUsage } = useConversationContextUsage({
     conversationId,
     workspaceId: owner.sId,
+    options: { disabled: true },
   });
   const methods = useVirtuosoMethods<
     VirtuosoMessage,
     VirtuosoMessageListContext
   >();
+  const updateMessageThrottled = useMemo(
+    () => createUpdateMessageThrottled(),
+    []
+  );
+
+  // Short-circuit replays of events we've already processed in this hook
+  // instance. The hook is mounted per agent message (via AgentMessage.tsx),
+  // so the ref is scoped to a single message and resets on remount or when a
+  // retry creates a new agentMessage.sId. Within a single mount,
+  // `useEventSource` reconnects on every server-side "done" frame and on
+  // network errors using `lastEventId`; if the server replays an event we
+  // already saw (e.g. just past the cursor boundary), the handlers downstream
+  // are not idempotent — inline activity step IDs are built from `Date.now()`
+  // and same-millisecond re-processing produces duplicate React keys.
+  const seenEventIds = useRef<Set<string>>(new Set());
+
+  // Once a terminal event (agent_message_success, agent_error, etc.) is
+  // received, we must stop reconnecting entirely. Without this, a race between
+  // Virtuoso's deferred item re-render (which updates `agentMessage.status` and
+  // flips `shouldStream` to false) and the immediate React re-render triggered
+  // by the SSE `done` frame causes the effect to fire with `shouldStream` still
+  // true, reconnecting to the server. The server then replays history including
+  // `end-of-stream`, after which every subsequent reconnect gets an empty
+  // history and another immediate `done`, producing an infinite loop.
+  // Returning null from buildEventSourceURL breaks the loop at the source.
+  const isStreamTerminated = useRef(false);
+
+  useEffect(() => {
+    return () => {
+      updateMessageThrottled.cancel();
+    };
+  }, [updateMessageThrottled]);
 
   const shouldStream = useMemo(
     () =>
@@ -315,8 +342,8 @@ export function useAgentMessageStream({
   );
 
   const chainOfThought = useRef(agentMessage.chainOfThought ?? "");
-  // In inline mode, content.current tracks the current text segment only
-  // (cleared on each flush). In non-inline mode, it accumulates all text.
+  // content.current tracks the current text segment only
+  // (cleared on each flush to inline activity steps).
   const content = useRef(agentMessage.content ?? "");
   // Tracks the last token classification to detect transitions between
   // thinking (chain_of_thought) and writing (tokens), flushing completed
@@ -325,7 +352,10 @@ export function useAgentMessageStream({
 
   const buildEventSourceURL = useCallback(
     (lastEvent: string | null) => {
-      const esURL = `/api/w/${owner.sId}/assistant/conversations/${conversationId}/messages/${sId}/events`;
+      if (isStreamTerminated.current) {
+        return null;
+      }
+      const esURL = `/api/sse/w/${owner.sId}/assistant/conversations/${conversationId}/messages/${sId}/events`;
       let lastEventId = "";
       if (lastEvent) {
         const eventPayload: {
@@ -347,11 +377,18 @@ export function useAgentMessageStream({
         eventId: string;
         data: AgentMessageStateWithControlEvent;
       } = JSON.parse(eventStr);
+      if (eventPayload.eventId) {
+        if (seenEventIds.current.has(eventPayload.eventId)) {
+          return;
+        }
+        seenEventIds.current.add(eventPayload.eventId);
+      }
       const eventType = eventPayload.data.type;
       switch (eventType) {
         case "end-of-stream":
           // This event is emitted in front/lib/api/assistant/pubsub.ts. Its purpose is to signal the
           // end of the stream to the client. So we just return.
+          isStreamTerminated.current = true;
           return;
 
         case "tool_ask_user_question":
@@ -368,6 +405,17 @@ export function useAgentMessageStream({
           ) {
             content.current = "";
             chainOfThought.current = "";
+            methods.data.map((m) => {
+              if (!isAgentMessageWithStreaming(m) || m.sId !== sId) {
+                return m;
+              }
+
+              return {
+                ...m,
+                content: "",
+                chainOfThought: "",
+              };
+            });
             isFreshMountWithContent.current = false;
           }
 
@@ -383,10 +431,9 @@ export function useAgentMessageStream({
               lastClassification.current !== null &&
               classification !== lastClassification.current
             ) {
+              updateMessageThrottled.cancel();
               const newAgentState =
-                classification === "tokens" && isInlineActivityEnabled
-                  ? "writing"
-                  : "thinking";
+                classification === "tokens" ? "writing" : "thinking";
               methods.data.map((m) => {
                 if (!isAgentMessageWithStreaming(m) || m.sId !== sId) {
                   return m;
@@ -395,7 +442,6 @@ export function useAgentMessageStream({
                   lastClassification,
                   chainOfThought,
                   content,
-                  isInlineActivityEnabled,
                   steps: m.streaming.inlineActivitySteps,
                   suffix: `pre-${Date.now()}`,
                 });
@@ -410,7 +456,6 @@ export function useAgentMessageStream({
                 };
               });
             } else if (
-              isInlineActivityEnabled &&
               lastClassification.current === null &&
               classification === "tokens"
             ) {
@@ -462,6 +507,7 @@ export function useAgentMessageStream({
                     id: `action-${action.id}`,
                     actionId: action.sId,
                     internalMCPServerName: action.internalMCPServerName,
+                    toolName: action.toolName ?? null,
                   },
                 ];
             return {
@@ -488,6 +534,7 @@ export function useAgentMessageStream({
           break;
 
         case "tool_params":
+          updateMessageThrottled.cancel();
           const toolParams = eventPayload.data;
           methods.data.map((m) => {
             if (!isAgentMessageWithStreaming(m) || m.sId !== sId) {
@@ -497,7 +544,6 @@ export function useAgentMessageStream({
               lastClassification,
               chainOfThought,
               content,
-              isInlineActivityEnabled,
               steps: m.streaming.inlineActivitySteps,
               suffix: `toolparams-${Date.now()}`,
             });
@@ -556,6 +602,8 @@ export function useAgentMessageStream({
 
         case "tool_error":
         case "agent_error":
+          isStreamTerminated.current = true;
+          updateMessageThrottled.cancel();
           const error = eventPayload.data.error;
           methods.data.map((m) => {
             if (!isAgentMessageWithStreaming(m) || m.sId !== sId) {
@@ -565,7 +613,6 @@ export function useAgentMessageStream({
               lastClassification,
               chainOfThought,
               content,
-              isInlineActivityEnabled,
               steps: m.streaming.inlineActivitySteps,
               suffix: `error-${Date.now()}`,
             });
@@ -596,6 +643,12 @@ export function useAgentMessageStream({
           break;
 
         case "agent_generation_cancelled": {
+          isStreamTerminated.current = true;
+          updateMessageThrottled.cancel();
+          const cancelData = eventPayload.data;
+          if (cancelData.type !== "agent_generation_cancelled") {
+            break;
+          }
           methods.data.map((m) => {
             if (!isAgentMessageWithStreaming(m) || m.sId !== sId) {
               return m;
@@ -604,13 +657,12 @@ export function useAgentMessageStream({
               lastClassification,
               chainOfThought,
               content,
-              isInlineActivityEnabled,
               steps: m.streaming.inlineActivitySteps,
               suffix: `cancel-${Date.now()}`,
             });
             return {
               ...m,
-              status: "cancelled",
+              status: cancelData.status,
               ...(contentCleared ? { content: null } : {}),
               streaming: {
                 ...m.streaming,
@@ -625,15 +677,16 @@ export function useAgentMessageStream({
 
         case "agent_message_gracefully_stopped":
         case "agent_message_success": {
+          isStreamTerminated.current = true;
+          updateMessageThrottled.cancel();
           const messageSuccess = eventPayload.data;
           // Flush any remaining CoT (but not content — the final text segment
           // becomes the message body via the server's canonical message).
           const cotAtSuccess = chainOfThought.current;
           chainOfThought.current = "";
-          // In inline activity mode, content.current tracks only the final
-          // text segment (intermediate segments were flushed to content steps).
-          // The server's full message includes ALL text, so we override with
-          // the tracked final segment. In non-inline mode, we trust the server.
+          // content.current tracks only the final text segment (intermediate
+          // segments were flushed to content steps). The server's full message
+          // includes ALL text, so we override with the tracked final segment.
           // Only override when tokens were actually streamed (lastClassification
           // is non-null); otherwise the content was set server-side without
           // streaming (e.g. prompt commands like /list) and the server's value
@@ -645,19 +698,31 @@ export function useAgentMessageStream({
             if (!isAgentMessageWithStreaming(m) || m.sId !== sId) {
               return m;
             }
-            const steps = cotAtSuccess
+            let steps = cotAtSuccess
               ? appendThinkingStep(
                   m.streaming.inlineActivitySteps,
                   cotAtSuccess,
                   `thinking-final-${Date.now()}`
                 )
               : m.streaming.inlineActivitySteps;
+            // When no tokens streamed after the last tool call (e.g. the agent
+            // handed off or otherwise terminated right after a tool), the text
+            // we flushed as a content step at the last `tool_params` is also
+            // what the server keeps as the message body. Drop that trailing
+            // content step so the same text isn't rendered twice — aligning
+            // with `contentsToActivitySteps`, which is what runs after reload.
+            if (!hadStreamedTokens) {
+              for (let i = steps.length - 1; i >= 0; i--) {
+                if (steps[i].type === "content") {
+                  steps = [...steps.slice(0, i), ...steps.slice(i + 1)];
+                  break;
+                }
+              }
+            }
             return {
               ...m,
               ...getLightAgentMessageFromAgentMessage(messageSuccess.message),
-              ...(isInlineActivityEnabled && hadStreamedTokens
-                ? { content: finalSegment || null }
-                : {}),
+              ...(hadStreamedTokens ? { content: finalSegment || null } : {}),
               streaming: {
                 ...m.streaming,
                 agentState: "done",
@@ -679,10 +744,10 @@ export function useAgentMessageStream({
     },
     [
       customOnEventCallback,
-      isInlineActivityEnabled,
       methods,
       sId,
       mutateContextUsage,
+      updateMessageThrottled,
     ]
   );
 

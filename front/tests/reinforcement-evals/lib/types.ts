@@ -1,9 +1,11 @@
 import type { AgentMessageFeedbackDirection } from "@app/lib/api/assistant/conversation/feedbacks";
-import {
-  formatConversationForShrinkWrap,
-  type ShrinkWrapAction,
-} from "@app/lib/api/assistant/conversation/shrink_wrap";
+import { renderConversationAsText } from "@app/lib/api/assistant/conversation/render_as_text";
 import type { AvailableTool } from "@app/lib/api/assistant/workspace_capabilities";
+import {
+  mockAgentMessage,
+  mockConversation,
+  mockUserMessage,
+} from "@app/tests/utils/conversation_test_factories";
 import type { SkillSuggestionType } from "@app/types/suggestions/skill_suggestion";
 
 export interface MockMcpToolInput {
@@ -26,10 +28,22 @@ export interface MockMcpDescription {
   tools: MockMcpTool[];
 }
 
+export interface MockSearchKnowledgeNode {
+  nodeId: string;
+  title: string;
+  dataSourceViewId: string;
+  spaceId: string;
+  hasChildren: boolean;
+  connectorProvider?: string | null;
+  sourceUrl?: string | null;
+}
+
 export interface WorkspaceContext {
   tools: AvailableTool[];
   /** Optional MCP details returned when describe_mcp is called during eval. */
   mcpDescriptions?: MockMcpDescription[];
+  /** Optional knowledge nodes returned when search_knowledge is called during eval. */
+  searchKnowledgeNodes?: MockSearchKnowledgeNode[];
 }
 
 function slugify(name: string): string {
@@ -72,65 +86,33 @@ export interface MockConversationMessage {
 }
 
 /**
- * Build a shrink-wrapped conversation text from a compact message list,
- * using the real `formatConversationForShrinkWrap`.
+ * Build a conversation text from a compact message list using the real serializer
+ * so the output format always stays in sync with production rendering.
  */
 export function buildConversationText(
   messages: MockConversationMessage[],
-  agentConfigSId: string = "skill-under-test"
+  _agentConfigSId: string = "skill-under-test"
 ): string {
-  const feedbackByMessageId = new Map<
-    string,
-    { thumbDirection: AgentMessageFeedbackDirection; content: string | null }[]
-  >();
-
-  const shrinkMessages = messages.map((msg, i) => {
-    const sId = `msg_${i}`;
-    const created = 1700000000 + i * 100;
-
-    if (msg.role === "user") {
-      return {
-        type: "user_message" as const,
-        sId,
-        created,
-        content: msg.content,
-        context: { username: "user" },
-        mentions: [{ configurationId: agentConfigSId }],
-      };
-    }
-
-    if (msg.feedback) {
-      feedbackByMessageId.set(sId, [
-        {
-          thumbDirection: msg.feedback.direction,
-          content: msg.feedback.comment ?? null,
-        },
-      ]);
-    }
-
-    const actions: ShrinkWrapAction[] = (msg.actions ?? []).map((a) => ({
-      functionCallName: a.functionCallName,
-      status: a.status,
-      internalMCPServerName: null,
-      params: a.params ?? {},
-      output: a.output ?? null,
-    }));
-
-    return {
-      type: "agent_message" as const,
-      sId,
-      created,
-      content: msg.content,
-      status: "succeeded",
-      configuration: { sId: agentConfigSId, name: "Agent" },
-      actions,
-      parentAgentMessageId: null,
-    };
-  });
-
-  return formatConversationForShrinkWrap(
-    { sId: "conv_eval", title: "Eval conversation", messages: shrinkMessages },
-    { feedbackByMessageId, includeActionDetails: true }
+  return renderConversationAsText(
+    mockConversation(
+      messages.map((msg) =>
+        msg.role === "user"
+          ? mockUserMessage(msg.content)
+          : mockAgentMessage({
+              content: msg.content,
+              actions: msg.actions,
+              feedback: msg.feedback
+                ? [
+                    {
+                      direction: msg.feedback.direction,
+                      comment: msg.feedback.comment,
+                    },
+                  ]
+                : undefined,
+            })
+      )
+    ),
+    { includeActions: true, includeActionDetails: true, includeFeedback: true }
   );
 }
 
@@ -211,38 +193,93 @@ export interface ToolCall {
 }
 
 export type ToolCallAssertion =
-  | { type: "editSkillWithInstructions"; skillId: string }
-  | { type: "editSkillWithTool"; skillId: string; toolId: string }
-  | { type: "editSkill"; skillId: string }
+  | {
+      type: "editSkillWithInstructions";
+      skillId: string;
+      sourceSuggestionIds?: string[];
+    }
+  | {
+      type: "editSkillWithTool";
+      skillId: string;
+      toolId: string;
+      sourceSuggestionIds?: string[];
+    }
+  | {
+      type: "editSkillWithAgentFacingDescription";
+      skillId: string;
+      sourceSuggestionIds?: string[];
+    }
+  | { type: "editSkill"; skillId: string; sourceSuggestionIds?: string[] }
   | { type: "editSkillCallCount"; count: number }
+  | { type: "editSkillCallsWithSources"; sourceSuggestionIdGroups: string[][] }
   | { type: "noSuggestion" }
+  | {
+      type: "rejectSuggestion";
+      sourceSuggestionIds: string[];
+    }
   | { type: "calledDescribeMcp"; mcpId: string };
 
 /** Expects an edit_skill call with instructionEdits for the given skill. */
-export function editSkillWithInstructions(skillId: string): ToolCallAssertion {
-  return { type: "editSkillWithInstructions", skillId };
+export function editSkillWithInstructions(
+  skillId: string,
+  sourceSuggestionIds?: string[]
+): ToolCallAssertion {
+  return { type: "editSkillWithInstructions", skillId, sourceSuggestionIds };
 }
 
 /** Expects an edit_skill call with a toolEdit for the given skill and tool. */
 export function editSkillWithTool(
   skillId: string,
-  toolId: string
+  toolId: string,
+  sourceSuggestionIds?: string[]
 ): ToolCallAssertion {
-  return { type: "editSkillWithTool", skillId, toolId };
+  return { type: "editSkillWithTool", skillId, toolId, sourceSuggestionIds };
+}
+
+/** Expects an edit_skill call with an agentFacingDescriptionEdit for the given skill. */
+export function editSkillWithAgentFacingDescription(
+  skillId: string,
+  sourceSuggestionIds?: string[]
+): ToolCallAssertion {
+  return {
+    type: "editSkillWithAgentFacingDescription",
+    skillId,
+    sourceSuggestionIds,
+  };
 }
 
 /** Expects an edit_skill call for the given skill (any edit type). */
-export function editSkill(skillId: string): ToolCallAssertion {
-  return { type: "editSkill", skillId };
+export function editSkill(
+  skillId: string,
+  sourceSuggestionIds?: string[]
+): ToolCallAssertion {
+  return { type: "editSkill", skillId, sourceSuggestionIds };
 }
 
 export function noSuggestion(): ToolCallAssertion {
   return { type: "noSuggestion" };
 }
 
+/** Expects reject_suggestion to be called with the given sourceSuggestionIds. */
+export function rejectSuggestion(
+  sourceSuggestionIds: string[]
+): ToolCallAssertion {
+  return { type: "rejectSuggestion", sourceSuggestionIds };
+}
+
 /** Expects exactly `count` edit_skill calls. */
 export function editSkillCallCount(count: number): ToolCallAssertion {
   return { type: "editSkillCallCount", count };
+}
+
+/**
+ * Expects one edit_skill call per group, where each call's sourceSuggestionIds
+ * matches exactly one of the provided groups (order of calls doesn't matter).
+ */
+export function editSkillCallsWithSources(
+  sourceSuggestionIdGroups: string[][]
+): ToolCallAssertion {
+  return { type: "editSkillCallsWithSources", sourceSuggestionIdGroups };
 }
 
 /** Expects describe_mcp to have been called with the given mcpId. */

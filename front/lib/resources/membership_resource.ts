@@ -2,6 +2,7 @@ import { getWorkOS } from "@app/lib/api/workos/client";
 import { invalidateWorkOSOrganizationsCacheForUserId } from "@app/lib/api/workos/organization_membership";
 import type { Authenticator } from "@app/lib/auth";
 import { BaseResource } from "@app/lib/resources/base_resource";
+import { frontSequelize } from "@app/lib/resources/storage";
 import { MembershipModel } from "@app/lib/resources/storage/models/membership";
 import { UserModel } from "@app/lib/resources/storage/models/user";
 import type { ReadonlyAttributesType } from "@app/lib/resources/storage/types";
@@ -20,6 +21,8 @@ import { launchIndexUserSearchWorkflow } from "@app/temporal/es_indexation/clien
 import type {
   MembershipOriginType,
   MembershipRoleType,
+  MembershipSeatType,
+  UserCreditState,
 } from "@app/types/memberships";
 import type { ModelId } from "@app/types/shared/model_id";
 import type { Result } from "@app/types/shared/result";
@@ -27,6 +30,7 @@ import { Err, Ok } from "@app/types/shared/result";
 import type { RequireAtLeastOne } from "@app/types/shared/typescipt_utils";
 import { assertNever } from "@app/types/shared/utils/assert_never";
 import type { LightWorkspaceType, UserType } from "@app/types/user";
+import assert from "assert";
 import type {
   Attributes,
   FindOptions,
@@ -48,7 +52,7 @@ type GetMembershipsOptions = RequireAtLeastOne<{
 export type MembershipsPaginationParams = {
   orderColumn: "createdAt";
   orderDirection: "asc" | "desc";
-  lastValue: number | null | undefined;
+  lastValue?: number;
   limit: number;
 };
 
@@ -306,13 +310,21 @@ export class MembershipResource extends BaseResource<MembershipModel> {
     }
 
     // Get all the memberships matching the criteria.
-    const { rows, count } = await this.model.findAndCountAll({
+    const rows = await this.model.findAll({
       ...findOptions,
       // WORKSPACE_ISOLATION_BYPASS: Used to find latest memberships across users and workspace is
       // optional.
       // biome-ignore lint/plugin/noUnverifiedWorkspaceBypass: WORKSPACE_ISOLATION_BYPASS verified
       dangerouslyBypassWorkspaceIsolationSecurity: true,
     });
+
+    let count = rows.length;
+
+    // Only do the count if we are paginating, otherwise we can use the length of the rows as there is no limit by default
+    if (paginationParams) {
+      count = await MembershipModel.count(findOptions);
+    }
+
     // Then, we only keep the latest membership for each (user, workspace).
     const latestMembershipByUserAndWorkspace = new Map<
       string,
@@ -334,6 +346,13 @@ export class MembershipResource extends BaseResource<MembershipModel> {
     };
   }
 
+  /**
+   * Returns the most recent membership row by `startAt` (still excluding
+   * future-dated rows), regardless of revocation state. Used by call sites
+   * that need to detect a previously-revoked membership.
+   *
+   * Use `getActiveMembershipOfUserInWorkspace` for "active right now".
+   */
   static async getLatestMembershipOfUserInWorkspace({
     user,
     workspace,
@@ -343,29 +362,72 @@ export class MembershipResource extends BaseResource<MembershipModel> {
     workspace: LightWorkspaceType;
     transaction?: Transaction;
   }): Promise<MembershipResource | null> {
-    const { memberships, total } = await this.getLatestMemberships({
-      users: [user],
-      workspace,
+    const row = await this.model.findOne({
+      where: {
+        userId: user.id,
+        workspaceId: workspace.id,
+        startAt: { [Op.lte]: new Date() },
+      },
+      order: [["startAt", "DESC"]],
       transaction,
     });
-    if (total === 0) {
-      return null;
+    return row ? new MembershipResource(this.model, row.get()) : null;
+  }
+
+  /**
+   * Returns the future-scheduled membership row for the user (startAt > NOW)
+   * if any. Used to detect / consume scheduled seat changes.
+   */
+  static async getScheduledMembershipOfUserInWorkspace({
+    user,
+    workspace,
+    transaction,
+  }: {
+    user: UserResource;
+    workspace: LightWorkspaceType;
+    transaction?: Transaction;
+  }): Promise<MembershipResource | null> {
+    const row = await this.model.findOne({
+      where: {
+        userId: user.id,
+        workspaceId: workspace.id,
+        startAt: { [Op.gt]: new Date() },
+      },
+      transaction,
+    });
+    return row ? new MembershipResource(this.model, row.get()) : null;
+  }
+
+  /**
+   * Returns the next-scheduled membership row keyed by userId for the given
+   * users in a workspace. Single query for use by paginated listings.
+   */
+  static async getScheduledMembershipsByUserIdInWorkspace({
+    workspace,
+    userIds,
+  }: {
+    workspace: LightWorkspaceType;
+    userIds: ModelId[];
+  }): Promise<Map<ModelId, MembershipResource>> {
+    if (userIds.length === 0) {
+      return new Map();
     }
-    if (memberships.length > 1) {
-      logger.error(
-        {
-          panic: true,
-          userId: user.id,
-          workspaceId: workspace.id,
-          memberships,
-        },
-        "Unreachable: Found multiple latest memberships for user in workspace."
-      );
-      throw new Error(
-        `Unreachable: Found multiple latest memberships for user ${user.id} in workspace ${workspace.id}`
-      );
+    const rows = await this.model.findAll({
+      where: {
+        workspaceId: workspace.id,
+        userId: userIds,
+        startAt: { [Op.gt]: new Date() },
+      },
+    });
+    const result = new Map<ModelId, MembershipResource>();
+    for (const row of rows) {
+      const resource = new MembershipResource(this.model, row.get());
+      const existing = result.get(row.userId);
+      if (!existing || row.startAt < existing.startAt) {
+        result.set(row.userId, resource);
+      }
     }
-    return memberships[0];
+    return result;
   }
 
   private static readonly roleCacheKeyResolver = ({
@@ -410,11 +472,26 @@ export class MembershipResource extends BaseResource<MembershipModel> {
     { cacheNullValues: false }
   );
 
-  private static invalidateRoleCache = invalidateCacheWithRedis(
+  private static _invalidateRoleCache = invalidateCacheWithRedis(
     MembershipResource._getActiveRoleForUserInWorkspaceUncached,
     (params: { userModelId: ModelId; workspaceModelId: ModelId }) =>
       MembershipResource.roleCacheKeyResolver(params)
   );
+
+  private static invalidateRoleCache = async (params: {
+    userModelId: ModelId;
+    workspaceModelId: ModelId;
+  }) => {
+    logger.info(
+      {
+        userModelId: params.userModelId,
+        workspaceModelId: params.workspaceModelId,
+        method: "MembershipResource.invalidateRoleCache",
+      },
+      "Invalidating auth resource cache"
+    );
+    return MembershipResource._invalidateRoleCache(params);
+  };
 
   static async getActiveRoleForUserInWorkspace({
     user,
@@ -426,6 +503,14 @@ export class MembershipResource extends BaseResource<MembershipModel> {
     transaction?: Transaction;
   }): Promise<MembershipRoleType | "none"> {
     if (transaction) {
+      logger.info(
+        {
+          userModelId: user.id,
+          workspaceModelId: workspace.id,
+          method: "MembershipResource.getActiveRoleForUserInWorkspace",
+        },
+        "Skipping auth resource cache: transaction provided"
+      );
       return this._getActiveRoleForUserInWorkspaceUncached({
         userModelId: user.id,
         workspaceModelId: workspace.id,
@@ -515,6 +600,64 @@ export class MembershipResource extends BaseResource<MembershipModel> {
       col: "userId",
       transaction,
     });
+  }
+
+  static async getMembersCountsForWorkspaces(
+    auth: Authenticator,
+    {
+      workspaces,
+      activeOnly,
+    }: {
+      workspaces: LightWorkspaceType[];
+      activeOnly: boolean;
+    }
+  ): Promise<Record<string, number>> {
+    assert(
+      auth.isDustSuperUser(),
+      "Counting members across different workspaces is only allowed for super users."
+    );
+
+    const countByWorkspaceId: Record<string, number> = {};
+    if (workspaces.length === 0) {
+      return countByWorkspaceId;
+    }
+
+    const workspaceIdByModelId = new Map<ModelId, string>();
+    for (const w of workspaces) {
+      countByWorkspaceId[w.sId] = 0;
+      workspaceIdByModelId.set(w.id, w.sId);
+    }
+
+    const now = new Date();
+    let where: WhereOptions<InferAttributes<MembershipModel>> = {
+      workspaceId: { [Op.in]: workspaces.map((w) => w.id) },
+    };
+    if (activeOnly) {
+      where = {
+        ...where,
+        endAt: { [Op.or]: [{ [Op.eq]: null }, { [Op.gte]: now }] },
+        startAt: { [Op.lte]: now },
+        firstUsedAt: { [Op.ne]: null },
+      };
+    }
+
+    const rows = await this.model.count({
+      where,
+      distinct: true,
+      col: "userId",
+      group: ["workspaceId"],
+    });
+
+    for (const row of rows) {
+      const workspaceModelId = row.workspaceId;
+      if (typeof workspaceModelId === "number") {
+        const workspaceId = workspaceIdByModelId.get(workspaceModelId);
+        if (workspaceId) {
+          countByWorkspaceId[workspaceId] = row.count;
+        }
+      }
+    }
+    return countByWorkspaceId;
   }
 
   static async countActiveMembersForWorkspace({
@@ -660,6 +803,13 @@ export class MembershipResource extends BaseResource<MembershipModel> {
     return true;
   }
 
+  async updateCreditState(
+    creditState: UserCreditState,
+    transaction?: Transaction
+  ): Promise<void> {
+    await this.update({ creditState }, transaction);
+  }
+
   static async deleteAllForWorkspace(auth: Authenticator) {
     const workspace = auth.getNonNullableWorkspace();
 
@@ -709,6 +859,7 @@ export class MembershipResource extends BaseResource<MembershipModel> {
     workspace,
     role,
     origin = "invited",
+    seatType = "workspace",
     startAt = new Date(),
     transaction,
   }: {
@@ -716,6 +867,7 @@ export class MembershipResource extends BaseResource<MembershipModel> {
     workspace: LightWorkspaceType;
     role: MembershipRoleType;
     origin?: MembershipOriginType;
+    seatType?: MembershipSeatType;
     startAt?: Date;
     transaction?: Transaction;
   }): Promise<MembershipResource> {
@@ -745,6 +897,7 @@ export class MembershipResource extends BaseResource<MembershipModel> {
         workspaceId: workspace.id,
         role,
         origin,
+        seatType,
         firstUsedAt: origin === "provisioned" ? null : new Date(),
       },
       { transaction }
@@ -829,7 +982,7 @@ export class MembershipResource extends BaseResource<MembershipModel> {
     if (endAt < membership.startAt) {
       return new Err({ type: "invalid_end_at" });
     }
-    if (membership.endAt) {
+    if (membership.endAt && membership.endAt < new Date()) {
       return new Err({ type: "already_revoked" });
     }
 
@@ -851,6 +1004,17 @@ export class MembershipResource extends BaseResource<MembershipModel> {
       { endAt },
       { where: { id: membership.id }, transaction }
     );
+
+    // Drop any future-scheduled seat-change rows so they don't reactivate the
+    // user after the revoke date.
+    await MembershipModel.destroy({
+      where: {
+        userId: user.id,
+        workspaceId: workspace.id,
+        startAt: { [Op.gt]: new Date() },
+      },
+      transaction,
+    });
 
     if (workspace.workOSOrganizationId && user.workOSUserId) {
       try {
@@ -949,7 +1113,8 @@ export class MembershipResource extends BaseResource<MembershipModel> {
       transaction,
     });
 
-    if (membership?.endAt && !allowTerminated) {
+    const isRevoked = !!(membership?.endAt && membership.endAt < new Date());
+    if (isRevoked && !allowTerminated) {
       return new Err({ type: "membership_already_terminated" });
     }
     if (!membership) {
@@ -960,7 +1125,7 @@ export class MembershipResource extends BaseResource<MembershipModel> {
 
     // If the membership is not terminated, we update the role in place.
     // We do not historicize the roles.
-    if (!membership.endAt) {
+    if (!isRevoked) {
       if (previousRole === newRole) {
         return new Err({ type: "already_on_role" });
       }
@@ -1013,12 +1178,13 @@ export class MembershipResource extends BaseResource<MembershipModel> {
       });
     } else {
       // If the last membership was terminated, we create a new membership with the new role.
-      // Preserve the origin from the previous membership.
+      // Preserve the origin and seatType from the previous membership.
       await this.createMembership({
         user,
         workspace,
         role: newRole,
         origin: membership.origin,
+        seatType: membership.seatType,
         startAt: new Date(),
         transaction,
       });
@@ -1128,6 +1294,144 @@ export class MembershipResource extends BaseResource<MembershipModel> {
     );
 
     return { previousOrigin, newOrigin };
+  }
+
+  /**
+   * Update the seatType of an active membership in place. Callers are
+   * responsible for calling handleSeatTransition before this returns.
+   */
+  async updateMembershipSeat({
+    user,
+    workspace,
+    newSeatType,
+    transaction,
+    author,
+  }: {
+    user: UserResource;
+    workspace: LightWorkspaceType;
+    newSeatType: MembershipSeatType;
+    transaction?: Transaction;
+    author: UserType | "no-author";
+  }): Promise<{
+    previousSeatType: MembershipSeatType;
+    newSeatType: MembershipSeatType;
+  }> {
+    const previousSeatType = this.seatType;
+    if (previousSeatType === newSeatType) {
+      return { previousSeatType, newSeatType };
+    }
+
+    await this.update({ seatType: newSeatType }, transaction);
+
+    auditLog(
+      {
+        author,
+        userId: user.id,
+        workspaceId: workspace.id,
+        previousSeatType,
+        newSeatType,
+      },
+      "Membership seat type updated"
+    );
+
+    return { previousSeatType, newSeatType };
+  }
+
+  /**
+   * Schedule a seat-type change at a future date by closing the current
+   * row at `scheduledAt` and inserting a future row that becomes active
+   * once `scheduledAt` is reached. Both rows coexist during the window;
+   * only the future one has `endAt = null`, preserving the unique
+   * `WHERE endAt IS NULL` invariant.
+   */
+  async scheduleSeatChange({
+    user,
+    workspace,
+    newSeatType,
+    scheduledAt,
+    author,
+  }: {
+    user: UserResource;
+    workspace: LightWorkspaceType;
+    newSeatType: MembershipSeatType;
+    scheduledAt: Date;
+    author: UserType | "no-author";
+  }): Promise<void> {
+    const previousSeatType = this.seatType;
+    await frontSequelize.transaction(async (transaction) => {
+      // Replace any existing future row (re-scheduling is idempotent).
+      await MembershipModel.destroy({
+        where: {
+          userId: user.id,
+          workspaceId: workspace.id,
+          startAt: { [Op.gt]: new Date() },
+        },
+        transaction,
+      });
+      await this.update({ endAt: scheduledAt }, transaction);
+      await MembershipModel.create(
+        {
+          startAt: scheduledAt,
+          userId: user.id,
+          workspaceId: workspace.id,
+          role: this.role,
+          origin: this.origin,
+          seatType: newSeatType,
+          firstUsedAt: this.firstUsedAt,
+        },
+        { transaction }
+      );
+    });
+
+    auditLog(
+      {
+        author,
+        userId: user.id,
+        workspaceId: workspace.id,
+        previousSeatType,
+        newSeatType,
+        scheduledAt: scheduledAt.toISOString(),
+      },
+      "Membership seat change scheduled"
+    );
+  }
+
+  /**
+   * Cancel a previously scheduled seat change. Reopens the current row
+   * (clears its `endAt`) and removes the future row.
+   */
+  async cancelScheduledSeatChange({
+    user,
+    workspace,
+    author,
+  }: {
+    user: UserResource;
+    workspace: LightWorkspaceType;
+    author: UserType | "no-author";
+  }): Promise<void> {
+    await frontSequelize.transaction(async (transaction) => {
+      const futureRow = await MembershipModel.findOne({
+        where: {
+          userId: user.id,
+          workspaceId: workspace.id,
+          startAt: { [Op.gt]: new Date() },
+        },
+        transaction,
+      });
+      if (futureRow) {
+        await futureRow.destroy({ transaction });
+      }
+      await this.update({ endAt: null }, transaction);
+    });
+
+    auditLog(
+      {
+        author,
+        userId: user.id,
+        workspaceId: workspace.id,
+      },
+      "Membership scheduled seat change cancelled"
+    );
   }
 
   async delete(

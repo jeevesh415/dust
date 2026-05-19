@@ -1,4 +1,5 @@
 /** @ignoreswagger */
+// @migration-status: MIGRATED_TO_HONO
 import {
   buildAuditLogTarget,
   emitAuditLogEvent,
@@ -15,13 +16,12 @@ import type { SpaceResource } from "@app/lib/resources/space_resource";
 import { apiError } from "@app/logger/withlogging";
 import type { DataSourceType } from "@app/types/data_source";
 import type { WithAPIErrorResponse } from "@app/types/error";
-import { isLeft } from "fp-ts/lib/Either";
-import * as t from "io-ts";
-import * as reporter from "io-ts-reporters";
 import type { NextApiRequest, NextApiResponse } from "next";
+import { z } from "zod";
+import { fromError } from "zod-validation-error";
 
-const PatchDataSourceWithoutProviderRequestBodySchema = t.type({
-  description: t.string,
+const PatchDataSourceWithoutProviderRequestBodySchema = z.object({
+  description: z.string(),
 });
 
 type PatchSpaceDataSourceResponseBody = {
@@ -73,9 +73,9 @@ async function handler(
       }
 
       const bodyValidation =
-        PatchDataSourceWithoutProviderRequestBodySchema.decode(req.body);
-      if (isLeft(bodyValidation)) {
-        const pathError = reporter.formatValidationErrors(bodyValidation.left);
+        PatchDataSourceWithoutProviderRequestBodySchema.safeParse(req.body);
+      if (!bodyValidation.success) {
+        const pathError = fromError(bodyValidation.error).toString();
         return apiError(req, res, {
           status_code: 400,
           api_error: {
@@ -84,7 +84,7 @@ async function handler(
           },
         });
       }
-      const { description } = bodyValidation.right;
+      const { description } = bodyValidation.data;
 
       await dataSource.setDescription(description);
 
@@ -97,8 +97,8 @@ async function handler(
         ],
         context: getAuditLogContext(auth, req),
         metadata: {
-          dataSourceName: dataSource.name,
-          field: Object.keys(bodyValidation.right).join(","),
+          data_source_name: dataSource.name,
+          field: Object.keys(bodyValidation.data).join(","),
         },
       });
 
@@ -161,9 +161,9 @@ async function handler(
         ],
         context: getAuditLogContext(auth, req),
         metadata: {
-          dataSourceName: dataSource.name,
+          data_source_name: dataSource.name,
           provider: dataSource.connectorProvider ?? "folder",
-          spaceId: space.sId,
+          space_id: space.sId,
         },
       });
 

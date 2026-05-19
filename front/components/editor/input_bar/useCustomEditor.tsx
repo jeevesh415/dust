@@ -1,14 +1,17 @@
 import { CodeExtension } from "@app/components/editor/extensions/CodeExtension";
 import { EmojiExtension } from "@app/components/editor/extensions/EmojiExtension";
 import { DataSourceLinkExtension } from "@app/components/editor/extensions/input_bar/DataSourceLinkExtension";
+import {
+  InputBarSlashSuggestionExtension,
+  inputBarSlashSuggestionPluginKey,
+} from "@app/components/editor/extensions/input_bar/InputBarSlashSuggestionExtension";
+import type { InputBarSlashSuggestionCapability } from "@app/components/editor/extensions/input_bar/InputBarSlashSuggestionTypes";
 import { KeyboardShortcutsExtension } from "@app/components/editor/extensions/input_bar/KeyboardShortcutsExtension";
 import { PastedAttachmentExtension } from "@app/components/editor/extensions/input_bar/PastedAttachmentExtension";
+import { SkillNode } from "@app/components/editor/extensions/input_bar/SkillNode";
 import { URLDetectionExtension } from "@app/components/editor/extensions/input_bar/URLDetectionExtension";
 import { URLStorageExtension } from "@app/components/editor/extensions/input_bar/URLStorageExtension";
-import {
-  MentionExtension,
-  type MentionsStrippedPayload,
-} from "@app/components/editor/extensions/MentionExtension";
+import { MentionExtension } from "@app/components/editor/extensions/MentionExtension";
 import { BlockquoteExtension } from "@app/components/editor/input_bar/BlockquoteExtension";
 import { cleanupPastedHTML } from "@app/components/editor/input_bar/cleanupPastedHTML";
 import { emojiPluginKey } from "@app/components/editor/input_bar/emojiSuggestion";
@@ -125,12 +128,16 @@ const useEditorService = (editor: Editor | null) => {
           return {
             markdown: "",
             mentions: [],
+            skills: [],
           };
         }
 
+        const { mentions, skills } = extractFromEditorJSON(editor?.getJSON());
+
         return {
           markdown: editor.getMarkdown(),
-          mentions: extractFromEditorJSON(editor?.getJSON()).mentions,
+          mentions,
+          skills,
         };
       },
 
@@ -151,24 +158,6 @@ const useEditorService = (editor: Editor | null) => {
 
       clearEditor() {
         return editor?.commands.clearContent();
-      },
-
-      removeUserMentions(): boolean {
-        if (!editor) {
-          return false;
-        }
-        const { tr } = editor.state;
-        let modified = false;
-        editor.state.doc.descendants((node, pos) => {
-          if (node.type.name === "mention" && node.attrs.type === "user") {
-            tr.delete(tr.mapping.map(pos), tr.mapping.map(pos + node.nodeSize));
-            modified = true;
-          }
-        });
-        if (modified) {
-          editor.view.dispatch(tr);
-        }
-        return modified;
       },
 
       setLoading(loading: boolean) {
@@ -198,7 +187,6 @@ export interface CustomEditorProps {
   disableUserMentions?: boolean;
   onUrlDetected?: (candidate: UrlCandidate | NodeCandidate | null) => void;
   onAgentSelect?: (mention: RichMention) => void;
-  singleAgentInputEnabled?: boolean;
   owner: WorkspaceType;
   conversationId?: string | null;
   spaceId?: string;
@@ -212,14 +200,18 @@ export interface CustomEditorProps {
   onInlineText?: (fileId: string, textContent: string) => void;
   // When true, agent suggestions are fully disabled (e.g. edit mode).
   disableAgentMentions?: boolean;
-  // Ref that dynamically controls whether agent suggestions are shown for single agent mode.
-  shouldSuggestAgentRef?: React.RefObject<boolean>;
   onFirstAgentMentionPasteRef?: React.RefObject<
     ((agentId: string) => void) | undefined
   >;
-  onAgentMentionsStrippedRef?: React.RefObject<
-    ((payload: MentionsStrippedPayload) => void) | undefined
-  >;
+  slashSuggestion?: {
+    enabledRef: React.RefObject<boolean>;
+    onSelectRef: React.RefObject<
+      ((capability: InputBarSlashSuggestionCapability) => void) | undefined
+    >;
+    selectedMCPServerViewIdsRef: React.RefObject<Set<string>>;
+  };
+  // Override the default editor placeholder (e.g. to show a blocked-state reason).
+  placeholderOverride?: string | null;
 }
 
 export const buildEditorExtensions = ({
@@ -231,10 +223,9 @@ export const buildEditorExtensions = ({
   onInlineText,
   onUrlDetected,
   onAgentSelect,
-  singleAgentInputEnabled,
-  shouldSuggestAgentRef,
   onFirstAgentMentionPasteRef,
-  onAgentMentionsStrippedRef,
+  slashSuggestion,
+  placeholderOverride,
 }: {
   owner: WorkspaceType;
   conversationId?: string | null;
@@ -244,14 +235,11 @@ export const buildEditorExtensions = ({
   onInlineText?: (fileId: string, textContent: string) => void;
   onUrlDetected?: (candidate: UrlCandidate | NodeCandidate | null) => void;
   onAgentSelect?: (mention: RichMention) => void;
-  singleAgentInputEnabled?: boolean;
-  shouldSuggestAgentRef?: React.RefObject<boolean>;
   onFirstAgentMentionPasteRef?: React.RefObject<
     ((agentId: string) => void) | undefined
   >;
-  onAgentMentionsStrippedRef?: React.RefObject<
-    ((payload: MentionsStrippedPayload) => void) | undefined
-  >;
+  slashSuggestion?: CustomEditorProps["slashSuggestion"];
+  placeholderOverride?: string | null;
 }) => {
   const extensions = [
     KeyboardShortcutsExtension,
@@ -314,7 +302,6 @@ export const buildEditorExtensions = ({
     MentionExtension.configure({
       owner,
       onFirstAgentMentionPasteRef,
-      onAgentMentionsStrippedRef,
       HTMLAttributes: {
         class:
           "min-w-0 px-0 py-0 border-none outline-none focus:outline-none focus:border-none ring-0 focus:ring-0 text-highlight-500 font-semibold",
@@ -327,20 +314,17 @@ export const buildEditorExtensions = ({
           agents: !disableAgentMentions,
           users: !disableUserMentions,
         },
-        shouldSuggestAgentRef,
         onAgentSelect,
-        singleAgentInputEnabled,
       }),
     }),
+    SkillNode,
     EmojiExtension,
     Placeholder.configure({
       placeholder: ({ node }) => {
         if (node.type.name !== "paragraph") {
           return "";
         }
-        return singleAgentInputEnabled
-          ? "Ask a question"
-          : "Ask an @agent a question, or get some @help";
+        return placeholderOverride ?? "Ask a question";
       },
       emptyNodeClass:
         "first:before:text-gray-400 first:before:content-[attr(data-placeholder)] first:before:pointer-events-none first:before:absolute",
@@ -350,6 +334,19 @@ export const buildEditorExtensions = ({
     }),
     URLStorageExtension,
   ];
+
+  if (slashSuggestion) {
+    extensions.push(
+      InputBarSlashSuggestionExtension.configure({
+        owner,
+        enabledRef: slashSuggestion.enabledRef,
+        onSelectRef: slashSuggestion.onSelectRef,
+        selectedMCPServerViewIdsRef:
+          slashSuggestion.selectedMCPServerViewIdsRef,
+      })
+    );
+  }
+
   if (onUrlDetected) {
     extensions.push(
       URLDetectionExtension.configure({
@@ -367,7 +364,6 @@ const useCustomEditor = ({
   disableUserMentions,
   onUrlDetected,
   onAgentSelect,
-  singleAgentInputEnabled,
   owner,
   conversationId,
   spaceId,
@@ -375,9 +371,9 @@ const useCustomEditor = ({
   longTextPasteCharsThreshold,
   onInlineText,
   disableAgentMentions,
-  shouldSuggestAgentRef,
   onFirstAgentMentionPasteRef,
-  onAgentMentionsStrippedRef,
+  slashSuggestion,
+  placeholderOverride,
 }: CustomEditorProps) => {
   const editor = useEditor(
     {
@@ -391,10 +387,9 @@ const useCustomEditor = ({
         onInlineText,
         onUrlDetected,
         onAgentSelect,
-        singleAgentInputEnabled,
-        shouldSuggestAgentRef,
         onFirstAgentMentionPasteRef,
-        onAgentMentionsStrippedRef,
+        slashSuggestion,
+        placeholderOverride,
       }),
       shouldRerenderOnTransaction: true, // necessary to update the editor state (and so the toolbar icons "activation") in real time
       editorProps: {
@@ -422,7 +417,8 @@ const useCustomEditor = ({
       immediatelyRender: false,
     },
     // Important to watch for conversationId changes to reset the editor state when switching conversations.
-    [conversationId]
+    // placeholderOverride is included so the placeholder text updates when the blocked-state reason changes.
+    [conversationId, placeholderOverride]
   );
 
   const editorService = useEditorService(editor);
@@ -464,6 +460,12 @@ const useCustomEditor = ({
             const emojiPluginState = emojiPluginKey.getState(view.state);
             // Let the emoji extension handle the event if its dropdown is currently opened.
             if (emojiPluginState?.active) {
+              return false;
+            }
+
+            const inputBarSlashSuggestionPluginState =
+              inputBarSlashSuggestionPluginKey.getState(view.state);
+            if (inputBarSlashSuggestionPluginState?.active) {
               return false;
             }
 

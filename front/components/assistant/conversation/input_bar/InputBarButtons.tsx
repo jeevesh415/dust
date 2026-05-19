@@ -14,12 +14,12 @@ import type {
   RichMention,
 } from "@app/types/assistant/mentions";
 import { toRichAgentMentionType } from "@app/types/assistant/mentions";
-import type { SkillType } from "@app/types/assistant/skill_configuration";
+import type { SkillWithoutInstructionsAndToolsType } from "@app/types/assistant/skill_configuration";
 import type { DataSourceViewContentNode } from "@app/types/data_source_view";
 import { getSupportedFileExtensions } from "@app/types/files";
 import type { SpaceType } from "@app/types/space";
 import type { UserType, WorkspaceType } from "@app/types/user";
-import { Avatar, Button, cn, RobotIcon } from "@dust-tt/sparkle";
+import { Avatar, Button, cn, RobotIcon, XMarkIcon } from "@dust-tt/sparkle";
 import React from "react";
 
 interface InputBarButtonsProps {
@@ -30,20 +30,22 @@ interface InputBarButtonsProps {
   clientType: string;
   conversation?: ConversationWithoutContentType;
   disableAgentSelector: boolean;
-  disableInput: boolean;
   editorService: ReturnType<typeof useCustomEditor>["editorService"];
   fileInputRef: React.MutableRefObject<HTMLInputElement | null>;
   fileUploaderService: FileUploaderService;
   handleSingleAgentSelect: (mention: RichMention) => void;
+  hideCapabilities: boolean;
+  // When true, disables every picker (tools, attachment) in addition to the
+  // agent selector which is muted via `disableAgentSelector`.
+  isInputDisabled: boolean;
+  onAgentRemove: () => void;
   onMCPServerViewSelect: (serverView: MCPServerViewType) => void;
   onNodeSelect: (node: DataSourceViewContentNode) => void;
   onNodeUnselect: (node: DataSourceViewContentNode) => void;
-  onSkillSelect: (skill: SkillType) => void;
+  onSkillSelect: (skill: SkillWithoutInstructionsAndToolsType) => void;
   owner: WorkspaceType;
   selectedAgent: RichAgentMention | null;
   selectedMCPServerViews: MCPServerViewType[];
-  selectedSkills: SkillType[];
-  singleAgentInput: boolean;
   space: SpaceType | undefined;
   user: UserType | null;
 }
@@ -56,11 +58,13 @@ export const InputBarButtons = React.memo(function InputBarButtons({
   clientType,
   conversation,
   disableAgentSelector,
-  disableInput,
   editorService,
   fileInputRef,
   fileUploaderService,
   handleSingleAgentSelect,
+  hideCapabilities,
+  isInputDisabled,
+  onAgentRemove,
   onMCPServerViewSelect,
   onNodeSelect,
   onNodeUnselect,
@@ -68,8 +72,6 @@ export const InputBarButtons = React.memo(function InputBarButtons({
   owner,
   selectedAgent,
   selectedMCPServerViews,
-  selectedSkills,
-  singleAgentInput,
   space,
   user,
 }: InputBarButtonsProps) {
@@ -88,11 +90,7 @@ export const InputBarButtons = React.memo(function InputBarButtons({
       size={buttonSize}
       onAgentDetailsClick={handleAgentDetailsClick}
       onItemClick={(c) => {
-        if (singleAgentInput) {
-          handleSingleAgentSelect(toRichAgentMentionType(c));
-        } else {
-          editorService.insertMention(toRichAgentMentionType(c));
-        }
+        handleSingleAgentSelect(toRichAgentMentionType(c));
       }}
       agents={allAgents}
       showDropdownArrow={false}
@@ -101,33 +99,51 @@ export const InputBarButtons = React.memo(function InputBarButtons({
         actions.includes("agents-list-with-actions") &&
         clientType !== "extension"
       }
-      disabled={disableInput}
       pickerButton={
-        singleAgentInput ? (
-          selectedAgent ? (
-            <Button
-              variant="ghost-secondary"
-              size={buttonSize}
-              icon={() => (
-                <Avatar size="xxs" visual={selectedAgent.pictureUrl} />
-              )}
-              label={selectedAgent.label}
-              className={cn(
-                disableAgentSelector && "bg-gray-150 dark:bg-gray-800"
-              )}
-            />
-          ) : (
-            <Button
-              variant="ghost-secondary"
-              size={buttonSize}
-              icon={RobotIcon}
-              label="Agent"
-              className={cn(
-                disableAgentSelector && "bg-gray-150 dark:bg-gray-800"
-              )}
-            />
-          )
-        ) : undefined
+        selectedAgent ? (
+          <div
+            role="button"
+            tabIndex={isInputDisabled ? -1 : 0}
+            aria-label={`Selected agent: ${selectedAgent.label}`}
+            aria-disabled={isInputDisabled}
+            className={cn(
+              "inline-flex box-border items-center rounded-lg h-7 heading-xs px-2 gap-1.5 bg-muted-background border-border dark:bg-muted-background-night dark:border-border-night text-primary-900 dark:text-primary-900-night transition-colors duration-200",
+              isInputDisabled
+                ? "opacity-50 pointer-events-none"
+                : "cursor-pointer hover:bg-hover dark:hover:bg-hover-night"
+            )}
+          >
+            <Avatar size="xxs" visual={selectedAgent.pictureUrl} />
+            <span className="grow truncate">{selectedAgent.label}</span>
+            <button
+              type="button"
+              aria-label="Remove agent"
+              className="p-0.5 text-faint dark:text-faint-night hover:text-foreground transition-colors duration-200"
+              onPointerDown={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+              }}
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                onAgentRemove();
+              }}
+            >
+              <XMarkIcon className="h-3 w-3" />
+            </button>
+          </div>
+        ) : (
+          <Button
+            variant="ghost-secondary"
+            size={buttonSize}
+            icon={RobotIcon}
+            label="Agent"
+            disabled={isInputDisabled}
+            className={cn(
+              disableAgentSelector && "bg-gray-150 dark:bg-gray-800"
+            )}
+          />
+        )
       }
     />
   );
@@ -137,10 +153,9 @@ export const InputBarButtons = React.memo(function InputBarButtons({
       user={user}
       selectedMCPServerViews={selectedMCPServerViews}
       onSelect={onMCPServerViewSelect}
-      selectedSkills={selectedSkills}
       onSkillSelect={onSkillSelect}
-      disabled={disableInput}
       buttonSize={buttonSize}
+      disabled={isInputDisabled}
     />
   );
   const attachmentButton = actions.includes("attachment") &&
@@ -167,7 +182,6 @@ export const InputBarButtons = React.memo(function InputBarButtons({
           onNodeSelect={onNodeSelect}
           onNodeUnselect={onNodeUnselect}
           attachedNodes={attachedNodes}
-          disabled={disableInput}
           buttonSize={buttonSize}
           toolFileUpload={{
             useCase: "conversation",
@@ -177,20 +191,15 @@ export const InputBarButtons = React.memo(function InputBarButtons({
           }}
           spaceId={spaceId}
           type="dropdown"
+          disabled={isInputDisabled}
         />
       </>
     );
-  return singleAgentInput ? (
+  return (
     <>
       {agentButton}
-      {toolsButton}
+      {!hideCapabilities && toolsButton}
       {attachmentButton}
-    </>
-  ) : (
-    <>
-      {attachmentButton}
-      {toolsButton}
-      {agentButton}
     </>
   );
 });

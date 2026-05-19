@@ -69,6 +69,7 @@
  *         - sId
  *         - name
  *         - role
+ *         - regionalModelsOnly
  *       properties:
  *         id:
  *           type: integer
@@ -93,6 +94,9 @@
  *           nullable: true
  *         ssoEnforced:
  *           type: boolean
+ *         regionalModelsOnly:
+ *           type: boolean
+ *           description: When true, only models whose regionalAvailability includes the workspace's region are usable.
  *         metadata:
  *           type: object
  *           nullable: true
@@ -147,6 +151,81 @@
  *           type: array
  *           items:
  *             type: string
+ *         forkingData:
+ *           $ref: '#/components/schemas/PrivateConversationForkingData'
+ *     PrivateConversationForkUser:
+ *       type: object
+ *       properties:
+ *         sId:
+ *           type: string
+ *         id:
+ *           type: integer
+ *         createdAt:
+ *           type: integer
+ *         provider:
+ *           type: string
+ *           nullable: true
+ *           enum: [auth0, github, google, okta, samlp, waad]
+ *         username:
+ *           type: string
+ *         email:
+ *           type: string
+ *         firstName:
+ *           type: string
+ *         lastName:
+ *           type: string
+ *           nullable: true
+ *         fullName:
+ *           type: string
+ *         image:
+ *           type: string
+ *           nullable: true
+ *         lastLoginAt:
+ *           type: integer
+ *           nullable: true
+ *     PrivateConversationForkedFrom:
+ *       type: object
+ *       required:
+ *         - parentConversationId
+ *         - parentConversationTitle
+ *         - sourceMessageId
+ *         - branchedAt
+ *         - user
+ *       properties:
+ *         parentConversationId:
+ *           type: string
+ *         parentConversationTitle:
+ *           type: string
+ *           nullable: true
+ *         sourceMessageId:
+ *           type: string
+ *         branchedAt:
+ *           type: integer
+ *         user:
+ *           $ref: '#/components/schemas/PrivateConversationForkUser'
+ *     PrivateConversationForkedChild:
+ *       type: object
+ *       properties:
+ *         childConversationId:
+ *           type: string
+ *         childConversationTitle:
+ *           type: string
+ *           nullable: true
+ *         sourceMessageId:
+ *           type: string
+ *         branchedAt:
+ *           type: integer
+ *         user:
+ *           $ref: '#/components/schemas/PrivateConversationForkUser'
+ *     PrivateConversationForkingData:
+ *       type: object
+ *       properties:
+ *         forkedFrom:
+ *           $ref: '#/components/schemas/PrivateConversationForkedFrom'
+ *         forkedChildren:
+ *           type: array
+ *           items:
+ *             $ref: '#/components/schemas/PrivateConversationForkedChild'
  *     PrivateFullConversation:
  *       type: object
  *       description: Full conversation including content, owner, and visibility.
@@ -511,6 +590,13 @@
  *           type: string
  *           nullable: true
  *           description: Present for file content fragments
+ *         path:
+ *           type: string
+ *           nullable: true
+ *           description: Path of this file inside the sandbox conversation mount.
+ *         skipFileProcessing:
+ *           type: boolean
+ *           description: Whether upload-time file processing was skipped.
  *         snippet:
  *           type: string
  *           nullable: true
@@ -557,6 +643,9 @@
  *         rank:
  *           type: integer
  *         branchId:
+ *           type: string
+ *           nullable: true
+ *         sourceConversationId:
  *           type: string
  *           nullable: true
  *         status:
@@ -774,6 +863,13 @@
  *             archivedAt:
  *               type: integer
  *               nullable: true
+ *             todoGenerationEnabled:
+ *               type: boolean
+ *               description: Whether automatic todo suggestions from project activity are enabled.
+ *             lastTodoAnalysisAt:
+ *               type: integer
+ *               nullable: true
+ *               description: Unix timestamp (ms) of the last automatic todo suggestion scan, if any.
  *     PrivateDataSourceView:
  *       type: object
  *       description: A view on a data source within a space.
@@ -952,6 +1048,61 @@
  *           type: boolean
  *         dismissed:
  *           type: boolean
+ *     PrivateWakeUp:
+ *       type: object
+ *       description: A wake-up scheduled in a conversation to re-invoke the agent at a later time.
+ *       required:
+ *         - id
+ *         - sId
+ *         - createdAt
+ *         - agentConfigurationId
+ *         - scheduleConfig
+ *         - reason
+ *         - status
+ *         - fireCount
+ *         - maxFires
+ *       properties:
+ *         id:
+ *           type: integer
+ *         sId:
+ *           type: string
+ *         createdAt:
+ *           type: integer
+ *           description: Unix timestamp (milliseconds).
+ *         agentConfigurationId:
+ *           type: string
+ *         scheduleConfig:
+ *           oneOf:
+ *             - type: object
+ *               required: [type, fireAt]
+ *               properties:
+ *                 type:
+ *                   type: string
+ *                   enum: [one_shot]
+ *                 fireAt:
+ *                   type: integer
+ *                   description: Unix timestamp (milliseconds) when the wake-up should fire.
+ *             - type: object
+ *               required: [type, cron, timezone]
+ *               properties:
+ *                 type:
+ *                   type: string
+ *                   enum: [cron]
+ *                 cron:
+ *                   type: string
+ *                   description: 5-field cron expression.
+ *                 timezone:
+ *                   type: string
+ *                   description: IANA timezone name.
+ *         reason:
+ *           type: string
+ *         status:
+ *           type: string
+ *           enum: [scheduled, fired, cancelled, expired]
+ *         fireCount:
+ *           type: integer
+ *         maxFires:
+ *           type: integer
  *     PrivateMention:
  *       type: object
  *       description: A mention in a message (agent or user).
@@ -1019,7 +1170,7 @@
  *           type: string
  *         origin:
  *           type: string
- *           enum: [web, project_kickoff, extension, agent_sidekick, api, cli, cli_programmatic, email, excel, gsheet, make, n8n, powerpoint, raycast, slack, slack_workflow, teams, transcript, triggered_programmatic, triggered, zapier, zendesk, onboarding_conversation]
+ *           enum: [web, project_kickoff, extension, agent_sidekick, api, cli, cli_programmatic, email, excel, gsheet, make, n8n, powerpoint, raycast, slack, slack_workflow, teams, transcript, triggered_programmatic, triggered, wakeup, zapier, zendesk, onboarding_conversation]
  *     PrivateReaction:
  *       type: object
  *       description: A reaction on a message.

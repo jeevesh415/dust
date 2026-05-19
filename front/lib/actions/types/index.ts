@@ -3,6 +3,7 @@ import type {
   LightMCPToolConfigurationType,
   MCPServerConfigurationType,
 } from "@app/lib/actions/mcp";
+import type { AgentMCPActionType } from "@app/types/actions";
 import type { AgentConfigurationType } from "@app/types/assistant/agent";
 import type {
   AgentMessageType,
@@ -24,6 +25,20 @@ export function isFileAuthorizationInfo(
   value: unknown
 ): value is FileAuthorizationInfo {
   return FileAuthorizationInfoSchema.safeParse(value).success;
+}
+
+const SandboxChildActionInfoSchema = z.object({
+  parentActionId: z.string(),
+});
+
+export type SandboxChildActionInfo = z.infer<
+  typeof SandboxChildActionInfoSchema
+>;
+
+export function isSandboxChildActionInfo(
+  value: unknown
+): value is SandboxChildActionInfo {
+  return SandboxChildActionInfoSchema.safeParse(value).success;
 }
 
 const UserQuestionOptionSchema = z.object({
@@ -79,31 +94,45 @@ export type StepContext = {
   citationsCount: number;
   citationsOffset: number;
   fileAuthorizationInfo?: FileAuthorizationInfo;
+  sandboxChildActionInfo?: SandboxChildActionInfo;
   resumeState: Record<string, unknown> | null;
   retrievalTopK: number;
-  sandboxOrigin?: boolean;
-  sandboxPaused?: boolean;
   websearchResultCount: number;
 };
 
-export type ActionGeneratedFileType = {
-  fileId: string;
+type ActionGeneratedFileBase = {
   title: string;
   contentType: AllSupportedFileContentType;
   snippet: string | null;
+  hidden?: boolean;
   createdAt?: number;
   updatedAt?: number;
   isInProjectContext?: boolean;
-  hidden?: boolean;
   // True for files created by offloading oversized tool output to disk. These are never indexed in
   // Qdrant and should not be flagged as searchable in the conversation render.
   skipDataSourceIndexing?: boolean;
 };
 
+// File backed by a Dust FileResource.
+export type ActionGeneratedDBFileType = ActionGeneratedFileBase & {
+  fileId: string;
+  filePath?: never;
+};
+
+// File path only, no FileResource in DB.
+export type ActionGeneratedFilePathType = ActionGeneratedFileBase & {
+  fileId: null;
+  filePath: string;
+};
+
+export type ActionGeneratedFileType =
+  | ActionGeneratedDBFileType
+  | ActionGeneratedFilePathType;
+
 export type AgentLoopRunContextType = {
   agentConfiguration: AgentConfigurationType;
   agentMessage: AgentMessageType;
-  clientSideActionConfigurations?: ClientSideMCPServerConfigurationType[];
+  currentAction: AgentMCPActionType;
   conversation: ConversationType;
   stepContext: StepContext;
   toolConfiguration: LightMCPToolConfigurationType;

@@ -14,6 +14,16 @@ export function formatSandboxImageId(id: SandboxImageId): string {
 }
 
 // ---------------------------------------------------------------------------
+// Tool Names
+// ---------------------------------------------------------------------------
+
+// TODO(dsbx-tools): Hacky temporary — exported so the `dsbx` entry can be
+// filtered out of the sandbox tool manifest by name when the
+// `sandbox_dsbx_tools` flag is off. Remove once `dsbx tools` ships to all
+// sandbox-enabled workspaces and the flag goes away.
+export const DSBX_TOOL_NAME = "dsbx";
+
+// ---------------------------------------------------------------------------
 // Tool Runtime & Profile
 // ---------------------------------------------------------------------------
 
@@ -34,7 +44,7 @@ export interface ToolEntry {
   readonly usage?: string;
   readonly returns?: string;
   readonly runtime: ToolRuntime;
-  readonly profile?: ToolProfile;
+  readonly profile?: ToolProfile | readonly ToolProfile[];
 }
 
 // ---------------------------------------------------------------------------
@@ -43,7 +53,10 @@ export interface ToolEntry {
 
 export type ManifestFormat = "json" | "yaml";
 
-export type ContentGenerator = () => Buffer | string;
+export type ContentGenerator = () =>
+  | Buffer
+  | string
+  | Map<string, Buffer | string>;
 
 export type CopySource =
   | { readonly type: "path"; readonly path: string }
@@ -85,15 +98,22 @@ export interface NetworkPolicy {
   readonly allowlist?: readonly string[];
 }
 
-export const ALLOWLIST_NETWORK_POLICY: NetworkPolicy = {
+// Agent commands run as agent-proxied (uid 1003) whose traffic is redirected
+// by nftables to the in-sandbox egress proxy. The E2B-level allowlist covers
+// services that root processes access directly (bypassing the proxy).
+export const PROXY_ONLY_NETWORK_POLICY: NetworkPolicy = {
   mode: "deny_all",
   allowlist: [
+    // GCS — gcsfuse mounts run as root
     "storage.googleapis.com",
-    "dust.tt",
-    "*.dust.tt",
-    // Datadog EU — sandbox telemetry
+    // Datadog EU — sandbox telemetry runs as root
     "http-intake.logs.datadoghq.eu",
     "api.datadoghq.eu",
+    // Regional egress proxy — the forwarder (root) connects by resolved IP,
+    // but E2B's domain-based allowOut needs the wildcard too.
+    "*.sandbox-egress.dust.tt",
+    "104.199.4.80/32", // eu.sandbox-egress.dust.tt
+    "104.154.146.142/32", // us.sandbox-egress.dust.tt
   ],
 };
 
@@ -111,7 +131,6 @@ export interface ManifestToolEntry {
 
 export interface ToolManifest {
   readonly version: "1.0";
-  readonly generatedAt: string;
   readonly tools: Readonly<
     Partial<Record<ToolRuntime, readonly ManifestToolEntry[]>>
   >;

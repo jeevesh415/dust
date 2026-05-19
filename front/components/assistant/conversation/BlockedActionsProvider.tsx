@@ -1,7 +1,7 @@
 import { useConversations } from "@app/hooks/conversations";
 import type { BlockedToolExecution } from "@app/lib/actions/mcp";
 import { useBlockedActions } from "@app/lib/swr/blocked_actions";
-import type { ConversationWithoutContentType } from "@app/types/assistant/conversation";
+import type { ConversationListItemType } from "@app/types/assistant/conversation";
 import type { LightWorkspaceType } from "@app/types/user";
 import type { ReactNode } from "react";
 import {
@@ -59,7 +59,7 @@ export function useBlockedActionsContext() {
 
 interface BlockedActionsProviderProps {
   owner: LightWorkspaceType;
-  conversation?: ConversationWithoutContentType;
+  conversation?: ConversationListItemType;
   children: ReactNode;
 }
 
@@ -90,17 +90,29 @@ export function BlockedActionsProvider({
 
   useEffect(() => {
     if (conversationId) {
-      setBlockedActionsQueue(
-        blockedActions.flatMap((action): BlockedActionQueueItem[] => {
+      // Sub-agent (run_agent) conversations can be nested arbitrarily deep:
+      // a `blocked_child_action_input_required` action can itself contain
+      // child actions in the same `blocked_child_action_input_required` state.
+      // Walk the tree to surface every leaf, anchored on the outermost
+      // message id so removal/lookup matches the rendered agent message.
+      const flattenBlockedActions = (
+        actions: BlockedToolExecution[],
+        outerMessageId: string
+      ): BlockedActionQueueItem[] =>
+        actions.flatMap((action) => {
           if (action.status === "blocked_child_action_input_required") {
-            return action.childBlockedActionsList.map((childAction) => ({
-              blockedAction: childAction,
-              messageId: action.messageId,
-            }));
-          } else {
-            return [{ blockedAction: action, messageId: action.messageId }];
+            return flattenBlockedActions(
+              action.childBlockedActionsList,
+              outerMessageId
+            );
           }
-        })
+          return [{ blockedAction: action, messageId: outerMessageId }];
+        });
+
+      setBlockedActionsQueue(
+        blockedActions.flatMap((action) =>
+          flattenBlockedActions([action], action.messageId)
+        )
       );
     } else {
       setBlockedActionsQueue(EMPTY_BLOCKED_ACTIONS_QUEUE);
@@ -211,7 +223,10 @@ export function BlockedActionsProvider({
     [blockedActionsQueue]
   );
 
-  const { mutateConversations } = useConversations({ workspaceId: owner.sId });
+  const { mutateConversations } = useConversations({
+    workspaceId: owner.sId,
+    options: { disabled: true },
+  });
 
   const removeAllBlockedActionsForMessage = useCallback(
     ({
@@ -229,7 +244,7 @@ export function BlockedActionsProvider({
       // We only show the conversation in unread inbox if actionRequired is true (and this happens only when you come back to a conversation
       // since we don't update this value on frontend side), so we don't have to update the cache if it's not in the unread inbox.
       void mutateConversations(
-        (currentData: ConversationWithoutContentType[] | undefined) =>
+        (currentData: ConversationListItemType[] | undefined) =>
           currentData?.map((c) =>
             c.sId === conversationId && c.actionRequired
               ? { ...c, actionRequired: false }

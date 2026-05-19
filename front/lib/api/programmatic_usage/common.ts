@@ -29,15 +29,16 @@ export const USAGE_ORIGINS_CLASSIFICATION: Record<
   transcript: "user",
   triggered_programmatic: "programmatic",
   triggered: "user",
+  wakeup: "user",
   web: "user",
   zapier: "programmatic",
   zendesk: "user",
   onboarding_conversation: "user",
   agent_sidekick: "user",
   project_kickoff: "user",
-  reinforced_agent_notification: "user",
   reinforced_skill_notification: "user",
-  reinforcement: "user",
+  reinforcement: "programmatic",
+  branch_anchor: "user",
 };
 
 export const USER_USAGE_ORIGINS = Object.keys(

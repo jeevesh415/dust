@@ -36,15 +36,13 @@ export function getRetrievalTopK({
     (tool) =>
       isServerSideMCPToolConfigurationWithName(tool, "search") ||
       (isServerSideMCPToolConfigurationWithName(tool, "conversation_files") &&
-        tool.originalName === "semantic_search") ||
-      (isServerSideMCPToolConfigurationWithName(tool, "project_manager") &&
         tool.originalName === "semantic_search")
   );
 
   const includeActions = stepActions.filter(
     (tool) =>
       isServerSideMCPToolConfigurationWithName(tool, "include_data") ||
-      (isServerSideMCPToolConfigurationWithName(tool, "project_manager") &&
+      (isServerSideMCPToolConfigurationWithName(tool, "pod_manager") &&
         tool.originalName === "retrieve_recent_documents")
   );
   const dsFsActions = stepActions.filter((tool) =>

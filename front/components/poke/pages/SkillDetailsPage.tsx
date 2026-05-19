@@ -1,4 +1,4 @@
-import { ReinforcementSkillsConversationDataTable } from "@app/components/poke/conversation/reinforcement_skills_table";
+import { SelfImprovingSkillsConversationDataTable } from "@app/components/poke/conversation/self_improving_skills_table";
 import { PluginList } from "@app/components/poke/plugins/PluginList";
 import { SkillSuggestionDataTable } from "@app/components/poke/skill_suggestions/table";
 import { SkillOverviewTable } from "@app/components/poke/skills/SkillOverviewTable";
@@ -125,6 +125,18 @@ export function SkillDetailsPage() {
 
       <div className="mt-4">
         <div className="border-material-200 rounded-lg border p-4">
+          <h2 className="text-md pb-4 font-bold">Instructions HTML</h2>
+          <TextArea
+            value={skill.instructionsHtml ?? ""}
+            readOnly
+            resize="none"
+            isDisplay
+          />
+        </div>
+      </div>
+
+      <div className="mt-4">
+        <div className="border-material-200 rounded-lg border p-4">
           <h2 className="text-md pb-4 font-bold">
             Tools ({skill.tools.length})
           </h2>
@@ -143,7 +155,7 @@ export function SkillDetailsPage() {
       </div>
 
       <div className="mt-4">
-        <ReinforcementSkillsConversationDataTable owner={owner} skillId={sId} />
+        <SelfImprovingSkillsConversationDataTable owner={owner} skillId={sId} />
       </div>
 
       <SkillSuggestionDataTable owner={owner} skillId={sId} />

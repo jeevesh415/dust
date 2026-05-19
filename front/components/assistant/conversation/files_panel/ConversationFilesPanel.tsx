@@ -1,4 +1,5 @@
 import { useConversationSidePanelContext } from "@app/components/assistant/conversation/ConversationSidePanelContext";
+import { ConversationFileExplorer } from "@app/components/assistant/conversation/files_panel/ConversationFileExplorer";
 import { FilesTab } from "@app/components/assistant/conversation/files_panel/FilesTab";
 import { SandboxStatusChip } from "@app/components/assistant/conversation/files_panel/SandboxStatusChip";
 import { SandboxTab } from "@app/components/assistant/conversation/files_panel/SandboxTab";
@@ -13,8 +14,8 @@ import { useConversationAttachments } from "@app/hooks/conversations/useConversa
 import { useConversationSandboxStatus } from "@app/hooks/conversations/useConversationSandboxStatus";
 import { useSendNotification } from "@app/hooks/useNotification";
 import { isFileAttachmentType } from "@app/lib/api/assistant/conversation/attachments";
+import type { GCSMountFileEntry } from "@app/lib/api/files/gcs_mount/files";
 import { downloadSandboxFile } from "@app/lib/swr/files";
-import type { GCSMountFileEntry } from "@app/pages/api/w/[wId]/assistant/conversations/[cId]/files";
 import type { ConversationWithoutContentType } from "@app/types/assistant/conversation";
 import { isInteractiveContentType } from "@app/types/files";
 import type { LightWorkspaceType } from "@app/types/user";
@@ -37,6 +38,8 @@ export function ConversationFilesPanel({
   conversation,
   owner,
 }: ConversationFilesPanelProps) {
+  const isNewFileExplorer = conversation.metadata?.useFileSystem === true;
+
   const [activeTab, setActiveTab] = useState("files");
   const [previewFile, setPreviewFile] = useState<MinimalFileForPreview | null>(
     null
@@ -51,11 +54,13 @@ export function ConversationFilesPanel({
     useConversationAttachments({
       conversationId: conversation.sId,
       owner,
+      options: { disabled: isNewFileExplorer },
     });
 
   const { sandboxStatus } = useConversationSandboxStatus({
     conversationId: conversation.sId,
     owner,
+    options: { disabled: isNewFileExplorer },
   });
 
   const openFile = useCallback(
@@ -143,6 +148,12 @@ export function ConversationFilesPanel({
         .map((a) => conversationAttachmentToRow(a, handleAttachmentClick)),
     [attachments, handleAttachmentClick]
   );
+
+  if (isNewFileExplorer) {
+    return (
+      <ConversationFileExplorer conversation={conversation} owner={owner} />
+    );
+  }
 
   const hasSandbox = sandboxStatus !== null;
 

@@ -1,4 +1,4 @@
-import * as t from "io-ts";
+import { z } from "zod";
 
 import type { ModelId } from "./shared/model_id";
 import type { RoleType } from "./user";
@@ -63,15 +63,15 @@ export type GroupType = {
   memberCount: number;
 };
 
-export const GroupKindCodec = t.keyof({
-  global: null,
-  regular: null,
-  space_editors: null,
-  agent_editors: null,
-  skill_editors: null,
-  system: null,
-  provisioned: null,
-});
+export const GroupKindCodec = z.enum([
+  "global",
+  "regular",
+  "space_editors",
+  "agent_editors",
+  "skill_editors",
+  "system",
+  "provisioned",
+]);
 
 const DustGroupIdsHeader = "X-Dust-Group-Ids";
 
@@ -126,6 +126,6 @@ export function getHeaderFromRole(role: RoleType | undefined) {
 export const AGENT_GROUP_PREFIX = "Group for Agent";
 export const SKILL_GROUP_PREFIX = "Group for Skill";
 export const SPACE_GROUP_PREFIX = "Group for space";
-export const PROJECT_GROUP_PREFIX = "Group for project";
-export const PROJECT_EDITOR_GROUP_PREFIX = "Editors for project";
+export const PROJECT_GROUP_PREFIX = "Group for Pod";
+export const PROJECT_EDITOR_GROUP_PREFIX = "Editors for Pod";
 export const GLOBAL_SPACE_NAME = "Company Data";

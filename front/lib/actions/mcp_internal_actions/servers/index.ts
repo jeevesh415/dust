@@ -12,6 +12,7 @@ import { default as agentSidekickAgentStateServer } from "@app/lib/api/actions/s
 import { default as agentSidekickContextServer } from "@app/lib/api/actions/servers/agent_sidekick_context";
 import { default as ashbyServer } from "@app/lib/api/actions/servers/ashby";
 import { default as askUserQuestionServer } from "@app/lib/api/actions/servers/ask_user_question";
+import { default as clariCopilotServer } from "@app/lib/api/actions/servers/clari_copilot";
 import { default as commonUtilitiesServer } from "@app/lib/api/actions/servers/common_utilities";
 import { default as confluenceServer } from "@app/lib/api/actions/servers/confluence";
 import { default as conversationFilesServer } from "@app/lib/api/actions/servers/conversation_files";
@@ -21,6 +22,7 @@ import { default as databricksServer } from "@app/lib/api/actions/servers/databr
 import { default as extractDataServer } from "@app/lib/api/actions/servers/extract_data";
 import { default as fathomServer } from "@app/lib/api/actions/servers/fathom";
 import { default as fileGenerationServer } from "@app/lib/api/actions/servers/file_generation";
+import { default as filesServer } from "@app/lib/api/actions/servers/files";
 import { default as freshserviceServer } from "@app/lib/api/actions/servers/freshservice";
 import { default as frontServer } from "@app/lib/api/actions/servers/front";
 import { default as githubServer } from "@app/lib/api/actions/servers/github";
@@ -46,11 +48,12 @@ import { default as notionServer } from "@app/lib/api/actions/servers/notion";
 import { default as openaiUsageServer } from "@app/lib/api/actions/servers/openai_usage";
 import { default as outlookCalendarServer } from "@app/lib/api/actions/servers/outlook/calendar_server";
 import { default as outlookMailServer } from "@app/lib/api/actions/servers/outlook/mail_server";
+import { default as planModeServer } from "@app/lib/api/actions/servers/plan_mode";
+import { default as podManagerServer } from "@app/lib/api/actions/servers/pod_manager";
+import { default as podTasksServer } from "@app/lib/api/actions/servers/pod_tasks";
 import { default as pokeServer } from "@app/lib/api/actions/servers/poke";
 import { default as primitiveTypesDebuggerServer } from "@app/lib/api/actions/servers/primitive_types_debugger";
 import { default as productboardServer } from "@app/lib/api/actions/servers/productboard";
-import { default as projectManagerServer } from "@app/lib/api/actions/servers/project_manager";
-import { default as projectTodosServer } from "@app/lib/api/actions/servers/project_todos";
 import { default as tablesQueryServerV2 } from "@app/lib/api/actions/servers/query_tables_v2";
 import { default as runAgentServer } from "@app/lib/api/actions/servers/run_agent";
 import { default as dustAppServer } from "@app/lib/api/actions/servers/run_dust_app";
@@ -73,6 +76,7 @@ import { default as ukgReadyServer } from "@app/lib/api/actions/servers/ukg_read
 import { default as userMentionsServer } from "@app/lib/api/actions/servers/user_mentions";
 import { default as valtownServer } from "@app/lib/api/actions/servers/val_town";
 import { default as vantaServer } from "@app/lib/api/actions/servers/vanta";
+import { default as wakeupsServer } from "@app/lib/api/actions/servers/wakeups";
 import { default as webSearchBrowseServer } from "@app/lib/api/actions/servers/web_search_browse";
 import { default as zendeskServer } from "@app/lib/api/actions/servers/zendesk";
 import type { Authenticator } from "@app/lib/auth";
@@ -118,6 +122,8 @@ export async function getInternalMCPServer(
       return githubServer(auth, agentLoopContext);
     case "ashby":
       return ashbyServer(auth, agentLoopContext);
+    case "clari_copilot":
+      return clariCopilotServer(auth, agentLoopContext);
     case "hubspot":
       return hubspotServer(auth, agentLoopContext);
     case "image_generation":
@@ -186,6 +192,8 @@ export async function getInternalMCPServer(
       return dataSourcesFileSystemServer(auth, agentLoopContext);
     case "conversation_files":
       return conversationFilesServer(auth, agentLoopContext);
+    case "files":
+      return filesServer(auth, agentLoopContext);
     case "databricks":
       return databricksServer(auth, agentLoopContext);
     case "jira":
@@ -242,10 +250,10 @@ export async function getInternalMCPServer(
       return schedulesManagementServer(auth, agentLoopContext);
     case "productboard":
       return productboardServer(auth, agentLoopContext);
-    case "project_manager":
-      return projectManagerServer(auth, agentLoopContext);
-    case "project_todos":
-      return projectTodosServer(auth, agentLoopContext);
+    case "pod_manager":
+      return podManagerServer(auth, agentLoopContext);
+    case "pod_tasks":
+      return podTasksServer(auth, agentLoopContext);
     case "poke":
       return pokeServer(auth, agentLoopContext);
     case "ask_user_question":
@@ -258,6 +266,10 @@ export async function getInternalMCPServer(
       return statuspageServer(auth, agentLoopContext);
     case "sandbox":
       return sandboxServer(auth, agentLoopContext);
+    case "wakeups":
+      return wakeupsServer(auth, agentLoopContext);
+    case "plan_mode":
+      return planModeServer(auth, agentLoopContext);
     default:
       assertNever(internalMCPServerName);
   }

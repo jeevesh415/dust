@@ -1,3 +1,5 @@
+// @migration-status: MIGRATED_TO_HONO
+
 /** @ignoreswagger */
 import type { AppStatus } from "@app/lib/api/status";
 import {

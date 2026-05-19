@@ -18,6 +18,7 @@ import type {
 } from "@app/types/assistant/conversation";
 import {
   isCompactionMessageType,
+  isHiddenMessageOrigin,
   isLightAgentMessageType,
   isLightAgentMessageWithActionsType,
   isUserMessageTypeWithContentFragments,
@@ -75,9 +76,21 @@ export type AgentMessageWithStreaming = LightAgentMessageWithActionsType & {
     lastUpdated: Date;
     actionProgress: ActionProgressState;
     pendingToolCalls: PendingToolCall[];
-    useFullChainOfThought: boolean;
     inlineActivitySteps: InlineActivityStep[];
   };
+};
+
+export type ConversationForkNotice = {
+  type: "conversation_fork_notice";
+  sId: string;
+  created: number;
+  rank: number;
+  branchId: null;
+  visibility: "visible";
+  sourceMessageId: string;
+  childConversationId: string;
+  childConversationTitle: string | null;
+  user: UserType;
 };
 
 export type AgentMessageStateEvent = (
@@ -92,13 +105,13 @@ export type AgentMessageStateWithControlEvent =
 export type VirtuosoMessage =
   | AgentMessageWithStreaming
   | UserMessageTypeWithContentFragments
-  | CompactionMessageType;
+  | CompactionMessageType
+  | ConversationForkNotice;
 
 export type VirtuosoMessageListContext = {
   owner: LightWorkspaceType;
   user: UserType;
   isOnboardingConversation: boolean;
-  onConversationBranched?: () => Promise<void> | void;
   handleSubmit: (
     input: string,
     mentions: RichMention[],
@@ -151,10 +164,7 @@ export const isTriggeredOrigin = (origin?: UserMessageOrigin | null) => {
 export const isHiddenMessage = (message: VirtuosoMessage): boolean => {
   return (
     (isUserMessage(message) &&
-      (message.context.origin === "onboarding_conversation" ||
-        message.context.origin === "project_kickoff" ||
-        message.context.origin === "reinforced_agent_notification" ||
-        message.context.origin === "reinforced_skill_notification" ||
+      (isHiddenMessageOrigin(message.context.origin) ||
         isSidekickBootstrapMessage(message))) ||
     isHandoverUserMessage(message)
   );
@@ -163,6 +173,10 @@ export const isHiddenMessage = (message: VirtuosoMessage): boolean => {
 export const isCompactionMessage = (
   msg: VirtuosoMessage
 ): msg is CompactionMessageType => msg.type === "compaction_message";
+
+export const isConversationForkNotice = (
+  msg: VirtuosoMessage
+): msg is ConversationForkNotice => msg.type === "conversation_fork_notice";
 
 export const isUserMessage = (
   msg: VirtuosoMessage
@@ -189,11 +203,12 @@ export const makeInitialMessageStreamState = (
     streaming: {
       actionProgress: new Map(),
       agentState: message.status === "created" ? "thinking" : "done",
-      inlineActivitySteps: message.activitySteps ?? [],
+      // Live messages rebuild inline steps from the SSE replay on mount.
+      inlineActivitySteps:
+        message.status === "created" ? [] : (message.activitySteps ?? []),
       isRetrying: false,
       lastUpdated: new Date(),
       pendingToolCalls: [],
-      useFullChainOfThought: false,
     },
   };
 };

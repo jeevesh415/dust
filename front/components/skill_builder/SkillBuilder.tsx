@@ -41,7 +41,6 @@ import {
   ContentMessage,
   cn,
   InformationCircleIcon,
-  LightbulbIcon,
   ResizableHandle,
   ResizablePanel,
   ResizablePanelGroup,
@@ -81,14 +80,14 @@ export default function SkillBuilder({
     limit: 30,
   });
 
-  const hasReinforcedAgents =
+  const hasSelfImprovingSkills =
     hasFeature("reinforced_agents") && hasFeature("reinforcement_ui");
 
   const { suggestions } = useSkillSuggestions({
     skillId: skill?.sId ?? null,
     states: ["pending"],
     workspaceId: owner.sId,
-    disabled: !skill || !hasReinforcedAgents,
+    disabled: !skill || !hasSelfImprovingSkills,
   });
 
   const hasPendingSuggestions = suggestions.length > 0;
@@ -180,15 +179,8 @@ export default function SkillBuilder({
     void form.handleSubmit(handleSubmit)();
   };
 
-  const [isSuggestionsPanelOpen, setIsSuggestionsPanelOpen] = useState(false);
-
-  useEffect(() => {
-    if (hasPendingSuggestions) {
-      setIsSuggestionsPanelOpen(true);
-    }
-  }, [hasPendingSuggestions]);
-
-  const showSuggestionsPanel = skill && !isMobile && hasReinforcedAgents;
+  const showSuggestionsPanel =
+    skill && !isMobile && hasSelfImprovingSkills && hasPendingSuggestions;
 
   const leftPanel = (
     <div className="flex h-full w-full flex-col">
@@ -197,7 +189,7 @@ export default function SkillBuilder({
         className="mx-4"
         title={skill ? `Edit skill ${skill.name}` : "Create new skill"}
         centerActions={
-          skill && skillHistory ? (
+          skill && skillHistory && !hasPendingSuggestions ? (
             <SkillVersionHistoryPicker
               skill={skill}
               skillHistory={skillHistory}
@@ -206,21 +198,6 @@ export default function SkillBuilder({
         }
         rightActions={
           <div className="flex items-center gap-2">
-            {showSuggestionsPanel && (
-              <Button
-                icon={LightbulbIcon}
-                size="sm"
-                variant={
-                  isSuggestionsPanelOpen ? "highlight" : "ghost-secondary"
-                }
-                tooltip={
-                  isSuggestionsPanelOpen
-                    ? "Hide suggestions"
-                    : "Show suggestions"
-                }
-                onClick={() => setIsSuggestionsPanelOpen((prev) => !prev)}
-              />
-            )}
             <BarHeader.ButtonBar variant="close" onClose={handleCancel} />
           </div>
         }
@@ -251,12 +228,17 @@ export default function SkillBuilder({
               specific needs before saving.
             </ContentMessage>
           )}
-          <SkillBuilderRequestedSpacesSection />
+          <SkillBuilderRequestedSpacesSection
+            initialRequestedSpaceIds={skill?.requestedSpaceIds}
+          />
           <SkillBuilderAgentFacingDescriptionSection />
           <SkillBuilderInstructionsSection />
           {hasFeature("sandbox_tools") && <SkillBuilderFilesSection />}
           <SkillBuilderToolsSection extendedSkill={extendedSkill} />
-          <SkillBuilderSettingsOrComparisonFooter />
+          <SkillBuilderSettingsOrComparisonFooter
+            skill={skill}
+            hasSelfImprovingSkills={hasSelfImprovingSkills}
+          />
         </div>
       </ScrollArea>
       <BarFooter
@@ -305,16 +287,14 @@ export default function SkillBuilder({
                   </div>
                 </ResizablePanel>
 
-                {isSuggestionsPanelOpen && (
-                  <>
-                    <ResizableHandle withHandle />
-                    <ResizablePanel defaultSize={35} minSize={20} maxSize={50}>
-                      <div className="h-full w-full overflow-y-auto">
-                        <SkillBuilderSuggestionsPanel />
-                      </div>
-                    </ResizablePanel>
-                  </>
-                )}
+                <>
+                  <ResizableHandle withHandle />
+                  <ResizablePanel defaultSize={35} minSize={20} maxSize={50}>
+                    <div className="h-full w-full overflow-y-auto">
+                      <SkillBuilderSuggestionsPanel />
+                    </div>
+                  </ResizablePanel>
+                </>
               </ResizablePanelGroup>
             ) : (
               leftPanel
@@ -326,12 +306,23 @@ export default function SkillBuilder({
   );
 }
 
-function SkillBuilderSettingsOrComparisonFooter() {
+function SkillBuilderSettingsOrComparisonFooter({
+  skill,
+  hasSelfImprovingSkills,
+}: {
+  skill?: SkillType;
+  hasSelfImprovingSkills: boolean;
+}) {
   const { compareVersion } = useSkillVersionComparisonContext();
 
   if (compareVersion) {
     return <SkillBuilderVersionComparisonFooter />;
   }
 
-  return <SkillBuilderSettingsSection />;
+  return (
+    <SkillBuilderSettingsSection
+      skill={skill}
+      hasSelfImprovingSkills={hasSelfImprovingSkills}
+    />
+  );
 }

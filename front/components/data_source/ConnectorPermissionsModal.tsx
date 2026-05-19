@@ -6,6 +6,7 @@ import { CreateOrUpdateConnectionBigQueryModal } from "@app/components/data_sour
 import { CreateOrUpdateConnectionSnowflakeModal } from "@app/components/data_source/CreateOrUpdateConnectionSnowflakeModal";
 import { RequestDataSourceModal } from "@app/components/data_source/RequestDataSourceModal";
 import { SetupNotionPrivateIntegrationModal } from "@app/components/data_source/SetupNotionPrivateIntegrationModal";
+import { useSensitivityLabelsController } from "@app/components/shared/labels/useSensitivityLabelsController";
 import { setupConnection } from "@app/components/spaces/AddConnectionMenu";
 import { AdvancedNotionManagement } from "@app/components/spaces/AdvancedNotionManagement";
 import { ConnectorDataUpdatedModal } from "@app/components/spaces/ConnectorDataUpdatedModal";
@@ -49,12 +50,16 @@ import type { DataSourceViewType } from "@app/types/data_source_view";
 import type { APIError } from "@app/types/error";
 import { isOAuthProvider } from "@app/types/oauth/lib";
 import { assertNeverAndIgnore } from "@app/types/shared/utils/assert_never";
+import { isString } from "@app/types/shared/utils/general";
 import type { LightWorkspaceType, WorkspaceType } from "@app/types/user";
 import type { NotificationType } from "@dust-tt/sparkle";
 import {
   Avatar,
   Button,
   CloudArrowLeftRightIcon,
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
   ContentMessage,
   Dialog,
   DialogContainer,
@@ -271,12 +276,14 @@ function UpdateConnectionOAuthModal({
 
   const isSlack = connectorProvider === "slack";
   const isMicrosoft = connectorProvider === "microsoft";
+  const isZendesk = connectorProvider === "zendesk";
 
   // Fetch existing OAuth metadata when modal is open
   const { metadata, isMetadataLoading } = useOAuthMetadata({
     dataSource,
     owner,
-    disabled: !isOpen || !dataSource.connectorId || !isMicrosoft,
+    disabled:
+      !isOpen || !dataSource.connectorId || (!isMicrosoft && !isZendesk),
   });
 
   // Populate extraConfig from metadata on first load only
@@ -296,7 +303,23 @@ function UpdateConnectionOAuthModal({
         setExtraConfig(stringMetadata);
       }
     }
-  }, [isOpen, metadata, isMetadataLoading, isMicrosoft, dataSource.sId]);
+    if (isZendesk) {
+      const { zendesk_subdomain } = metadata ?? {};
+      if (!isString(zendesk_subdomain)) {
+        return;
+      }
+      setExtraConfig({
+        zendesk_subdomain,
+      });
+    }
+  }, [
+    isOpen,
+    metadata,
+    isMetadataLoading,
+    isMicrosoft,
+    isZendesk,
+    dataSource.sId,
+  ]);
 
   const { configValue: slackCredentialId } = useConnectorConfig({
     configKey: "privateIntegrationCredentialId",
@@ -793,29 +816,43 @@ export function ConnectorPermissionsModal({
   const [saving, setSaving] = useState(false);
   const sendNotification = useSendNotification();
   const { user } = useAuth();
+  const sensitivityLabelsController = useSensitivityLabelsController({
+    owner,
+    source: { dataSourceId: dataSource.sId },
+    disabled:
+      modalToShow !== "selection" ||
+      dataSource.connectorProvider !== "microsoft" ||
+      !featureFlags.includes("sensitivity_labels"),
+  });
+  const advancedOptionsHasChanges = sensitivityLabelsController.isDirty;
 
   function closeModal(save: boolean) {
     setModalToShow(null);
     onClose(save);
+    sensitivityLabelsController.reset();
     setTimeout(() => {
       setSelectedNodes({});
     }, 300);
   }
 
   async function save() {
-    if (
-      !(await confirmPrivateNodesSync({
-        selectedNodes: Object.values(selectedNodes)
-          .filter((sn) => sn.isSelected)
-          .map((sn) => sn.node),
-        confirm,
-      }))
-    ) {
-      return;
+    if (!isUnchanged) {
+      if (
+        !(await confirmPrivateNodesSync({
+          selectedNodes: Object.values(selectedNodes)
+            .filter((sn) => sn.isSelected)
+            .map((sn) => sn.node),
+          confirm,
+        }))
+      ) {
+        return;
+      }
     }
     setSaving(true);
     try {
-      if (Object.keys(selectedNodes).length) {
+      let didSave = false;
+
+      if (!isUnchanged && Object.keys(selectedNodes).length) {
         const r = await clientFetch(
           `/api/w/${owner.sId}/data_sources/${dataSource.sId}/managed/permissions`,
           {
@@ -848,6 +885,7 @@ export function ConnectorPermissionsModal({
             title: error.error.message,
             description: error.error.connectors_error.message,
           });
+          return;
         } else {
           void mutate(
             (key) =>
@@ -856,22 +894,34 @@ export function ConnectorPermissionsModal({
                 `/api/w/${owner.sId}/data_sources/${dataSource.sId}/managed/permissions`
               )
           );
-
-          // Display the data updated modal.
-          setModalToShow("data_updated");
+          didSave = true;
         }
+      }
+
+      if (advancedOptionsHasChanges) {
+        const advancedSaveSucceeded = await sensitivityLabelsController.save();
+        if (!advancedSaveSucceeded) {
+          return;
+        }
+        didSave = true;
+      }
+
+      if (didSave) {
+        setModalToShow("data_updated");
       } else {
         closeModal(false);
       }
     } catch (e) {
       sendNotification({
         type: "error",
-        title: "Error saving permissions",
-        description: "An unexpected error occurred while saving permissions.",
+        title: "Error saving connector configuration",
+        description:
+          "An unexpected error occurred while saving connector configuration.",
       });
       console.error(e);
+    } finally {
+      setSaving(false);
     }
-    setSaving(false);
   }
 
   const isUnchanged = useMemo(
@@ -902,6 +952,8 @@ export function ConnectorPermissionsModal({
   const connectorUIConfiguration = CONNECTOR_UI_CONFIGURATIONS[connector.type];
 
   const OptionsComponent = connectorUIConfiguration.optionsComponent;
+  const AdvancedOptionsComponent =
+    connectorUIConfiguration.advancedOptionsComponent;
 
   const permissionsConfigurable = getConnectorPermissionsConfigurableBlocked(
     connector.type
@@ -1028,6 +1080,23 @@ export function ConnectorPermissionsModal({
                       />
                     </>
                   )}
+                  {AdvancedOptionsComponent &&
+                    featureFlags.includes("sensitivity_labels") && (
+                      <Collapsible className="mb-4">
+                        <CollapsibleTrigger>
+                          <div className="heading-lg">Advanced</div>
+                        </CollapsibleTrigger>
+                        <CollapsibleContent>
+                          <div className="mt-4">
+                            <AdvancedOptionsComponent
+                              owner={owner}
+                              readOnly={readOnly}
+                              controller={sensitivityLabelsController}
+                            />
+                          </div>
+                        </CollapsibleContent>
+                      </Collapsible>
+                    )}
 
                   {advancedNotionManagement && (
                     <AdvancedNotionManagement
@@ -1048,7 +1117,8 @@ export function ConnectorPermissionsModal({
                   rightButtonProps={{
                     label: saving ? "Saving..." : "Save",
                     variant: "primary",
-                    disabled: isUnchanged || saving,
+                    disabled:
+                      (isUnchanged && !advancedOptionsHasChanges) || saving,
                     onClick: save,
                   }}
                 />

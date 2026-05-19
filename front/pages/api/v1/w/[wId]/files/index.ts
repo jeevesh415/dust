@@ -1,6 +1,8 @@
 import { withPublicAPIAuthentication } from "@app/lib/api/auth_wrappers";
 import { isUploadSupportedForContentType } from "@app/lib/api/files/processing";
+import { buildEffectiveUseCaseMetadata } from "@app/lib/api/files/upload_metadata";
 import type { Authenticator } from "@app/lib/auth";
+import { getFeatureFlags } from "@app/lib/auth";
 import { FileResource } from "@app/lib/resources/file_resource";
 import { rateLimiter } from "@app/lib/utils/rate_limiter";
 import logger from "@app/logger/logger";
@@ -160,7 +162,15 @@ async function handler(
         });
       }
 
-      if (!ensureFileSize(contentType, fileSize)) {
+      const flags = await getFeatureFlags(auth);
+      const hasSandboxTools = flags.includes("sandbox_tools");
+
+      if (
+        !ensureFileSize(contentType, fileSize, {
+          hasSandboxTools,
+          useCase,
+        })
+      ) {
         return apiError(req, res, {
           status_code: 400,
           api_error: {
@@ -177,7 +187,13 @@ async function handler(
         userId: user?.id ?? null,
         workspaceId: owner.id,
         useCase,
-        useCaseMetadata: useCaseMetadata,
+        useCaseMetadata: buildEffectiveUseCaseMetadata({
+          contentType,
+          fileName,
+          flags: { hasSandboxTools },
+          providedMetadata: useCaseMetadata,
+          useCase,
+        }),
       });
 
       res.status(200).json({ file: file.toPublicJSONWithUploadUrl(auth) });

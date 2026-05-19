@@ -1,4 +1,5 @@
 /** @ignoreswagger */
+import { getAgentConfigurationsForView } from "@app/lib/api/assistant/configuration/views";
 import type {
   EmailAttachment,
   EmailTriggerError,
@@ -35,13 +36,14 @@ import { config as regionsConfig } from "@app/lib/api/regions/config";
 import { Authenticator } from "@app/lib/auth";
 import logger from "@app/logger/logger";
 import { apiError, withLogging } from "@app/logger/withlogging";
+import type { LightAgentConfigurationType } from "@app/types/assistant/agent";
 import type { WithAPIErrorResponse } from "@app/types/error";
 import { isSupportedFileContentType } from "@app/types/files";
 import { isDevelopment } from "@app/types/shared/env";
 import type { Result } from "@app/types/shared/result";
 import { Err, Ok } from "@app/types/shared/result";
 import { normalizeError } from "@app/types/shared/utils/error_utils";
-import { isString, removeNulls } from "@app/types/shared/utils/general";
+import { isString } from "@app/types/shared/utils/general";
 import { IncomingForm } from "formidable";
 import { readFile } from "fs/promises";
 import type { NextApiRequest, NextApiResponse } from "next";
@@ -205,7 +207,10 @@ const parseSendgridWebhookContent = async (
       new Error("Failed to recreate request body for multipart parsing")
     );
   }
-  const form = new IncomingForm();
+  const form = new IncomingForm({
+    allowEmptyFiles: true,
+    minFileSize: 0,
+  });
   const [fields, files] = await form.parse(req);
 
   try {
@@ -252,6 +257,9 @@ const parseSendgridWebhookContent = async (
         continue;
       }
       for (const file of fileArray) {
+        if (file.size === 0) {
+          continue;
+        }
         if (file.mimetype && isSupportedFileContentType(file.mimetype)) {
           attachments.push({
             filepath: file.filepath,
@@ -512,30 +520,34 @@ async function handler(
         return;
       }
 
-      const agentConfigurations = removeNulls(
-        await Promise.all(
-          targetEmails.map(async (targetEmail) => {
-            const matchRes = await emailAssistantMatcher({
-              auth,
-              targetEmail,
-            });
-            if (matchRes.isErr()) {
-              await replyToError(email, matchRes.error);
-              return null;
-            }
+      const allAgentConfigurations = await getAgentConfigurationsForView({
+        auth,
+        agentsGetView: "list",
+        variant: "light",
+        limit: undefined,
+        sort: undefined,
+      });
 
-            return matchRes.value.agentConfiguration;
-          })
-        )
-      );
+      let agentConfigurations: LightAgentConfigurationType[] = [];
+      for (const targetEmail of targetEmails) {
+        const matchResult = emailAssistantMatcher({
+          allAgentConfigurations,
+          targetEmail,
+        });
+        if (matchResult.isErr()) {
+          await replyToError(email, matchResult.error);
+          continue;
+        }
+
+        agentConfigurations.push(matchResult.value.agentConfiguration);
+      }
 
       if (agentConfigurations.length === 0) {
         return;
       }
 
       // Trigger async processing - reply will be sent by finalization activity.
-      const triggerRes = await triggerFromEmail({
-        auth,
+      const triggerRes = await triggerFromEmail(auth, {
         agentConfigurations,
         email,
       });
@@ -557,8 +569,10 @@ async function handler(
         ],
         context: getAuditLogContext(auth, req),
         metadata: {
-          senderEmail: email.sender.email,
-          agentId: agentConfigurations.map((a) => a.sId).join(","),
+          sender_email: email.sender.email,
+          agent_id: agentConfigurations.map((a) => a.sId).join(","),
+          initiating_user_id: auth.user()?.sId ?? "unknown",
+          initiating_user_email: auth.user()?.email ?? "unknown",
         },
       });
 

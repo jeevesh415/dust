@@ -11,7 +11,6 @@ import type {
   SuggestionKeyDownProps,
   SuggestionProps,
 } from "@tiptap/suggestion";
-import type React from "react";
 import type { RefAttributes } from "react";
 
 export const mentionPluginKey = new PluginKey("mention-suggestion");
@@ -21,10 +20,8 @@ export function createMentionSuggestion({
   conversationId,
   spaceId,
   select,
-  shouldSuggestAgentRef,
   includeCurrentUser = false,
   onAgentSelect,
-  singleAgentInputEnabled,
 }: {
   owner: WorkspaceType;
   conversationId?: string | null;
@@ -34,10 +31,7 @@ export function createMentionSuggestion({
     agents: boolean;
     users: boolean;
   };
-  // Optional ref that gates select.agents at render time (used to hide agents dynamically in single-agent mode).
-  shouldSuggestAgentRef?: React.RefObject<boolean>;
   onAgentSelect?: (mention: RichMention) => void;
-  singleAgentInputEnabled?: boolean;
 }) {
   return {
     pluginKey: mentionPluginKey,
@@ -50,11 +44,7 @@ export function createMentionSuggestion({
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     command: ({ editor, range, props }: any) => {
       const mention = props as RichMention;
-      if (
-        mention.type === "agent" &&
-        singleAgentInputEnabled &&
-        onAgentSelect
-      ) {
+      if (mention.type === "agent" && onAgentSelect) {
         // Delete the @query text without inserting a mention node.
         editor.chain().focus().deleteRange(range).run();
         onAgentSelect(mention);
@@ -95,8 +85,7 @@ export function createMentionSuggestion({
               includeCurrentUser,
               onClose: closeDropdown,
               select: {
-                agents:
-                  select.agents && (shouldSuggestAgentRef?.current ?? true),
+                agents: select.agents,
                 users: select.users,
               },
             },
@@ -113,7 +102,7 @@ export function createMentionSuggestion({
             conversationId,
             spaceId,
             select: {
-              agents: select.agents && (shouldSuggestAgentRef?.current ?? true),
+              agents: select.agents,
               users: select.users,
             },
           });

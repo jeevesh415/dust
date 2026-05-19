@@ -26,7 +26,12 @@ import type {
   LightAgentConfigurationType,
 } from "@app/types/assistant/agent";
 import type { GroupKind, GroupType } from "@app/types/groups";
-import { AGENT_GROUP_PREFIX, GROUP_KINDS } from "@app/types/groups";
+import {
+  AGENT_GROUP_PREFIX,
+  GROUP_KINDS,
+  isAgentEditorGroupKind,
+  isSkillEditorGroupKind,
+} from "@app/types/groups";
 import type { ResourcePermission } from "@app/types/resource_permissions";
 import type { ModelId } from "@app/types/shared/model_id";
 import type { Result } from "@app/types/shared/result";
@@ -45,7 +50,7 @@ import type {
   Transaction,
   WhereOptions,
 } from "sequelize";
-import { Op, QueryTypes } from "sequelize";
+import { col, fn, Op, QueryTypes } from "sequelize";
 
 export const ADMIN_GROUP_NAME = "dust-admins";
 export const BUILDER_GROUP_NAME = "dust-builders";
@@ -63,6 +68,16 @@ export const BUILDER_GROUP_NAME = "dust-builders";
  * ┃                                                                         ┃
  * ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
  */
+
+type CachedGroup = {
+  id: ModelId;
+  name: string;
+  kind: GroupKind;
+  workspaceId: ModelId;
+  workOSGroupId: string | null;
+  createdAt: number;
+  updatedAt: number;
+};
 
 // Attributes are marked as read-only to reflect the stateless nature of our Resource.
 // This design will be moved up to BaseResource once we transition away from Sequelize.
@@ -86,6 +101,77 @@ export class GroupResource extends BaseResource<GroupModel> {
   >[] = GROUP_KINDS.filter(
     (k): k is Exclude<GroupKind, "system"> => k !== "system"
   );
+
+  // Group kinds returned to system API keys by listWorkspaceGroupsFromKey.
+  // Excludes agent_editors and skill_editors which are per-agent/per-skill
+  // and not relevant to system auth.
+  private static readonly groupKindsFromSystemKey: GroupKind[] =
+    GROUP_KINDS.filter(
+      (k) => !isAgentEditorGroupKind(k) && !isSkillEditorGroupKind(k)
+    );
+
+  private static readonly workspaceGroupsFromSystemKeyCacheKeyResolver = (
+    workspaceModelId: ModelId
+  ) => `workspace-groups-from-system-key:${workspaceModelId}`;
+
+  private static async _listWorkspaceGroupsFromSystemKeyUncached(
+    workspaceModelId: ModelId
+  ): Promise<CachedGroup[]> {
+    const groups = await GroupModel.findAll({
+      where: {
+        workspaceId: workspaceModelId,
+        kind: { [Op.in]: GroupResource.groupKindsFromSystemKey },
+      },
+    });
+    return groups.map((g) => ({
+      id: g.id,
+      name: g.name,
+      kind: g.kind,
+      workspaceId: g.workspaceId,
+      workOSGroupId: g.workOSGroupId,
+      createdAt: g.createdAt.getTime(),
+      updatedAt: g.updatedAt.getTime(),
+    }));
+  }
+
+  private static listWorkspaceGroupsFromSystemKeyCached = cacheWithRedis(
+    GroupResource._listWorkspaceGroupsFromSystemKeyUncached,
+    GroupResource.workspaceGroupsFromSystemKeyCacheKeyResolver,
+    { cacheNullValues: false }
+  );
+
+  private static _invalidateWorkspaceGroupsFromSystemKeyCache =
+    invalidateCacheWithRedis(
+      GroupResource._listWorkspaceGroupsFromSystemKeyUncached,
+      GroupResource.workspaceGroupsFromSystemKeyCacheKeyResolver
+    );
+
+  static invalidateWorkspaceGroupsFromSystemKeyCache = async (
+    workspaceModelId: ModelId
+  ) => {
+    logger.info(
+      {
+        workspaceModelId,
+        method: "GroupResource.invalidateWorkspaceGroupsFromSystemKeyCache",
+      },
+      "Invalidating workspace groups from system key cache"
+    );
+    return GroupResource._invalidateWorkspaceGroupsFromSystemKeyCache(
+      workspaceModelId
+    );
+  };
+
+  private static fromCachedGroup(data: CachedGroup): GroupResource {
+    return new GroupResource(GroupModel, {
+      id: data.id,
+      name: data.name,
+      kind: data.kind,
+      workspaceId: data.workspaceId,
+      workOSGroupId: data.workOSGroupId,
+      createdAt: new Date(data.createdAt),
+      updatedAt: new Date(data.updatedAt),
+    });
+  }
 
   private static readonly groupIdsCacheKeyResolver = ({
     user,
@@ -130,17 +216,47 @@ export class GroupResource extends BaseResource<GroupModel> {
     { cacheNullValues: false }
   );
 
-  static invalidateGroupIdsCacheForUser = invalidateCacheWithRedis(
+  private static _invalidateGroupIdsCacheForUser = invalidateCacheWithRedis(
     (_params: { user: { id: ModelId }; workspace: { id: ModelId } }) =>
       Promise.resolve([]),
     GroupResource.groupIdsCacheKeyResolver
   );
 
-  static batchInvalidateGroupIdsCacheForUsers = batchInvalidateCacheWithRedis(
-    (_params: { user: { id: ModelId }; workspace: { id: ModelId } }) =>
-      Promise.resolve([]),
-    GroupResource.groupIdsCacheKeyResolver
-  );
+  static invalidateGroupIdsCacheForUser = async (params: {
+    user: { id: ModelId };
+    workspace: { id: ModelId };
+  }) => {
+    logger.info(
+      {
+        userModelId: params.user.id,
+        workspaceModelId: params.workspace.id,
+        method: "GroupResource.invalidateGroupIdsCacheForUser",
+      },
+      "Invalidating auth resource cache"
+    );
+    return GroupResource._invalidateGroupIdsCacheForUser(params);
+  };
+
+  private static _batchInvalidateGroupIdsCacheForUsers =
+    batchInvalidateCacheWithRedis(
+      (_params: { user: { id: ModelId }; workspace: { id: ModelId } }) =>
+        Promise.resolve([]),
+      GroupResource.groupIdsCacheKeyResolver
+    );
+
+  static batchInvalidateGroupIdsCacheForUsers = async (
+    argsList: [{ user: { id: ModelId }; workspace: { id: ModelId } }][]
+  ) => {
+    logger.info(
+      {
+        workspaceModelId: argsList[0]?.[0]?.workspace.id,
+        count: argsList.length,
+        method: "GroupResource.batchInvalidateGroupIdsCacheForUsers",
+      },
+      "Invalidating auth resource cache (batch)"
+    );
+    return GroupResource._batchInvalidateGroupIdsCacheForUsers(argsList);
+  };
 
   /**
    * WARNING: This method skips workspace membership checks. It is intended for use in
@@ -157,6 +273,14 @@ export class GroupResource extends BaseResource<GroupModel> {
     transaction?: Transaction;
   }): Promise<ModelId[]> {
     if (transaction) {
+      logger.info(
+        {
+          userModelId: user.id,
+          workspaceModelId: workspace.id,
+          method: "GroupResource.dangerouslyListUserGroupsForAuth",
+        },
+        "Skipping auth resource cache: transaction provided"
+      );
       return this.dangerouslyListUserGroupsForAuthUncached({
         user,
         workspace,
@@ -218,6 +342,12 @@ export class GroupResource extends BaseResource<GroupModel> {
   ) {
     const group = await GroupModel.create(blob, { transaction });
     const workspaceModelId = group.workspaceId;
+
+    invalidateCacheAfterCommit(transaction, () =>
+      GroupResource.invalidateWorkspaceGroupsFromSystemKeyCache(
+        workspaceModelId
+      )
+    );
 
     // If memberIds are provided, create memberships
     if (memberIds && memberIds.length > 0) {
@@ -527,34 +657,26 @@ export class GroupResource extends BaseResource<GroupModel> {
   }
 
   static async listWorkspaceGroupsFromKey(
-    key: KeyResource,
-    groupKinds: GroupKind[] = [
-      "global",
-      "regular",
-      "space_editors",
-      "system",
-      "provisioned",
-    ]
+    key: KeyResource
   ): Promise<GroupResource[]> {
-    let groups: GroupModel[] = [];
-
     if (key.isSystem) {
-      groups = await this.model.findAll({
-        where: {
-          workspaceId: key.workspaceId,
-          kind: {
-            [Op.in]: groupKinds,
-          },
-        },
-      });
-    } else {
-      groups = await this.model.findAll({
-        where: {
-          workspaceId: key.workspaceId,
-          id: { [Op.in]: key.groupIds },
-        },
-      });
+      const cached = await GroupResource.listWorkspaceGroupsFromSystemKeyCached(
+        key.workspaceId
+      );
+
+      if (cached.length === 0) {
+        throw new Error("Group for key not found.");
+      }
+
+      return cached.map((g) => GroupResource.fromCachedGroup(g));
     }
+
+    const groups = await this.model.findAll({
+      where: {
+        workspaceId: key.workspaceId,
+        id: { [Op.in]: key.groupIds },
+      },
+    });
 
     if (groups.length === 0) {
       throw new Error("Group for key not found.");
@@ -623,7 +745,8 @@ export class GroupResource extends BaseResource<GroupModel> {
 
   private static async baseFetch(
     auth: Authenticator,
-    { includes, limit, order, where }: ResourceFindOptions<GroupModel> = {}
+    { includes, limit, order, where }: ResourceFindOptions<GroupModel> = {},
+    transaction?: Transaction
   ) {
     // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
     const includeClauses: Includeable[] = includes || [];
@@ -636,18 +759,27 @@ export class GroupResource extends BaseResource<GroupModel> {
       include: includeClauses,
       limit,
       order,
+      transaction,
     });
     return groupModels.map((b) => new this(this.model, b.get()));
   }
 
-  static async fetchByModelIds(auth: Authenticator, ids: ModelId[]) {
-    return this.baseFetch(auth, {
-      where: {
-        id: {
-          [Op.in]: ids,
+  static async fetchByModelIds(
+    auth: Authenticator,
+    ids: ModelId[],
+    { transaction }: { transaction?: Transaction } = {}
+  ) {
+    return this.baseFetch(
+      auth,
+      {
+        where: {
+          id: {
+            [Op.in]: ids,
+          },
         },
       },
-    });
+      transaction
+    );
   }
 
   static async fetchById(
@@ -1051,6 +1183,36 @@ export class GroupResource extends BaseResource<GroupModel> {
     return groups.map((group) => new this(GroupModel, group.get()));
   }
 
+  static async getMemberCountsForGroups(
+    auth: Authenticator,
+    groups: GroupResource[]
+  ): Promise<Map<ModelId, number>> {
+    const owner = auth.getNonNullableWorkspace();
+    const counts = new Map<ModelId, number>();
+
+    const globalGroup = groups.find((g) => g.isGlobal());
+    const regularGroups = groups.filter((g) => !g.isGlobal());
+
+    // Global group count comes from workspace active memberships.
+    if (globalGroup) {
+      const { total } = await MembershipResource.getActiveMemberships({
+        workspace: owner,
+      });
+      counts.set(globalGroup.id, total);
+    }
+
+    // All regular group counts in one query, reusing the existing method.
+    if (regularGroups.length > 0) {
+      const membershipsByGroup =
+        await GroupResource.getActiveMembershipsForGroups(auth, regularGroups);
+      for (const [groupId, userIds] of Object.entries(membershipsByGroup)) {
+        counts.set(Number(groupId), userIds.length);
+      }
+    }
+
+    return counts;
+  }
+
   static async getActiveMembershipsForGroups(
     auth: Authenticator,
     groups: GroupResource[]
@@ -1209,11 +1371,11 @@ export class GroupResource extends BaseResource<GroupModel> {
     {
       users,
       transaction,
-      allowProvisionnedGroups = false,
+      allowProvisionedGroups = false,
     }: {
       users: UserType[];
       transaction?: Transaction;
-      allowProvisionnedGroups?: boolean;
+      allowProvisionedGroups?: boolean;
     }
   ): Promise<
     Result<
@@ -1232,7 +1394,7 @@ export class GroupResource extends BaseResource<GroupModel> {
         this.kind === "space_editors" ||
         this.kind === "agent_editors" ||
         this.kind === "skill_editors" ||
-        (allowProvisionnedGroups && this.kind === "provisioned"),
+        (allowProvisionedGroups && this.kind === "provisioned"),
       `You can't add members to ${this.kind} groups.`
     );
     const owner = auth.getNonNullableWorkspace();
@@ -1354,11 +1516,11 @@ export class GroupResource extends BaseResource<GroupModel> {
     {
       user,
       transaction,
-      allowProvisionnedGroups = false,
+      allowProvisionedGroups = false,
     }: {
       user: UserType;
       transaction?: Transaction;
-      allowProvisionnedGroups?: boolean;
+      allowProvisionedGroups?: boolean;
     }
   ): Promise<
     Result<
@@ -1375,7 +1537,7 @@ export class GroupResource extends BaseResource<GroupModel> {
     return this.dangerouslyAddMembers(auth, {
       users: [user],
       transaction,
-      allowProvisionnedGroups,
+      allowProvisionedGroups,
     });
   }
 
@@ -1387,11 +1549,11 @@ export class GroupResource extends BaseResource<GroupModel> {
     {
       users,
       transaction,
-      allowProvisionnedGroups = false,
+      allowProvisionedGroups = false,
     }: {
       users: UserType[];
       transaction?: Transaction;
-      allowProvisionnedGroups?: boolean;
+      allowProvisionedGroups?: boolean;
     }
   ): Promise<
     Result<
@@ -1409,7 +1571,7 @@ export class GroupResource extends BaseResource<GroupModel> {
         this.kind === "space_editors" ||
         this.kind === "agent_editors" ||
         this.kind === "skill_editors" ||
-        (allowProvisionnedGroups && this.kind === "provisioned"),
+        (allowProvisionedGroups && this.kind === "provisioned"),
       `You can't remove members from ${this.kind} groups.`
     );
     const owner = auth.getNonNullableWorkspace();
@@ -1514,11 +1676,11 @@ export class GroupResource extends BaseResource<GroupModel> {
     {
       user,
       transaction,
-      allowProvisionnedGroups = false,
+      allowProvisionedGroups = false,
     }: {
       user: UserType;
       transaction?: Transaction;
-      allowProvisionnedGroups?: boolean;
+      allowProvisionedGroups?: boolean;
     }
   ): Promise<
     Result<
@@ -1534,7 +1696,7 @@ export class GroupResource extends BaseResource<GroupModel> {
     return this.dangerouslyRemoveMembers(auth, {
       users: [user],
       transaction,
-      allowProvisionnedGroups,
+      allowProvisionedGroups,
     });
   }
 
@@ -1799,13 +1961,18 @@ export class GroupResource extends BaseResource<GroupModel> {
       });
       const memberUserIds = activeMemberships.map((m) => m.userId);
 
-      await KeyModel.destroy({
-        where: {
-          groupIds: { [Op.contains]: [this.id] },
-          workspaceId: owner.id,
+      await KeyModel.update(
+        {
+          groupIds: fn("array_remove", col("groupIds"), this.id),
         },
-        transaction,
-      });
+        {
+          where: {
+            groupIds: { [Op.contains]: [this.id] },
+            workspaceId: owner.id,
+          },
+          transaction,
+        }
+      );
 
       await GroupSpaceModel.destroy({
         where: {
@@ -1849,6 +2016,11 @@ export class GroupResource extends BaseResource<GroupModel> {
           );
         });
       }
+
+      const workspaceId = owner.id;
+      invalidateCacheAfterCommit(transaction, () =>
+        GroupResource.invalidateWorkspaceGroupsFromSystemKeyCache(workspaceId)
+      );
 
       return new Ok(undefined);
     } catch (err) {

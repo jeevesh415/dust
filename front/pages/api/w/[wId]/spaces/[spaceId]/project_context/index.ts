@@ -1,9 +1,6 @@
 /** @ignoreswagger */
-import {
-  type ConversationAttachmentType,
-  isContentNodeAttachmentType,
-  isFileAttachmentType,
-} from "@app/lib/api/assistant/conversation/attachments";
+// @migration-status: MIGRATED_TO_HONO
+import type { ConversationAttachmentType } from "@app/lib/api/assistant/conversation/attachments";
 import { withSessionAuthenticationForWorkspace } from "@app/lib/api/auth_wrappers";
 import {
   addContentNodeToProject,
@@ -13,6 +10,7 @@ import type { Authenticator } from "@app/lib/auth";
 import { getFeatureFlags } from "@app/lib/auth";
 import { DataSourceViewResource } from "@app/lib/resources/data_source_view_resource";
 import { SpaceResource } from "@app/lib/resources/space_resource";
+import { concurrentExecutor } from "@app/lib/utils/async_utils";
 import { apiError } from "@app/logger/withlogging";
 import type { ContentNodeType } from "@app/types/core/content_node";
 import type { WithAPIErrorResponse } from "@app/types/error";
@@ -24,7 +22,7 @@ export type GetProjectContextResponseBody = {
   attachments: ConversationAttachmentType[];
 };
 
-const PostProjectContextContentNodeBodySchema = z.object({
+const PostProjectContextContentNodeItemSchema = z.object({
   title: z.string().min(1, "title is required"),
   nodeId: z.string().min(1, "nodeId is required"),
   nodeDataSourceViewId: z.string().min(1, "nodeDataSourceViewId is required"),
@@ -32,21 +30,27 @@ const PostProjectContextContentNodeBodySchema = z.object({
   supersededContentFragmentId: z.string().nullable().optional(),
 });
 
+const PostProjectContextContentNodeBodySchema = z.object({
+  items: z.array(PostProjectContextContentNodeItemSchema),
+});
+
+export type PostProjectContextContentNodeFragment = {
+  sId: string;
+  title: string;
+  contentType: string;
+  nodeId: string;
+  nodeDataSourceViewId: string;
+  nodeType: ContentNodeType;
+};
+
 export type PostProjectContextContentNodeResponseBody = {
-  contentFragment: {
-    sId: string;
-    title: string;
-    contentType: string;
-    nodeId: string;
-    nodeDataSourceViewId: string;
-    nodeType: ContentNodeType;
-  };
+  contentFragments: PostProjectContextContentNodeFragment[];
+  errors: Array<{ index: number; message: string }>;
 };
 
 const ProjectContextQuerySchema = z.object({
   spaceId: z.string(),
   query: z.string().optional(),
-  type: z.enum(["file", "content-node"]).optional(),
 });
 
 /** Lowercase + strip separators so "Hello World 4" matches query "helloworld". */
@@ -85,12 +89,12 @@ async function handler(
       api_error: {
         type: "invalid_request_error",
         message:
-          "Invalid query parameters. Expected `spaceId` (string), optional `query` (string), optional `type` (`file` | `content-node`).",
+          "Invalid query parameters. Expected `spaceId` (string), optional `query` (string).",
       },
     });
   }
 
-  const { spaceId, query, type } = queryValidation.data;
+  const { spaceId, query } = queryValidation.data;
 
   const space = await SpaceResource.fetchById(auth, spaceId);
   if (!space || !space.canRead(auth)) {
@@ -108,24 +112,10 @@ async function handler(
       const attachments = await listProjectContextAttachments(auth, space);
 
       const q = query?.trim().toLowerCase() ?? "";
-      const t = type ?? "";
 
-      const filtered = attachments.filter((a) => {
-        if (t) {
-          if (t === "file" && !isFileAttachmentType(a)) {
-            return false;
-          }
-          if (t === "content-node" && !isContentNodeAttachmentType(a)) {
-            return false;
-          }
-        }
-
-        if (!attachmentTitleMatchesQuery(a.title, q)) {
-          return false;
-        }
-
-        return true;
-      });
+      const filtered = attachments.filter((a) =>
+        attachmentTitleMatchesQuery(a.title, q)
+      );
 
       res.status(200).json({ attachments: filtered });
       return;
@@ -180,57 +170,50 @@ async function handler(
         });
       }
 
-      const addRes = await addContentNodeToProject(auth, {
-        space,
-        contentFragment: bodyValidation.data,
-      });
-
-      if (addRes.isErr()) {
-        const err = addRes.error;
-        const status = err.code === "invalid_request_error" ? 400 : 500;
-        return apiError(req, res, {
-          status_code: status,
-          api_error: {
-            type:
-              err.code === "invalid_request_error"
-                ? "invalid_request_error"
-                : "internal_server_error",
-            message: err.message,
-          },
-        });
-      }
-
-      const fr = addRes.value;
-      if (
-        fr.nodeId == null ||
-        fr.nodeDataSourceViewId == null ||
-        fr.nodeType == null
-      ) {
-        return apiError(req, res, {
-          status_code: 500,
-          api_error: {
-            type: "internal_server_error",
-            message: "Missing node fields on content fragment.",
-          },
-        });
-      }
-
+      const { items } = bodyValidation.data;
       const owner = auth.getNonNullableWorkspace();
-      const nodeDataSourceViewId = DataSourceViewResource.modelIdToSId({
-        id: fr.nodeDataSourceViewId,
-        workspaceId: owner.id,
-      });
 
-      res.status(201).json({
-        contentFragment: {
+      const results = await concurrentExecutor(
+        items,
+        (item) =>
+          addContentNodeToProject(auth, { space, contentFragment: item }),
+        { concurrency: 2 }
+      );
+
+      const contentFragments: PostProjectContextContentNodeFragment[] = [];
+      const errors: Array<{ index: number; message: string }> = [];
+
+      results.forEach((result, index) => {
+        if (result.isErr()) {
+          errors.push({ index, message: result.error.message });
+          return;
+        }
+        const fr = result.value;
+        if (
+          fr.nodeId == null ||
+          fr.nodeDataSourceViewId == null ||
+          fr.nodeType == null
+        ) {
+          errors.push({
+            index,
+            message: "Missing node fields on content fragment.",
+          });
+          return;
+        }
+        contentFragments.push({
           sId: fr.sId,
           title: fr.title,
           contentType: fr.contentType,
           nodeId: fr.nodeId,
-          nodeDataSourceViewId,
+          nodeDataSourceViewId: DataSourceViewResource.modelIdToSId({
+            id: fr.nodeDataSourceViewId,
+            workspaceId: owner.id,
+          }),
           nodeType: fr.nodeType,
-        },
+        });
       });
+
+      res.status(201).json({ contentFragments, errors });
       return;
     }
 

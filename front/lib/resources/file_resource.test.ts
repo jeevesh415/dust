@@ -3,6 +3,7 @@ import { getPrivateUploadBucket } from "@app/lib/file_storage";
 import { ConversationResource } from "@app/lib/resources/conversation_resource";
 import { FileResource } from "@app/lib/resources/file_resource";
 import { FileModel } from "@app/lib/resources/storage/models/files";
+import { copyContent } from "@app/lib/utils/files";
 import { ConversationFactory } from "@app/tests/utils/ConversationFactory";
 import { FileFactory } from "@app/tests/utils/FileFactory";
 import { createResourceTest } from "@app/tests/utils/generic_resource_tests";
@@ -114,7 +115,7 @@ describe("FileResource", () => {
         conversation.sId
       );
       assert(conversationResource, "Conversation resource should be defined");
-      await conversationResource.updateVisibilityToDeleted();
+      await conversationResource.updateVisibilityToDeleted(auth);
 
       // Should successfully fetch file.
       const result = await FileResource.fetchByShareTokenWithContent(token);
@@ -204,6 +205,7 @@ describe("FileResource", () => {
         status: "ready",
         useCase: "conversation",
         useCaseMetadata: { conversationId: "original-conv-id" },
+        snippet: "copied snippet",
       });
 
       // Copy the file.
@@ -222,8 +224,14 @@ describe("FileResource", () => {
       expect(copiedFile.fileName).toBe(sourceFile.fileName);
       expect(copiedFile.fileSize).toBe(sourceFile.fileSize);
       expect(copiedFile.useCase).toBe("project_context");
+      expect(copiedFile.snippet).toBe("copied snippet");
       expect(copiedFile.useCaseMetadata?.conversationId).toBe("new-conv-id");
       expect(copiedFile.isReady).toBe(true);
+      const copyCall = vi.mocked(copyContent).mock.calls.at(-1);
+      expect(copyCall?.[0]).toBe(auth);
+      expect(copyCall?.[1].sId).toBe(sourceFile.sId);
+      expect(copyCall?.[2].sId).toBe(copiedFile.sId);
+      expect(copyCall?.[3]).toEqual({ includeProcessedVersion: undefined });
     });
 
     it("should return error when source file not found", async () => {
@@ -320,6 +328,190 @@ describe("FileResource", () => {
       expect(copiedFile.useCase).toBe("upsert_document");
       expect(copiedFile.useCaseMetadata?.spaceId).toBe("space-1");
       expect(copiedFile.useCaseMetadata?.conversationId).toBeUndefined();
+      const copyCall = vi.mocked(copyContent).mock.calls.at(-1);
+      expect(copyCall?.[0]).toBe(auth);
+      expect(copyCall?.[1].sId).toBe(sourceFile.sId);
+      expect(copyCall?.[2].sId).toBe(copiedFile.sId);
+      expect(copyCall?.[3]).toEqual({ includeProcessedVersion: undefined });
+    });
+
+    it("should copy a conversation file to a different conversation", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const sourceFile = await FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName: "source.txt",
+        fileSize: testFileContent.length,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: {
+          conversationId: "parent-conv-id",
+          generatedTables: ["TABLE:parent"],
+          lastEditedByAgentConfigurationId: "agent-config",
+          sourceConversationId: "origin-conv-id",
+          sourceProvider: "github",
+          sourceIcon: "github",
+          hideFromUser: true,
+        },
+        snippet: "preserved snippet",
+      });
+
+      const result = await FileResource.copyToConversation(auth, {
+        sourceId: sourceFile.sId,
+        conversationId: "child-conv-id",
+      });
+
+      assert(result.isOk(), "copyToConversation should succeed");
+      const copiedFile = result.value;
+
+      expect(copiedFile.sId).not.toBe(sourceFile.sId);
+      expect(copiedFile.useCase).toBe("conversation");
+      expect(copiedFile.snippet).toBe("preserved snippet");
+      expect(copiedFile.useCaseMetadata).toEqual({
+        conversationId: "child-conv-id",
+        sourceConversationId: "origin-conv-id",
+        sourceProvider: "github",
+        sourceIcon: "github",
+        hideFromUser: true,
+      });
+      const copyCall = vi.mocked(copyContent).mock.calls.at(-1);
+      expect(copyCall?.[0]).toBe(auth);
+      expect(copyCall?.[1].sId).toBe(sourceFile.sId);
+      expect(copyCall?.[2].sId).toBe(copiedFile.sId);
+      expect(copyCall?.[3]).toEqual({ includeProcessedVersion: undefined });
+    });
+
+    it("should opt into processed version copying for conversation copies when requested", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const sourceFile = await FileFactory.create(auth, null, {
+        contentType: "application/pdf",
+        fileName: "source.pdf",
+        fileSize: testFileContent.length,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: "parent-conv-id" },
+      });
+
+      const result = await FileResource.copyToConversation(auth, {
+        sourceId: sourceFile.sId,
+        conversationId: "child-conv-id",
+        includeProcessedVersion: true,
+      });
+
+      assert(result.isOk(), "copyToConversation should succeed");
+
+      const copyCall = vi.mocked(copyContent).mock.calls.at(-1);
+      expect(copyCall?.[0]).toBe(auth);
+      expect(copyCall?.[1].sId).toBe(sourceFile.sId);
+      expect(copyCall?.[2].sId).toBe(result.value.sId);
+      expect(copyCall?.[3]).toEqual({ includeProcessedVersion: true });
+    });
+
+    it("should preserve tool_output use case when copying to a conversation", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const sourceFile = await FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName: "output.txt",
+        fileSize: testFileContent.length,
+        status: "ready",
+        useCase: "tool_output",
+        useCaseMetadata: {
+          conversationId: "parent-conv-id",
+          hideFromUser: true,
+        },
+        snippet: "tool output snippet",
+      });
+
+      const result = await FileResource.copyToConversation(auth, {
+        sourceId: sourceFile.sId,
+        conversationId: "child-conv-id",
+      });
+
+      assert(result.isOk(), "copyToConversation should succeed");
+      const copiedFile = result.value;
+
+      expect(copiedFile.useCase).toBe("tool_output");
+      expect(copiedFile.snippet).toBe("tool output snippet");
+      expect(copiedFile.useCaseMetadata).toEqual({
+        conversationId: "child-conv-id",
+        hideFromUser: true,
+      });
+    });
+
+    it("should reject non-conversation source use cases", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const sourceFile = await FileFactory.create(auth, null, {
+        contentType: "application/pdf",
+        fileName: "project.pdf",
+        fileSize: 100,
+        status: "ready",
+        useCase: "project_context",
+        useCaseMetadata: { spaceId: "space-1" },
+      });
+
+      const result = await FileResource.copyToConversation(auth, {
+        sourceId: sourceFile.sId,
+        conversationId: "child-conv-id",
+      });
+
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) {
+        expect(result.error.message).toContain(
+          "Only conversation files can be copied to a conversation"
+        );
+      }
+    });
+
+    it("should return error when source file is missing for copyToConversation", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const result = await FileResource.copyToConversation(auth, {
+        sourceId: "non-existent-file-id",
+        conversationId: "child-conv-id",
+      });
+
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) {
+        expect(result.error.message).toContain("Source file not found");
+      }
+    });
+
+    it("should return error when source file is not ready for copyToConversation", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const sourceFile = await FileFactory.create(auth, null, {
+        contentType: "text/plain",
+        fileName: "not-ready.txt",
+        fileSize: 100,
+        status: "created",
+        useCase: "conversation",
+        useCaseMetadata: { conversationId: "parent-conv-id" },
+      });
+
+      const result = await FileResource.copyToConversation(auth, {
+        sourceId: sourceFile.sId,
+        conversationId: "child-conv-id",
+      });
+
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) {
+        expect(result.error.message).toContain("not ready for copying");
+      }
     });
   });
 
@@ -547,6 +739,84 @@ describe("FileResource", () => {
         `w/${workspace.sId}/conversations/conv-retro/files/attachment.pdf`
       );
     });
+
+    it("should resolve mount path via markAsReady for project_context file", async () => {
+      const { authenticator: auth, workspace } = await createResourceTest({
+        role: "admin",
+      });
+
+      const file = await FileFactory.create(auth, null, {
+        contentType: "text/markdown",
+        fileName: "spec.md",
+        fileSize: 200,
+        status: "created",
+        useCase: "project_context",
+        useCaseMetadata: { spaceId: "spc-1" },
+      });
+
+      await file.markAsReady(auth);
+
+      const row = await FileModel.findOne({
+        where: { id: file.id, workspaceId: workspace.id },
+      });
+      expect(row?.mountFilePath).toBe(
+        `w/${workspace.sId}/projects/spc-1/files/spec.md`
+      );
+    });
+
+    it("should no-op for project_context when spaceId is missing", async () => {
+      const { authenticator: auth, workspace } = await createResourceTest({
+        role: "admin",
+      });
+
+      const file = await FileFactory.create(auth, null, {
+        contentType: "text/markdown",
+        fileName: "spec.md",
+        fileSize: 200,
+        status: "created",
+        useCase: "project_context",
+      });
+
+      await file.markAsReady(auth);
+
+      const row = await FileModel.findOne({
+        where: { id: file.id, workspaceId: workspace.id },
+      });
+      expect(row?.mountFilePath).toBeNull();
+    });
+
+    it("should disambiguate project_context files with the same name in a space", async () => {
+      const { authenticator: auth, workspace } = await createResourceTest({
+        role: "admin",
+      });
+
+      const file1 = await FileFactory.create(auth, null, {
+        contentType: "text/markdown",
+        fileName: "notes.md",
+        fileSize: 100,
+        status: "created",
+        useCase: "project_context",
+        useCaseMetadata: { spaceId: "spc-1" },
+      });
+      await file1.markAsReady(auth);
+
+      const file2 = await FileFactory.create(auth, null, {
+        contentType: "text/markdown",
+        fileName: "notes.md",
+        fileSize: 200,
+        status: "created",
+        useCase: "project_context",
+        useCaseMetadata: { spaceId: "spc-1" },
+      });
+      await file2.markAsReady(auth);
+
+      const row2 = await FileModel.findOne({
+        where: { id: file2.id, workspaceId: workspace.id },
+      });
+      expect(row2?.mountFilePath).toBe(
+        `w/${workspace.sId}/projects/spc-1/files/notes_${file2.sId}.md`
+      );
+    });
   });
 
   describe("getContentBucketAndPath", () => {
@@ -639,6 +909,28 @@ describe("FileResource", () => {
 
       const { path } = file.getContentBucketAndPath(auth);
       expect(path).toContain("/processed");
+    });
+
+    it("should resolve to 'original' version for spreadsheets when file processing is skipped", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const file = await FileFactory.create(auth, null, {
+        contentType:
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        fileName: "large.xlsx",
+        fileSize: 1000,
+        status: "ready",
+        useCase: "conversation",
+        useCaseMetadata: {
+          conversationId: "conv-1",
+          skipFileProcessing: true,
+        },
+      });
+
+      const { path } = file.getContentBucketAndPath(auth);
+      expect(path).toContain("/original");
     });
 
     it("should resolve to 'processed' version for images in conversation", async () => {

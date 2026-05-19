@@ -20,8 +20,8 @@ export function initializeOpenTelemetryInstrumentation({
   serviceName:
     | "dust-agent-loop"
     | "dust-front"
-    | "dust-reinforced-agent"
-    | "dust-reinforcement";
+    | "dust-reinforcement"
+    | "dust-project-todo";
 }): void {
   if (!config.isLangfuseEnabled() || sdk) {
     return;

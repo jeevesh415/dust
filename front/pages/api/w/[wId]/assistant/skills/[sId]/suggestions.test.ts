@@ -10,8 +10,16 @@ import type { SkillSuggestionState } from "@app/types/suggestions/skill_suggesti
 import type { RequestMethod } from "node-mocks-http";
 import { describe, expect, it, vi } from "vitest";
 
-vi.mock("@app/lib/reinforced_agent/workspace_check", () => ({
+vi.mock("@app/lib/reinforcement/workspace_check", () => ({
   hasReinforcementEnabled: vi.fn().mockResolvedValue(true),
+}));
+
+const postSkillSuggestionStatusUpdateMock = vi
+  .fn()
+  .mockResolvedValue(undefined);
+vi.mock("@app/lib/reinforcement/aggregate_suggestions", () => ({
+  postSkillSuggestionStatusUpdate: (...args: unknown[]) =>
+    postSkillSuggestionStatusUpdateMock(...args),
 }));
 
 import handler from "./suggestions";
@@ -218,9 +226,9 @@ describe("PATCH /api/w/[wId]/assistant/skills/[sId]/suggestions", () => {
       suggestion: {
         instructionEdits: [
           {
-            old_string: "original text",
-            new_string: "updated instructions",
-            expected_occurrences: 1,
+            targetBlockId: "abc12345",
+            content: "<p>Updated instructions</p>",
+            type: "replace",
           },
         ],
       },
@@ -249,9 +257,9 @@ describe("PATCH /api/w/[wId]/assistant/skills/[sId]/suggestions", () => {
       suggestion: {
         instructionEdits: [
           {
-            old_string: "original text",
-            new_string: "updated instructions",
-            expected_occurrences: 1,
+            targetBlockId: "abc12345",
+            content: "<p>Updated instructions</p>",
+            type: "replace",
           },
         ],
       },
@@ -356,9 +364,60 @@ describe("PATCH /api/w/[wId]/assistant/skills/[sId]/suggestions", () => {
     expect(fetched2?.state).toBe("approved");
   });
 
+  it("triggers postSkillSuggestionStatusUpdate when approving", async () => {
+    postSkillSuggestionStatusUpdateMock.mockClear();
+    const { req, res, auth, skill } = await setupTest();
+    const suggestion = await SkillSuggestionFactory.create(auth, skill, {
+      state: "pending",
+    });
+
+    req.body = { suggestionIds: [suggestion.sId], state: "approved" };
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    expect(postSkillSuggestionStatusUpdateMock).toHaveBeenCalledTimes(1);
+    const [, suggestions, state] =
+      postSkillSuggestionStatusUpdateMock.mock.calls[0];
+    expect(state).toBe("approved");
+    expect(suggestions.map((s: { sId: string }) => s.sId)).toEqual([
+      suggestion.sId,
+    ]);
+  });
+
+  it("triggers postSkillSuggestionStatusUpdate when rejecting", async () => {
+    postSkillSuggestionStatusUpdateMock.mockClear();
+    const { req, res, auth, skill } = await setupTest();
+    const suggestion = await SkillSuggestionFactory.create(auth, skill, {
+      state: "pending",
+    });
+
+    req.body = { suggestionIds: [suggestion.sId], state: "rejected" };
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    expect(postSkillSuggestionStatusUpdateMock).toHaveBeenCalledTimes(1);
+    expect(postSkillSuggestionStatusUpdateMock.mock.calls[0][2]).toBe(
+      "rejected"
+    );
+  });
+
+  it("does not trigger postSkillSuggestionStatusUpdate when marking outdated", async () => {
+    postSkillSuggestionStatusUpdateMock.mockClear();
+    const { req, res, auth, skill } = await setupTest();
+    const suggestion = await SkillSuggestionFactory.create(auth, skill, {
+      state: "pending",
+    });
+
+    req.body = { suggestionIds: [suggestion.sId], state: "outdated" };
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    expect(postSkillSuggestionStatusUpdateMock).not.toHaveBeenCalled();
+  });
+
   it("returns 400 when reinforcement is disabled", async () => {
     const { hasReinforcementEnabled } = await import(
-      "@app/lib/reinforced_agent/workspace_check"
+      "@app/lib/reinforcement/workspace_check"
     );
     vi.mocked(hasReinforcementEnabled).mockResolvedValueOnce(false);
 
@@ -377,7 +436,7 @@ describe("PATCH /api/w/[wId]/assistant/skills/[sId]/suggestions", () => {
 
     expect(res._getStatusCode()).toBe(400);
     expect(res._getJSONData().error.message).toContain(
-      "Reinforcement is not enabled"
+      "Self-improving skills are not enabled"
     );
   });
 });
@@ -510,7 +569,7 @@ describe("GET /api/w/[wId]/assistant/skills/[sId]/suggestions", () => {
 
   it("returns empty suggestions when reinforcement is disabled", async () => {
     const { hasReinforcementEnabled } = await import(
-      "@app/lib/reinforced_agent/workspace_check"
+      "@app/lib/reinforcement/workspace_check"
     );
     vi.mocked(hasReinforcementEnabled).mockResolvedValueOnce(false);
 

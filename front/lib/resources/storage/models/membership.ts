@@ -4,6 +4,8 @@ import { WorkspaceAwareModel } from "@app/lib/resources/storage/wrappers/workspa
 import type {
   MembershipOriginType,
   MembershipRoleType,
+  MembershipSeatType,
+  UserCreditState,
 } from "@app/types/memberships";
 import type { CreationOptional, ForeignKey, NonAttribute } from "sequelize";
 import { DataTypes, Op } from "sequelize";
@@ -17,6 +19,8 @@ export class MembershipModel extends WorkspaceAwareModel<MembershipModel> {
   declare startAt: Date;
   declare endAt: Date | null;
   declare firstUsedAt: Date | null;
+  declare seatType: CreationOptional<MembershipSeatType>;
+  declare creditState: CreationOptional<UserCreditState>;
 
   declare userId: ForeignKey<UserModel["id"]>;
   declare user: NonAttribute<UserModel>;
@@ -53,6 +57,16 @@ MembershipModel.init(
     firstUsedAt: {
       type: DataTypes.DATE,
       allowNull: true,
+    },
+    seatType: {
+      type: DataTypes.STRING,
+      allowNull: false,
+      defaultValue: "workspace",
+    },
+    creditState: {
+      type: DataTypes.STRING,
+      allowNull: false,
+      defaultValue: "normal",
     },
   },
   {

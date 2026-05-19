@@ -25,7 +25,7 @@ import {
   useDeleteWebhookSource,
   useWebhookSourcesWithViews,
 } from "@app/lib/swr/webhook_source";
-import { normalizeWebhookIcon } from "@app/lib/webhookSource";
+import { normalizeWebhookIcon } from "@app/lib/webhook_source";
 import datadogLogger from "@app/logger/datadogLogger";
 import type { RequireAtLeastOne } from "@app/types/shared/typescipt_utils";
 import { asDisplayName } from "@app/types/shared/utils/string_utils";
@@ -34,6 +34,7 @@ import type {
   WebhookSourceWithSystemViewType,
 } from "@app/types/triggers/webhooks";
 import { WEBHOOK_PRESETS } from "@app/types/triggers/webhooks";
+import { CLIENT_SIDE_WEBHOOK_PRESETS } from "@app/types/triggers/webhooks_client_side";
 import type { LightWorkspaceType } from "@app/types/user";
 import type { MultiPageSheetPage, RegularButtonProps } from "@dust-tt/sparkle";
 import {
@@ -49,8 +50,7 @@ import {
   TrashIcon,
 } from "@dust-tt/sparkle";
 import { zodResolver } from "@hookform/resolvers/zod";
-// biome-ignore lint/plugin/noBulkLodash: existing usage
-import _ from "lodash";
+import uniq from "lodash/uniq";
 import { useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { FormProvider, useForm } from "react-hook-form";
 
@@ -255,7 +255,7 @@ function WebhookSourceSheetContent({
         ...(remoteMetadata ? { remoteMetadata } : {}),
         ...(connectionId ? { connectionId } : {}),
         icon: normalizeWebhookIcon(
-          data.provider ? WEBHOOK_PRESETS[data.provider].icon : null
+          data.provider ? CLIENT_SIDE_WEBHOOK_PRESETS[data.provider].icon : null
         ),
       };
 
@@ -436,7 +436,7 @@ function WebhookSourceSheetContent({
       return;
     }
 
-    const agents = _.uniq(
+    const agents = uniq(
       webhookSourcesWithViews
         .filter((source) => source.sId === webhookSource.sId)
         .map((source) => source.usage?.agents ?? [])
@@ -560,7 +560,9 @@ function WebhookSourceSheetContent({
         description: "",
         icon: getIcon(
           normalizeWebhookIcon(
-            mode.provider ? WEBHOOK_PRESETS[mode.provider].icon : null
+            mode.provider
+              ? CLIENT_SIDE_WEBHOOK_PRESETS[mode.provider].icon
+              : null
           )
         ),
         content: (
@@ -590,7 +592,9 @@ function WebhookSourceSheetContent({
           ? () => <WebhookSourceViewIcon webhookSourceView={systemView} />
           : getIcon(
               normalizeWebhookIcon(
-                mode.provider ? WEBHOOK_PRESETS[mode.provider].icon : null
+                mode.provider
+                  ? CLIENT_SIDE_WEBHOOK_PRESETS[mode.provider].icon
+                  : null
               )
             ),
         content:

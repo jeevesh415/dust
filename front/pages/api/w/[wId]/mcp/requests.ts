@@ -6,38 +6,32 @@ import { initSSEResponse } from "@app/lib/api/sse";
 import type { Authenticator } from "@app/lib/auth";
 import { apiError } from "@app/logger/withlogging";
 import type { WithAPIErrorResponse } from "@app/types/error";
-import { isLeft } from "fp-ts/lib/Either";
-import * as t from "io-ts";
-import * as reporter from "io-ts-reporters";
 import type { NextApiRequest, NextApiResponse } from "next";
+import { z } from "zod";
+import { fromError } from "zod-validation-error";
 
-const GetMCPRequestsRequestQueryCodec = t.intersection([
-  t.type({
-    serverId: t.string,
-  }),
-  t.partial({
-    lastEventId: t.string,
-  }),
-]);
+const GetMCPRequestsRequestQuerySchema = z.object({
+  serverId: z.string(),
+  lastEventId: z.string().optional(),
+});
 
 async function handler(
   req: NextApiRequest,
   res: NextApiResponse<WithAPIErrorResponse<void>>,
   auth: Authenticator
 ): Promise<void> {
-  const queryValidation = GetMCPRequestsRequestQueryCodec.decode(req.query);
-  if (isLeft(queryValidation)) {
-    const pathError = reporter.formatValidationErrors(queryValidation.left);
+  const queryValidation = GetMCPRequestsRequestQuerySchema.safeParse(req.query);
+  if (!queryValidation.success) {
     return apiError(req, res, {
       status_code: 400,
       api_error: {
         type: "invalid_request_error",
-        message: `Invalid request query: ${pathError}`,
+        message: `Invalid request query: ${fromError(queryValidation.error).toString()}`,
       },
     });
   }
 
-  const { lastEventId, serverId } = queryValidation.right;
+  const { lastEventId, serverId } = queryValidation.data;
 
   const isValidAccess = await validateMCPServerAccess(auth, {
     serverId,
@@ -78,8 +72,10 @@ async function handler(
   const controller = new AbortController();
   const { signal } = controller;
 
-  // Handle client disconnection.
-  req.on("close", () => {
+  // Use res.on("close") rather than req.on("close"): Next.js fully reads and
+  // closes the request body before the handler runs, so req never emits "close"
+  // on client disconnect. The response stream is still live and fires reliably.
+  res.on("close", () => {
     controller.abort();
   });
 

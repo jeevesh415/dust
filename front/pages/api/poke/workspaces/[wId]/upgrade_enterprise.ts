@@ -91,6 +91,68 @@ async function handler(
       }
       const body = bodyValidation.right;
 
+      const programmaticConfigValidation =
+        ProgrammaticUsageConfigurationSchema.safeParse(body);
+      if (!programmaticConfigValidation.success) {
+        const errorMessage = programmaticConfigValidation.error.errors
+          .map((e) => `${e.path.join(".")}: ${e.message}`)
+          .join(", ");
+        await pluginRun.recordError(errorMessage);
+        return apiError(req, res, {
+          status_code: 400,
+          api_error: {
+            type: "invalid_request_error",
+            message: errorMessage,
+          },
+        });
+      }
+
+      const {
+        freeCreditsOverrideEnabled,
+        freeCreditsDollars,
+        defaultDiscountPercent,
+        paygEnabled,
+        paygCapDollars,
+      } = programmaticConfigValidation.data;
+
+      const freeCreditMicroUsd =
+        freeCreditsOverrideEnabled && freeCreditsDollars
+          ? Math.round(freeCreditsDollars * 1_000_000)
+          : null;
+
+      const paygCapMicroUsd =
+        paygEnabled && paygCapDollars
+          ? Math.round(paygCapDollars * 1_000_000)
+          : null;
+
+      const upsertResult = await upsertProgrammaticUsageConfiguration(auth, {
+        freeCreditMicroUsd,
+        defaultDiscountPercent: defaultDiscountPercent ?? 0,
+        paygCapMicroUsd,
+      });
+      if (upsertResult.isErr()) {
+        const errorMessage = upsertResult.error.message;
+        await pluginRun.recordError(errorMessage);
+        return apiError(req, res, {
+          status_code: 400,
+          api_error: {
+            type: "invalid_request_error",
+            message: errorMessage,
+          },
+        });
+      }
+
+      if (!body.stripeSubscriptionId) {
+        return apiError(req, res, {
+          status_code: 400,
+          api_error: {
+            type: "invalid_request_error",
+            message:
+              "stripeSubscriptionId is required for Stripe-billed subscriptions.",
+          },
+        });
+      }
+
       const stripeSubscription = await getStripeSubscription(
         body.stripeSubscriptionId
       );
@@ -141,57 +203,6 @@ async function handler(
         assertStripeSubscriptionIsValid(stripeSubscription);
       if (assertValidSubscription.isErr()) {
         const errorMessage = assertValidSubscription.error.invalidity_message;
-        await pluginRun.recordError(errorMessage);
-        return apiError(req, res, {
-          status_code: 400,
-          api_error: {
-            type: "invalid_request_error",
-            message: errorMessage,
-          },
-        });
-      }
-
-      const programmaticConfigValidation =
-        ProgrammaticUsageConfigurationSchema.safeParse(body);
-      if (!programmaticConfigValidation.success) {
-        const errorMessage = programmaticConfigValidation.error.errors
-          .map((e) => `${e.path.join(".")}: ${e.message}`)
-          .join(", ");
-        await pluginRun.recordError(errorMessage);
-        return apiError(req, res, {
-          status_code: 400,
-          api_error: {
-            type: "invalid_request_error",
-            message: errorMessage,
-          },
-        });
-      }
-
-      const {
-        freeCreditsOverrideEnabled,
-        freeCreditsDollars,
-        defaultDiscountPercent,
-        paygEnabled,
-        paygCapDollars,
-      } = programmaticConfigValidation.data;
-
-      const freeCreditMicroUsd =
-        freeCreditsOverrideEnabled && freeCreditsDollars
-          ? Math.round(freeCreditsDollars * 1_000_000)
-          : null;
-
-      const paygCapMicroUsd =
-        paygEnabled && paygCapDollars
-          ? Math.round(paygCapDollars * 1_000_000)
-          : null;
-
-      const upsertResult = await upsertProgrammaticUsageConfiguration(auth, {
-        freeCreditMicroUsd,
-        defaultDiscountPercent: defaultDiscountPercent ?? 0,
-        paygCapMicroUsd,
-      });
-      if (upsertResult.isErr()) {
-        const errorMessage = upsertResult.error.message;
         await pluginRun.recordError(errorMessage);
         return apiError(req, res, {
           status_code: 400,

@@ -2,7 +2,7 @@
 import { getMicrosoftClient } from "@connectors/connectors/microsoft";
 import {
   clientApiPost,
-  extractPath,
+  DeltaTooLargeError,
   getAllPaginatedEntities,
   getDeltaResults,
   getDriveInternalIdFromItem,
@@ -16,9 +16,10 @@ import {
   getSites,
   itemToMicrosoftNode,
 } from "@connectors/connectors/microsoft/lib/graph_api";
-import type {
-  DriveItem,
-  MicrosoftNode,
+import {
+  type DriveItem,
+  MICROSOFT_SKIP_REASON_SENSITIVITY_LABEL_NOT_ALLOWED,
+  type MicrosoftNode,
 } from "@connectors/connectors/microsoft/lib/types";
 import {
   getDriveInternalIdFromItemId,
@@ -33,12 +34,16 @@ import {
   isJSONParsingError,
   isMalformedDriveError,
 } from "@connectors/connectors/microsoft/temporal/cast_known_errors";
+// biome-ignore lint/suspicious/noImportCycles: ignored using `--suppress`
+import { launchMicrosoftFullSyncWorkflow } from "@connectors/connectors/microsoft/temporal/client";
 import {
   deleteFile,
   deleteFolder,
   getParents,
   isAlreadySeenItem,
   recursiveNodeDeletion,
+  removeFileBasedOnSensitivityLabel,
+  shouldSyncFileBasedOnSensitivityLabels,
   syncOneFile,
   updateDescendantsParentsInCore,
   // biome-ignore lint/suspicious/noImportCycles: ignored using `--suppress`
@@ -72,12 +77,12 @@ import {
 } from "@connectors/types";
 import type { LoggerInterface } from "@dust-tt/client";
 import { removeNulls } from "@dust-tt/client";
+import type { Bucket } from "@google-cloud/storage";
 import { Storage } from "@google-cloud/storage";
 import type { Client } from "@microsoft/microsoft-graph-client";
 import { GraphError } from "@microsoft/microsoft-graph-client";
 import { WorkflowNotFoundError } from "@temporalio/client";
-// biome-ignore lint/plugin/noBulkLodash: existing usage
-import * as _ from "lodash";
+import chunk from "lodash/chunk";
 import { Readable } from "stream";
 import { pipeline } from "stream/promises";
 import { parser } from "stream-json";
@@ -89,6 +94,21 @@ interface DeltaDataInGCS {
   rootNodeIds: string[];
   sortedChangedItems: DriveItem[];
   totalItems: number;
+}
+
+let _deltaSyncBucket: Bucket | null = null;
+function getDeltaSyncBucket(): Bucket {
+  if (!_deltaSyncBucket) {
+    const storage = new Storage({
+      keyFilename: isDevelopment()
+        ? connectorsConfig.getServiceAccount()
+        : undefined,
+    });
+    _deltaSyncBucket = storage.bucket(
+      connectorsConfig.getDustTmpSyncBucketName()
+    );
+  }
+  return _deltaSyncBucket;
 }
 
 // Creates a readable stream that yields JSON chunks for DeltaDataInGCS.
@@ -144,22 +164,31 @@ function createDeltaJsonStream(
 // for very large files (JavaScript string limit ~512MB).
 // Uses stream-json's Assembler to reconstruct the object from a token stream.
 async function readDeltaFromGCSStream(
-  file: ReturnType<ReturnType<Storage["bucket"]>["file"]>
+  file: ReturnType<Bucket["file"]>
 ): Promise<DeltaDataInGCS> {
-  return new Promise((resolve, reject) => {
-    const readStream = file.createReadStream();
-    const jsonParser = parser();
-    const assembler = Assembler.connectTo(jsonParser);
+  const readStream = file.createReadStream();
+  const jsonParser = parser();
 
-    assembler.on("done", (asm: Assembler) => {
-      resolve(asm.current as DeltaDataInGCS);
+  try {
+    const assembler = Assembler.connectTo(jsonParser);
+    const done = new Promise<DeltaDataInGCS>((resolve, reject) => {
+      assembler.on("done", (asm: Assembler) =>
+        resolve(asm.current as DeltaDataInGCS)
+      );
+      jsonParser.on("error", reject);
     });
 
-    readStream.on("error", reject);
-    jsonParser.on("error", reject);
-
-    readStream.pipe(jsonParser);
-  });
+    // `pipeline()` ensures both streams are torn down on error or completion, releasing the
+    // underlying TLS socket back to the agent pool.
+    const [, result] = await Promise.all([
+      pipeline(readStream, jsonParser),
+      done,
+    ]);
+    return result;
+  } finally {
+    readStream.destroy();
+    jsonParser.destroy();
+  }
 }
 
 const FILES_SYNC_CONCURRENCY = 10;
@@ -212,7 +241,7 @@ export async function getRootNodesToSyncFromResources(
             );
             return {
               ...node,
-              name: `${node.name} (${extractPath(item)})`,
+              name: node.name,
             };
           } catch (error) {
             if (error instanceof GraphError && error.statusCode === 404) {
@@ -361,7 +390,7 @@ export async function getRootNodesToSyncFromResources(
           const driveNode = itemToMicrosoftNode("drive", driveItem);
           return {
             ...driveNode,
-            name: `${driveNode.name} + " (${extractPath(driveItem)})`,
+            name: driveNode.name,
           };
         });
       },
@@ -640,12 +669,12 @@ export async function syncFiles({
   const client = await getMicrosoftClient(connector.connectionId);
 
   try {
-    // TODO(pr): handle pagination
     const childrenResult = await getFilesAndFolders(
       logger,
       client,
       parent.internalId,
-      nextPageLink
+      nextPageLink,
+      (providerConfig.allowedSensitivityLabels ?? []).length > 0
     );
 
     const children = childrenResult.results;
@@ -800,6 +829,129 @@ export async function syncFiles({
 
     throw e;
   }
+}
+
+export async function reconcileSensitivityLabelsForParent({
+  connectorId,
+  parentInternalId,
+  startSyncTs,
+  nextPageLink,
+}: {
+  connectorId: ModelId;
+  parentInternalId: string;
+  startSyncTs: number;
+  nextPageLink?: string;
+}): Promise<{
+  childNodes: string[];
+  nextLink?: string;
+}> {
+  const connector = await ConnectorResource.fetchById(connectorId);
+  if (!connector) {
+    throw new Error(`Connector ${connectorId} not found`);
+  }
+
+  const logger = getActivityLogger(connector);
+
+  const providerConfig =
+    await MicrosoftConfigurationResource.fetchByConnectorId(connectorId);
+  if (!providerConfig) {
+    throw new Error(`Configuration for connector ${connectorId} not found`);
+  }
+
+  const allowedLabels = providerConfig.allowedSensitivityLabels ?? [];
+  const dataSourceConfig = dataSourceConfigFromConnector(connector);
+  const client = await getMicrosoftClient(connector.connectionId);
+  const childrenResult = await getFilesAndFolders(
+    logger,
+    client,
+    parentInternalId,
+    nextPageLink,
+    allowedLabels.length > 0
+  );
+
+  const mimeTypesToSync = await getMimeTypesToSync({
+    pdfEnabled: providerConfig.pdfEnabled || false,
+    csvEnabled: providerConfig.csvEnabled || false,
+  });
+
+  let removedCount = 0;
+  let addedCount = 0;
+
+  for (const child of childrenResult.results) {
+    await heartbeat();
+
+    if (!child.file) {
+      continue;
+    }
+
+    if (!child.parentReference) {
+      throw new Error(`Unexpected: parent reference missing: ${child}`);
+    }
+
+    const mimeType = child.file.mimeType;
+    if (!mimeType || !mimeTypesToSync.includes(mimeType)) {
+      continue;
+    }
+
+    const internalId = getDriveItemInternalId(child);
+    const fileResource = await MicrosoftNodeResource.fetchByInternalId(
+      connectorId,
+      internalId
+    );
+
+    const shouldSync = shouldSyncFileBasedOnSensitivityLabels({
+      fields: child.listItem?.fields,
+      allowedLabels,
+    });
+
+    const isHiddenBySensitivityLabel =
+      fileResource?.skipReason ===
+      MICROSOFT_SKIP_REASON_SENSITIVITY_LABEL_NOT_ALLOWED;
+
+    if (!shouldSync) {
+      await removeFileBasedOnSensitivityLabel({
+        connectorId,
+        dataSourceConfig,
+        file: child,
+        fileResource,
+        parentInternalId,
+        logger,
+      });
+      removedCount++;
+    } else if (!fileResource || isHiddenBySensitivityLabel) {
+      const didSync = await syncOneFile({
+        connectorId,
+        dataSourceConfig,
+        providerConfig,
+        file: child,
+        parentInternalId: getParentReferenceInternalId(child.parentReference),
+        startSyncTs,
+        heartbeat,
+      });
+      if (didSync) {
+        addedCount++;
+      }
+    }
+  }
+
+  logger.info(
+    {
+      connectorId,
+      parentInternalId,
+      removedCount,
+      addedCount,
+    },
+    "[ReconcileSensitivityLabels] Parent page reconciled"
+  );
+
+  const childNodes = childrenResult.results
+    .filter((item) => item.folder)
+    .map((item) => getDriveInternalIdFromItem(item));
+
+  return {
+    childNodes,
+    nextLink: childrenResult.nextLink,
+  };
 }
 
 // Legacy activity, only for compatibilty.
@@ -1079,10 +1231,6 @@ export async function syncDeltaForRootNodesInDrive({
 
         const blob = itemToMicrosoftNode(type, item);
 
-        if (rootNodeIds.includes(blob.internalId)) {
-          blob.name = blob.name + ` (${extractPath(item)})`;
-        }
-
         const existingResource = await MicrosoftNodeResource.fetchByInternalId(
           connectorId,
           blob.internalId
@@ -1183,7 +1331,7 @@ export async function fetchDeltaForRootNodesInDrive({
   connectorId: ModelId;
   driveId: string;
   rootNodeIds: string[];
-}): Promise<{ gcsFilePath: string | null }> {
+}): Promise<{ gcsFilePath: string | null; deltaTooLarge: boolean }> {
   const connector = await ConnectorResource.fetchById(connectorId);
   if (!connector) {
     throw new Error(`Connector ${connectorId} not found`);
@@ -1218,7 +1366,7 @@ export async function fetchDeltaForRootNodesInDrive({
       },
       "Some root nodes not found in database, skipping delta sync for this drive"
     );
-    return { gcsFilePath: null };
+    return { gcsFilePath: null, deltaTooLarge: false };
   }
 
   const client = await getMicrosoftClient(connector.connectionId);
@@ -1244,7 +1392,7 @@ export async function fetchDeltaForRootNodesInDrive({
           { error: normalizeError(error).message, driveId },
           "Drive not found or malformed during delta population, skipping"
         );
-        return { gcsFilePath: null };
+        return { gcsFilePath: null, deltaTooLarge: false };
       }
       throw error;
     }
@@ -1273,12 +1421,19 @@ export async function fetchDeltaForRootNodesInDrive({
     results = resultsFromDelta;
     deltaLink = deltaLinkFromDelta;
   } catch (error) {
+    if (error instanceof DeltaTooLargeError) {
+      logger.warn(
+        { connectorId, driveId, rootNodeIds, itemCount: error.itemCount },
+        "Incremental delta too large, signaling workflow to recover"
+      );
+      return { gcsFilePath: null, deltaTooLarge: true };
+    }
     if (isItemNotFoundError(error) || isMalformedDriveError(error)) {
       logger.info(
         { error: error.message, driveId },
         "Drive not found or malformed, skipping"
       );
-      return { gcsFilePath: null };
+      return { gcsFilePath: null, deltaTooLarge: false };
     }
     throw error;
   }
@@ -1288,13 +1443,7 @@ export async function fetchDeltaForRootNodesInDrive({
   const gcsFilePath = `microsoft-delta-sync/${connectorId}/${driveId}/${timestamp}_delta.json`;
 
   // Upload the delta data to GCS
-  const storage = new Storage({
-    keyFilename: isDevelopment()
-      ? connectorsConfig.getServiceAccount()
-      : undefined,
-  });
-  const bucket = storage.bucket(connectorsConfig.getDustTmpSyncBucketName());
-  const file = bucket.file(gcsFilePath);
+  const file = getDeltaSyncBucket().file(gcsFilePath);
 
   // Process changes in batches of 1000
   const uniqueChangedItems = removeAllButLastOccurences(results);
@@ -1359,7 +1508,7 @@ export async function fetchDeltaForRootNodesInDrive({
       { connectorId, driveId, rootNodeIds },
       "No changes found, skipping delta sync"
     );
-    return { gcsFilePath: null };
+    return { gcsFilePath: null, deltaTooLarge: false };
   }
 
   const totalItems = sortedChangedItems.length;
@@ -1409,7 +1558,7 @@ export async function fetchDeltaForRootNodesInDrive({
     "Delta data fetched, processed, and uploaded to GCS"
   );
 
-  return { gcsFilePath };
+  return { gcsFilePath, deltaTooLarge: false };
 }
 
 export async function cleanupDeltaGCSFile({
@@ -1429,13 +1578,7 @@ export async function cleanupDeltaGCSFile({
   const logger = getActivityLogger(connector);
 
   try {
-    const storage = new Storage({
-      keyFilename: isDevelopment()
-        ? connectorsConfig.getServiceAccount()
-        : undefined,
-    });
-    const bucket = storage.bucket(connectorsConfig.getDustTmpSyncBucketName());
-    const file = bucket.file(gcsFilePath);
+    const file = getDeltaSyncBucket().file(gcsFilePath);
 
     await file.delete();
     logger.info(
@@ -1746,7 +1889,7 @@ export async function microsoftGarbageCollectionActivity({
     method: "GET",
   }));
 
-  const chunkedRequests = _.chunk(requests, 20);
+  const chunkedRequests = chunk(requests, 20);
 
   const nodeResources = await MicrosoftNodeResource.fetchByInternalIds(
     connectorId,
@@ -2156,13 +2299,7 @@ export async function processDeltaChangesFromGCS({
   const logger = getActivityLogger(connector);
 
   // Read the GCS file to get the list of changed items
-  const storage = new Storage({
-    keyFilename: isDevelopment()
-      ? connectorsConfig.getServiceAccount()
-      : undefined,
-  });
-  const bucket = storage.bucket(connectorsConfig.getDustTmpSyncBucketName());
-  const file = bucket.file(gcsFilePath);
+  const file = getDeltaSyncBucket().file(gcsFilePath);
 
   // Use streaming JSON parse to avoid "Invalid string length" error
   // when the file is too large to convert to a string.
@@ -2338,10 +2475,6 @@ export async function processDeltaChangesFromGCS({
 
         const blob = itemToMicrosoftNode(type, item);
 
-        if (rootNodeIds.includes(blob.internalId)) {
-          blob.name = blob.name + ` (${extractPath(item)})`;
-        }
-
         const existingResource = await MicrosoftNodeResource.fetchByInternalId(
           connectorId,
           blob.internalId
@@ -2472,5 +2605,22 @@ export async function isMicrosoftFullSyncRunning(
       return false;
     }
     throw e;
+  }
+}
+
+export async function launchMicrosoftFullSyncForDrive({
+  connectorId,
+  rootNodeIds,
+}: {
+  connectorId: ModelId;
+  rootNodeIds: string[];
+}): Promise<void> {
+  const res = await launchMicrosoftFullSyncWorkflow(
+    connectorId,
+    rootNodeIds,
+    []
+  );
+  if (res.isErr()) {
+    throw res.error;
   }
 }

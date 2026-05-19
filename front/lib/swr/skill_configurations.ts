@@ -5,6 +5,7 @@ import type { DetectedSkillSummary } from "@app/lib/skill_detection";
 import { emptyArray, useFetcher, useSWRWithDefaults } from "@app/lib/swr/swr";
 import type {
   GetSkillsResponseBody,
+  GetSkillsWithoutInstructionsAndToolsResponseBody,
   GetSkillsWithRelationsResponseBody,
 } from "@app/pages/api/w/[wId]/skills";
 import type {
@@ -16,8 +17,10 @@ import type { DetectSkillsResponseBody } from "@app/pages/api/w/[wId]/skills/det
 import type { ImportSkillsResponseBody } from "@app/pages/api/w/[wId]/skills/import";
 import type { GetSimilarSkillsResponseBody } from "@app/pages/api/w/[wId]/skills/similar";
 import type {
+  SkillReinforcementMode,
   SkillStatus,
   SkillType,
+  SkillViewType,
   SkillWithRelationsType,
 } from "@app/types/assistant/skill_configuration";
 import { isAPIErrorResponse } from "@app/types/error";
@@ -30,6 +33,21 @@ import type { SWRMutationConfiguration } from "swr/mutation";
 import useSWRMutation from "swr/mutation";
 
 const DETECT_SKILLS_DEBOUNCE_MS = 1_000;
+
+type SkillsResponseByViewType = {
+  full: GetSkillsResponseBody;
+  summary: GetSkillsWithoutInstructionsAndToolsResponseBody;
+};
+
+type SkillsByViewType<TViewType extends SkillViewType> =
+  SkillsResponseByViewType[TViewType]["skills"];
+
+type UseSkillsResult<TViewType extends SkillViewType> = {
+  skills: SkillsByViewType<TViewType>;
+  isSkillsError: boolean;
+  isSkillsLoading: boolean;
+  mutateSkills: () => void;
+};
 
 export function useSkill(options: {
   workspaceId: string;
@@ -92,21 +110,23 @@ export function useSkill({
   };
 }
 
-export function useSkills({
+export function useSkills<TViewType extends SkillViewType = "full">({
   owner,
   disabled,
   status,
   globalSpaceOnly,
   isDefault,
+  viewType,
 }: {
   owner: LightWorkspaceType;
   disabled?: boolean;
   status?: SkillStatus;
   globalSpaceOnly?: boolean;
   isDefault?: boolean;
-}) {
+  viewType?: TViewType;
+}): UseSkillsResult<TViewType> {
   const { fetcher } = useFetcher();
-  const skillsFetcher: Fetcher<GetSkillsResponseBody> = fetcher;
+  const requestedViewType: SkillViewType = viewType ?? "full";
 
   const queryParams = new URLSearchParams();
   if (status) {
@@ -118,16 +138,19 @@ export function useSkills({
   if (isDefault) {
     queryParams.set("isDefault", "true");
   }
+  if (requestedViewType === "summary") {
+    queryParams.set("viewType", requestedViewType);
+  }
   const queryString = queryParams.toString();
 
   const { data, error, isLoading, mutate } = useSWRWithDefaults(
     `/api/w/${owner.sId}/skills${queryString ? `?${queryString}` : ""}`,
-    skillsFetcher,
+    fetcher,
     { disabled }
   );
 
   return {
-    skills: data?.skills ?? emptyArray(),
+    skills: data?.skills ?? emptyArray<SkillsByViewType<TViewType>[number]>(),
     isSkillsError: !!error,
     isSkillsLoading: isLoading,
     mutateSkills: mutate,
@@ -138,16 +161,26 @@ export function useSkillsWithRelations({
   owner,
   disabled,
   status,
+  onlyCustom,
 }: {
   owner: LightWorkspaceType;
   disabled?: boolean;
   status: SkillStatus;
+  onlyCustom?: boolean;
 }) {
   const { fetcher } = useFetcher();
   const skillsFetcher: Fetcher<GetSkillsWithRelationsResponseBody> = fetcher;
 
+  const queryParams = new URLSearchParams({
+    withRelations: "true",
+    status,
+  });
+  if (onlyCustom) {
+    queryParams.set("onlyCustom", "true");
+  }
+
   const { data, isLoading, mutate } = useSWRWithDefaults(
-    `/api/w/${owner.sId}/skills?withRelations=true&status=${status}`,
+    `/api/w/${owner.sId}/skills?${queryParams.toString()}`,
     skillsFetcher,
     { disabled }
   );
@@ -250,6 +283,57 @@ export function useArchiveSkill({
   };
 
   return doArchive;
+}
+
+type SkillReinforcementUpdate = {
+  reinforcement?: SkillReinforcementMode;
+  selfImprovementLock?: boolean;
+  selfImprovementCostsCapMicroUsd?: number | null;
+};
+
+export function useUpdateSkillReinforcement({
+  owner,
+  onlyCustom,
+}: {
+  owner: LightWorkspaceType;
+  onlyCustom?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const sendNotification = useSendNotification();
+
+  const { mutateSkillsWithRelations: mutateActiveSkills } =
+    useSkillsWithRelations({
+      owner,
+      status: "active",
+      onlyCustom,
+      disabled: true,
+    });
+
+  const updateSkillReinforcement = useCallback(
+    async (skillId: string, update: SkillReinforcementUpdate) => {
+      try {
+        await fetcher(`/api/w/${owner.sId}/skills/${skillId}/reinforcement`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(update),
+        });
+        void mutateActiveSkills();
+        return true;
+      } catch (err) {
+        sendNotification({
+          type: "error",
+          title: "Failed to update reinforcement settings",
+          description: isAPIErrorResponse(err)
+            ? err.error.message
+            : "An unexpected error occurred.",
+        });
+        return false;
+      }
+    },
+    [owner.sId, fetcher, mutateActiveSkills, sendNotification]
+  );
+
+  return { updateSkillReinforcement };
 }
 
 export function useRestoreSkill({

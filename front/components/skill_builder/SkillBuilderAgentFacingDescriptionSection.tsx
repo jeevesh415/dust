@@ -10,7 +10,7 @@ import type { SkillBuilderFormData } from "@app/components/skill_builder/SkillBu
 import { useSkillVersionComparisonContext } from "@app/components/skill_builder/SkillBuilderVersionContext";
 import { useDebounceWithAbort } from "@app/hooks/useDebounce";
 import { useSimilarSkills, useSkills } from "@app/lib/swr/skill_configurations";
-import type { SkillType } from "@app/types/assistant/skill_configuration";
+import type { SkillWithoutInstructionsAndToolsType } from "@app/types/assistant/skill_configuration";
 import { ArrowGoBackIcon, Button, cn } from "@dust-tt/sparkle";
 import type { Transaction } from "@tiptap/pm/state";
 import type { Editor } from "@tiptap/react";
@@ -33,9 +33,11 @@ export function SkillBuilderAgentFacingDescriptionSection() {
     });
 
   const { getSimilarSkills } = useSimilarSkills({ owner });
-  const { skills } = useSkills({ owner });
+  const { skills } = useSkills({ owner, viewType: "summary" });
 
-  const [similarSkills, setSimilarSkills] = useState<SkillType[]>([]);
+  const [similarSkills, setSimilarSkills] = useState<
+    SkillWithoutInstructionsAndToolsType[]
+  >([]);
   const [isLoading, setIsLoading] = useState(false);
 
   const descriptionDiffers =
@@ -106,6 +108,19 @@ export function SkillBuilderAgentFacingDescriptionSection() {
     onUpdate: handleUpdate,
     onBlur: handleBlur,
   });
+
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) {
+      return;
+    }
+
+    // This allows RHF to focus this custom editor when validation fails.
+    descriptionField.ref(editor.view.dom);
+
+    return () => {
+      descriptionField.ref(null);
+    };
+  }, [descriptionField.ref, editor]);
 
   useEffect(() => {
     if (!editor) {

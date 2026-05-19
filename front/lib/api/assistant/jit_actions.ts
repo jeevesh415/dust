@@ -1,18 +1,30 @@
 import type { ServerSideMCPServerConfigurationType } from "@app/lib/actions/mcp";
+import type { AutoInternalMCPServerNameType } from "@app/lib/actions/mcp_internal_actions/constants";
 import type { ConversationAttachmentType } from "@app/lib/api/assistant/conversation/attachments";
+import { isContentNodeAttachmentType } from "@app/lib/api/assistant/conversation/attachments";
 import { getCommonUtilitiesServer } from "@app/lib/api/assistant/jit/common_utilities";
 import {
   getConversationFilesServer,
   getConversationMCPServers,
 } from "@app/lib/api/assistant/jit/conversation";
+import { getFilesServer } from "@app/lib/api/assistant/jit/files";
 import { getFolderSearchServers } from "@app/lib/api/assistant/jit/folder";
 import { getQueryTablesServer } from "@app/lib/api/assistant/jit/query_tables_v2";
 import { getSchedulesManagementServer } from "@app/lib/api/assistant/jit/schedules_management";
 import { getSkillManagementServer } from "@app/lib/api/assistant/jit/skills";
+import { isSearchableFolder } from "@app/lib/api/assistant/jit_utils";
 import type { Authenticator } from "@app/lib/auth";
+import { MCPServerViewResource } from "@app/lib/resources/mcp_server_view_resource";
 import type { AgentConfigurationType } from "@app/types/assistant/agent";
 import type { ConversationWithoutContentType } from "@app/types/assistant/conversation";
 import { removeNulls } from "@app/types/shared/utils/general";
+
+const ALWAYS_PREFETCHED_MCP_SERVERS: AutoInternalMCPServerNameType[] = [
+  "common_utilities",
+  "files",
+  "schedules_management",
+  "skill_management",
+];
 
 /**
  * Servers whose tool specifications are mostly always added or never added.
@@ -22,9 +34,14 @@ async function getUnconditionalJITServers(
   {
     agentConfiguration,
     conversation,
+    autoInternalViews,
   }: {
     agentConfiguration: AgentConfigurationType;
     conversation: ConversationWithoutContentType;
+    autoInternalViews: Map<
+      AutoInternalMCPServerNameType,
+      MCPServerViewResource
+    >;
   }
 ): Promise<ServerSideMCPServerConfigurationType[]> {
   const servers: (ServerSideMCPServerConfigurationType | null)[] = [];
@@ -32,16 +49,25 @@ async function getUnconditionalJITServers(
   const commonUtilitiesServer = await getCommonUtilitiesServer(
     auth,
     agentConfiguration,
-    conversation
+    conversation,
+    autoInternalViews
   );
   servers.push(commonUtilitiesServer);
 
   const skillManagementServer = await getSkillManagementServer(
     auth,
     agentConfiguration,
-    conversation
+    conversation,
+    autoInternalViews
   );
   servers.push(skillManagementServer);
+
+  const filesServer = getFilesServer(
+    agentConfiguration,
+    conversation,
+    autoInternalViews
+  );
+  servers.push(filesServer);
 
   return removeNulls(servers);
 }
@@ -55,10 +81,15 @@ async function getConditionalJITServers(
     agentConfiguration,
     conversation,
     attachments,
+    autoInternalViews,
   }: {
     agentConfiguration: AgentConfigurationType;
     conversation: ConversationWithoutContentType;
     attachments: ConversationAttachmentType[];
+    autoInternalViews: Map<
+      AutoInternalMCPServerNameType,
+      MCPServerViewResource
+    >;
   }
 ): Promise<ServerSideMCPServerConfigurationType[]> {
   const servers: (ServerSideMCPServerConfigurationType | null)[] = [];
@@ -75,7 +106,8 @@ async function getConditionalJITServers(
   const schedulesManagementServer = await getSchedulesManagementServer(
     auth,
     agentConfiguration,
-    conversation
+    conversation,
+    autoInternalViews
   );
   servers.push(schedulesManagementServer);
 
@@ -87,18 +119,24 @@ async function getConditionalJITServers(
 
   const conversationFilesServer = await getConversationFilesServer(
     auth,
-    attachments
+    attachments,
+    autoInternalViews
   );
   servers.push(conversationFilesServer);
 
   const queryTablesServer = await getQueryTablesServer(
     auth,
     conversation,
-    attachments
+    attachments,
+    autoInternalViews
   );
   servers.push(queryTablesServer);
 
-  const folderSearchServers = await getFolderSearchServers(auth, attachments);
+  const folderSearchServers = await getFolderSearchServers(
+    auth,
+    attachments,
+    autoInternalViews
+  );
   servers.push(...folderSearchServers);
 
   return removeNulls(servers);
@@ -119,12 +157,41 @@ export async function getJITServers(
   servers: ServerSideMCPServerConfigurationType[];
   hasConditionalJITTools: boolean;
 }> {
+  const mcpServersToFetch = new Set<AutoInternalMCPServerNameType>(
+    ALWAYS_PREFETCHED_MCP_SERVERS
+  );
+
+  if (attachments.length > 0) {
+    mcpServersToFetch.add("conversation_files");
+    if (attachments.some((a) => a.isQueryable)) {
+      mcpServersToFetch.add("query_tables_v2");
+    }
+    if (
+      attachments.some(
+        (a) => isContentNodeAttachmentType(a) && isSearchableFolder(a)
+      )
+    ) {
+      mcpServersToFetch.add("search");
+    }
+  }
+
+  const autoInternalViews =
+    await MCPServerViewResource.getMCPServerViewsForAutoInternalToolsAsMap(
+      auth,
+      Array.from(mcpServersToFetch)
+    );
+
   const [baseServers, conditionalServers] = await Promise.all([
-    getUnconditionalJITServers(auth, { agentConfiguration, conversation }),
+    getUnconditionalJITServers(auth, {
+      agentConfiguration,
+      conversation,
+      autoInternalViews,
+    }),
     getConditionalJITServers(auth, {
       agentConfiguration,
       conversation,
       attachments,
+      autoInternalViews,
     }),
   ]);
 

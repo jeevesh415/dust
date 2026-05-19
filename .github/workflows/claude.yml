@@ -38,14 +38,11 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
-          node-version: 22.22.0
-
-      - name: Install correct npm version
-        run: npm install -g npm@11.11.0
+          node-version: 24.14.0
 
       # Setup Rust for core project
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@c93f4f9c67595668add93d3d6895795ce52d8c2d # 1.85.0
+        uses: dtolnay/rust-toolchain@aad518f59d88bae90133242f9ddac7f8bbc5dddf # 1.94.1
         with:
           components: rustfmt
 
@@ -123,14 +120,14 @@ jobs:
 
             ### Project-specific Build Commands:
 
-            **front**: cd front && npm ci && npx tsc --noEmit && npm run lint && npm run format:check
-            **connectors**: cd connectors && npm install && npm run build && npm run lint && npm run format:check
-            **cli**: cd cli/dust-cli && npm ci && npx tsc && npm run lint
+            **front**: cd front && npm ci && npx tsc --noEmit && cd .. && npm run format:ci
+            **connectors**: cd connectors && npm install && npm run build && cd .. && npm run format:ci
+            **cli**: cd cli/dust-cli && npm ci && npx tsc && cd ../.. && npm run format:ci
             **core**: cd core && cargo check && cargo fmt --all -- --check
-            **extension**: cd extension && npm ci && npm run build && npm run lint
-            **sparkle**: cd sparkle && npm install && npm run build && npm run lint
+            **extension**: cd extension && npm ci && npm run build && cd .. && npm run format:ci
+            **sparkle**: cd sparkle && npm install && npm run build && cd .. && npm run format:ci
             **viz**: cd viz && npm install && npm run build && npm run check
-            **sdks/js**: Already pre-built; if changes made: cd sdks/js && npm run build && npm run lint
+            **sdks/js**: Already pre-built; if changes made: cd sdks/js && npm run build && cd ../.. && npm run format:ci
 
             ### Important Rules:
             - Install dependencies once per project when first needed (npm ci or npm install)

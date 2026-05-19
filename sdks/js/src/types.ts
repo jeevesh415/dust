@@ -37,6 +37,7 @@ type KnownModelLLMId =
   | "gpt-5.1"
   | "gpt-5.2"
   | "gpt-5.4"
+  | "gpt-5.5"
   | "gpt-5-nano"
   | "gpt-5-mini"
   | "gpt-5"
@@ -57,9 +58,11 @@ type KnownModelLLMId =
   | "claude-sonnet-4-5-20250929"
   | "claude-opus-4-5-20251101"
   | "claude-opus-4-6"
+  | "claude-opus-4-7"
   | "claude-sonnet-4-6"
   | "mistral-large-latest"
   | "mistral-medium"
+  | "mistral-medium-3-5"
   | "mistral-small-latest"
   | "codestral-latest"
   | "gemini-2.5-pro"
@@ -79,6 +82,7 @@ type KnownModelLLMId =
   | "deepseek-reasoner" // deepseek api
   | "accounts/fireworks/models/deepseek-r1-0528" // fireworks
   | "accounts/fireworks/models/deepseek-v3p2" // fireworks
+  | "accounts/fireworks/models/deepseek-v4-pro" // fireworks
   | "accounts/fireworks/models/kimi-k2-instruct" // fireworks - not supported anymore
   | "accounts/fireworks/models/kimi-k2-instruct-0905" // fireworks
   | "accounts/fireworks/models/kimi-k2p5" // fireworks
@@ -227,6 +231,8 @@ export const supportedAudioFileFormats = {
   "audio/wav": [".wav"],
   "audio/x-wav": [".wav"],
   "audio/webm": [".webm"],
+  // Chrome sometimes uses video/webm for audio files, and we can still process them as audio only files
+  "video/webm": [".webm"],
 } as const;
 
 // Webhook trigger endpoint (skeleton) response type
@@ -336,15 +342,16 @@ const USER_MESSAGE_ORIGINS = [
   "transcript",
   "triggered_programmatic",
   "triggered",
+  "wakeup",
   "web",
   "zapier",
   "zendesk",
   "onboarding_conversation",
   "agent_sidekick",
   "project_kickoff",
-  "reinforced_agent_notification",
   "reinforced_skill_notification",
   "reinforcement",
+  "branch_anchor",
 ] as const;
 
 const UserMessageOriginEnumSchema = z.enum(USER_MESSAGE_ORIGINS);
@@ -680,14 +687,11 @@ const WhitelistableFeaturesSchema = FlexibleEnumSchema<
   | "agent_management_tool"
   | "custom_model_feature"
   | "anthropic_vertex_fallback"
-  | "ask_user_question_tool"
   | "audit_logs"
   | "claude_4_5_opus_feature"
   | "claude_4_opus_feature"
   | "confluence_tool"
-  | "conversation_branches"
   | "sessions_branching"
-  | "project_todo"
   | "projects"
   | "databricks_tool"
   | "deepseek_feature"
@@ -703,8 +707,9 @@ const WhitelistableFeaturesSchema = FlexibleEnumSchema<
   | "dust_spa"
   | "fireworks_new_model_feature"
   | "gemini_3_1_pro_feature"
-  | "gong_tool"
+  | "clari_copilot_mcp"
   | "google_sheets_tool"
+  | "gpt_image_2_feature"
   | "hootl_subscriptions"
   | "http_client_tool"
   | "index_private_slack_channel"
@@ -716,7 +721,7 @@ const WhitelistableFeaturesSchema = FlexibleEnumSchema<
   | "netsuite_mcp"
   | "noop_model_feature"
   | "notion_private_integration"
-  | "official_notion_mcp"
+  | "allow_old_notion_mcp"
   | "openai_o1_custom_assistants_feature"
   | "openai_o1_feature"
   | "openai_o1_high_reasoning_feature"
@@ -724,21 +729,25 @@ const WhitelistableFeaturesSchema = FlexibleEnumSchema<
   | "power_bi_mcp"
   | "reinforced_agents"
   | "reinforcement_ui"
+  | "self_improving_skills_report_usage"
   | "metronome_billing"
+  | "plan_mode"
   | "poke_mcp"
   | "restrict_agents_publishing"
   | "restrict_agents_publishing_to_admins"
   | "salesforce_synced_queries"
   | "salesforce_tool"
+  | "sandbox_dsbx_tools"
   | "sandbox_tools"
+  | "sandbox_workspace_admin"
   | "self_created_slack_app_connector_rollout"
   | "show_debug_tools"
-  | "skill_builder_instructions_html"
   | "slack_bot_mcp"
   | "slack_enhanced_default_agent"
   | "slack_message_splitting"
   | "slideshow"
   | "snowflake_tool"
+  | "skills_as_user_messages"
   | "run_tools_from_prompt"
   | "usage_data_api"
   | "xai_feature"
@@ -746,8 +755,13 @@ const WhitelistableFeaturesSchema = FlexibleEnumSchema<
   | "anthropic_reasoning_token_count"
   | "collapsible_messages"
   | "use_dust_keys"
-  | "enable_compaction"
-  | "enable_steering"
+  | "browser_extension_mcp_tools"
+  | "sensitivity_labels"
+  | "conversation_search_indexing"
+  | "conversation_search_read"
+  | "new_file_explorer"
+  | "use_vertex_for_anthropic_models"
+  | "metronome_billing_usage_page"
 >();
 
 export type WhitelistableFeature = z.infer<typeof WhitelistableFeaturesSchema>;
@@ -765,6 +779,7 @@ const LightWorkspaceSchema = z.object({
   segmentation: WorkspaceSegmentationSchema,
   whiteListedProviders: ModelProviderIdSchema.array().nullable(),
   defaultEmbeddingProvider: EmbeddingProviderIdSchema.nullable(),
+  regionalModelsOnly: z.boolean().default(false),
 });
 
 export type LightWorkspaceType = z.infer<typeof LightWorkspaceSchema>;
@@ -1595,6 +1610,16 @@ const UserMessageNewEventSchema = z.object({
 });
 export type UserMessageNewEvent = z.infer<typeof UserMessageNewEventSchema>;
 
+// Event sent when a pending user message is promoted to visible.
+const UserMessagePromotedEventSchema = z.object({
+  type: z.literal("user_message_promoted"),
+  created: z.number(),
+  messageId: z.string(),
+});
+export type UserMessagePromotedEvent = z.infer<
+  typeof UserMessagePromotedEventSchema
+>;
+
 // Event sent when a new message is created (empty) and the agent is about to be executed.
 const AgentMessageNewEventSchema = z.object({
   type: z.literal("agent_message_new"),
@@ -1615,29 +1640,41 @@ export type ConversationTitleEvent = z.infer<
   typeof ConversationTitleEventSchema
 >;
 
+export const ConversationEventDataSchema = z.union([
+  UserMessageNewEventSchema,
+  UserMessagePromotedEventSchema,
+  AgentMessageNewEventSchema,
+  AgentMessageDoneEventSchema,
+  ConversationTitleEventSchema,
+]);
+export type ConversationEventData = z.infer<typeof ConversationEventDataSchema>;
+
 const ConversationEventTypeSchema = z.object({
   eventId: z.string(),
-  data: z.union([
-    UserMessageNewEventSchema,
-    AgentMessageNewEventSchema,
-    AgentMessageDoneEventSchema,
-    ConversationTitleEventSchema,
-  ]),
+  data: ConversationEventDataSchema,
 });
 
 export type ConversationEventType = z.infer<typeof ConversationEventTypeSchema>;
 
+export const AgentMessageEventDataSchema = z.union([
+  AgentActionSpecificEventSchema,
+  AgentActionSuccessEventSchema,
+  AgentContextPrunedEventSchema,
+  AgentErrorEventSchema,
+  AgentGenerationCancelledEventSchema,
+  AgentMessageDoneEventSchema,
+  AgentMessageGracefullyStoppedEventSchema,
+  AgentMessageSuccessEventSchema,
+  AgentToolCallStartedEventSchema,
+  GenerationTokensEventSchema,
+  ToolErrorEventSchema,
+  UserMessageErrorEventSchema,
+]);
+export type AgentMessageEventData = z.infer<typeof AgentMessageEventDataSchema>;
+
 const AgentMessageEventTypeSchema = z.object({
   eventId: z.string(),
-  data: z.union([
-    AgentErrorEventSchema,
-    AgentActionSpecificEventSchema,
-    AgentToolCallStartedEventSchema,
-    AgentActionSuccessEventSchema,
-    AgentContextPrunedEventSchema,
-    AgentGenerationCancelledEventSchema,
-    GenerationTokensEventSchema,
-  ]),
+  data: AgentMessageEventDataSchema,
 });
 
 export type AgentMessageEventType = z.infer<typeof AgentMessageEventTypeSchema>;
@@ -1707,6 +1744,7 @@ const APIErrorTypeSchema = FlexibleEnumSchema<
   | "personal_workspace_not_found"
   | "plan_limit_error"
   | "plan_message_limit_exceeded"
+  | "credits_exhausted"
   | "plugin_execution_failed"
   | "plugin_not_found"
   | "provider_auth_error"
@@ -2031,6 +2069,14 @@ export const PatchAgentConfigurationRequestSchema = z.object({
 
 export type PatchAgentConfigurationRequestType = z.infer<
   typeof PatchAgentConfigurationRequestSchema
+>;
+
+export const DeleteAgentConfigurationResponseSchema = z.object({
+  success: z.boolean(),
+});
+
+export type DeleteAgentConfigurationResponseType = z.infer<
+  typeof DeleteAgentConfigurationResponseSchema
 >;
 
 export const GetAgentConfigurationYAMLExportResponseSchema = z.string();
@@ -2600,6 +2646,9 @@ export const ProjectMetadataSchema = z.object({
   updatedAt: z.number(),
   spaceId: z.string(),
   description: z.string().nullable(),
+  archivedAt: z.number().nullable().optional(),
+  todoGenerationEnabled: z.boolean().optional(),
+  lastTodoAnalysisAt: z.number().nullable().optional(),
   members: z.array(z.string()),
 });
 export type ProjectMetadataType = z.infer<typeof ProjectMetadataSchema>;
@@ -2609,6 +2658,47 @@ export const GetSpaceMetadataResponseSchema = z.object({
 });
 export type GetSpaceMetadataResponseType = z.infer<
   typeof GetSpaceMetadataResponseSchema
+>;
+
+export const ProjectMountFileEntrySchema = z.object({
+  isDirectory: z.literal(false),
+  fileName: z.string(),
+  path: z.string(),
+  sizeBytes: z.number(),
+  lastModifiedMs: z.number(),
+  contentType: z.string(),
+  fileId: z.string().nullable(),
+  thumbnailUrl: z.string().nullable(),
+  signedDownloadUrl: z.string().nullable(),
+});
+export type ProjectMountFileEntryType = z.infer<
+  typeof ProjectMountFileEntrySchema
+>;
+
+export const ProjectMountDirectoryEntrySchema = z.object({
+  isDirectory: z.literal(true),
+  fileName: z.string(),
+  path: z.string(),
+  sizeBytes: z.number(),
+  lastModifiedMs: z.number(),
+});
+export type ProjectMountDirectoryEntryType = z.infer<
+  typeof ProjectMountDirectoryEntrySchema
+>;
+
+export const ProjectMountListEntrySchema = z.discriminatedUnion("isDirectory", [
+  ProjectMountDirectoryEntrySchema,
+  ProjectMountFileEntrySchema,
+]);
+export type ProjectMountListEntryType = z.infer<
+  typeof ProjectMountListEntrySchema
+>;
+
+export const GetProjectFilesResponseSchema = z.object({
+  files: z.array(ProjectMountListEntrySchema),
+});
+export type GetProjectFilesResponseType = z.infer<
+  typeof GetProjectFilesResponseSchema
 >;
 
 const GetDocumentsResponseSchema = z.object({
@@ -2903,6 +2993,7 @@ export const GetAnalyticsExportRequestSchema = z
     startDate: AnalyticsDateSchema,
     endDate: AnalyticsDateSchema,
     timezone: Timezone.optional(),
+    format: z.enum(["csv", "json"]).optional(),
   })
   .refine((d) => d.startDate <= d.endDate, {
     message: "startDate must be before or equal to endDate",
@@ -3171,6 +3262,7 @@ const InternalAllowedIconSchema = FlexibleEnumSchema<
   | "BigQueryLogo"
   | "ToolsIcon"
   | "CanvaLogo"
+  | "ClariLogo"
   | "CommandLineIcon"
   | "ConfluenceLogo"
   | "DriveLogo"
@@ -3423,6 +3515,7 @@ export type GetMCPServerViewsQueryType = z.infer<
 >;
 
 export const CallMCPToolRequestBodySchema = z.object({
+  serverViewId: z.string(),
   toolName: z.string(),
   arguments: z.record(z.unknown()).optional(),
 });

@@ -3,6 +3,7 @@ import { runOnRedis } from "@app/lib/api/redis";
 import type { Authenticator } from "@app/lib/auth";
 import type { SandboxResource } from "@app/lib/resources/sandbox_resource";
 import logger from "@app/logger/logger";
+import type { AgentMCPActionType } from "@app/types/actions";
 import type { AgentConfigurationType } from "@app/types/assistant/agent";
 import type {
   AgentMessageType,
@@ -18,11 +19,14 @@ export const SANDBOX_TOKEN_PREFIX = "sbt-";
 const SandboxExecTokenPayloadSchema = z.object({
   wId: z.string(),
   cId: z.string(),
-  uId: z.string(),
+  // Optional: omitted when the conversation is driven by a non-human actor
+  // (e.g. a Slack bot user with no associated Dust user).
+  uId: z.string().optional(),
   aId: z.string(),
   mId: z.string(),
   sbId: z.string(),
   execId: z.string(),
+  actionId: z.string(),
 });
 
 export type SandboxExecTokenPayload = z.infer<
@@ -98,6 +102,7 @@ export async function generateSandboxExecToken(
     conversation,
     sandbox,
     execId,
+    sandboxAction,
     expiryMs = 2 * 60 * 1000, // Default to 2 minutes
   }: {
     agentConfiguration: AgentConfigurationType;
@@ -105,16 +110,18 @@ export async function generateSandboxExecToken(
     conversation: ConversationType;
     sandbox: SandboxResource;
     execId: string;
+    sandboxAction: AgentMCPActionType;
     expiryMs?: number;
   }
 ): Promise<string> {
   const payload: SandboxExecTokenPayload = {
     wId: auth.getNonNullableWorkspace().sId,
     cId: conversation.sId,
-    uId: auth.getNonNullableUser().sId,
+    uId: auth.user()?.sId,
     aId: agentConfiguration.sId,
     mId: agentMessage.sId,
     sbId: sandbox.sId,
+    actionId: sandboxAction.sId,
     execId,
   };
 

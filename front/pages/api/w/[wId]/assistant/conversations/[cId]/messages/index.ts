@@ -127,10 +127,10 @@ import { fetchConversationMessages } from "@app/lib/api/assistant/messages";
 import { withSessionAuthenticationForWorkspace } from "@app/lib/api/auth_wrappers";
 import { getPaginationParams } from "@app/lib/api/pagination";
 import type { Authenticator } from "@app/lib/auth";
-import { getFeatureFlags } from "@app/lib/auth";
+import { SkillResource } from "@app/lib/resources/skill/skill_resource";
+import { extractUniqueSkillIds } from "@app/lib/skills/format";
 import { concurrentExecutor } from "@app/lib/utils/async_utils";
 import { getStatsDClient } from "@app/lib/utils/statsd";
-
 import { apiError } from "@app/logger/withlogging";
 import { InternalPostMessagesRequestBodySchema } from "@app/types/api/internal/assistant";
 import type {
@@ -144,9 +144,8 @@ import type { ContentFragmentType } from "@app/types/content_fragment";
 import { isContentFragmentType } from "@app/types/content_fragment";
 import type { WithAPIErrorResponse } from "@app/types/error";
 import { removeNulls } from "@app/types/shared/utils/general";
-import { isLeft } from "fp-ts/lib/Either";
-import * as reporter from "io-ts-reporters";
 import type { NextApiRequest, NextApiResponse } from "next";
+import { fromError } from "zod-validation-error";
 
 export type PostMessagesResponseBody = {
   message: UserMessageType;
@@ -196,7 +195,7 @@ async function handler(
     case "GET":
       const messageStartTime = performance.now();
 
-      const paginationRes = getPaginationParams(req, {
+      const paginationRes = getPaginationParams(req.query, {
         defaultLimit: 10,
         defaultOrderColumn: "rank",
         defaultOrderDirection: "desc",
@@ -250,12 +249,12 @@ async function handler(
       break;
 
     case "POST":
-      const bodyValidation = InternalPostMessagesRequestBodySchema.decode(
+      const bodyValidation = InternalPostMessagesRequestBodySchema.safeParse(
         req.body
       );
 
-      if (isLeft(bodyValidation)) {
-        const pathError = reporter.formatValidationErrors(bodyValidation.left);
+      if (!bodyValidation.success) {
+        const pathError = fromError(bodyValidation.error).toString();
 
         return apiError(req, res, {
           status_code: 400,
@@ -267,7 +266,7 @@ async function handler(
       }
 
       const { content, context, mentions, skipToolsValidation } =
-        bodyValidation.right;
+        bodyValidation.data;
 
       if (context.clientSideMCPServerIds) {
         const hasServerAccess = await concurrentExecutor(
@@ -291,32 +290,45 @@ async function handler(
         }
       }
 
-      const [conversationRes, featureFlags] = await Promise.all([
-        getConversation(auth, conversationId),
-        getFeatureFlags(auth),
-      ]);
+      const conversationRes = await getConversation(auth, conversationId);
 
       if (conversationRes.isErr()) {
         return apiErrorForConversation(req, res, conversationRes.error);
       }
 
-      const steeringEnabled = featureFlags.includes("enable_steering");
+      if (content.length === 0 && mentions.length === 0) {
+        return apiError(req, res, {
+          status_code: 400,
+          api_error: {
+            type: "invalid_request_error",
+            message:
+              "Message content cannot be empty unless at least one mention is provided.",
+          },
+        });
+      }
 
-      if (content.length === 0) {
-        if (!steeringEnabled || mentions.length === 0) {
+      const conversation = conversationRes.value;
+
+      const selectedSkillIds = extractUniqueSkillIds(content);
+      if (selectedSkillIds.length > 0) {
+        const skills = await SkillResource.fetchByIds(auth, selectedSkillIds);
+
+        const r = await SkillResource.upsertConversationSkills(auth, {
+          conversationId: conversation.id,
+          skills,
+          enabled: true,
+        });
+
+        if (r.isErr()) {
           return apiError(req, res, {
-            status_code: 400,
+            status_code: 500,
             api_error: {
-              type: "invalid_request_error",
-              message: steeringEnabled
-                ? "Message content cannot be empty unless at least one mention is provided."
-                : "Message content cannot be empty.",
+              type: "internal_server_error",
+              message: "Failed to add skills to conversation",
             },
           });
         }
       }
-
-      const conversation = conversationRes.value;
 
       // Find all the contentFragments that are above the user message.
       // Messages may have multiple versions, so we need to return only the max version of each message.
@@ -362,7 +374,6 @@ async function handler(
           clientSideMCPServerIds: context.clientSideMCPServerIds ?? [],
         },
         skipToolsValidation: skipToolsValidation ?? false,
-        steeringEnabled: featureFlags.includes("enable_steering"),
       });
 
       if (messageRes.isErr()) {

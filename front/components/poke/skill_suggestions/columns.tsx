@@ -22,22 +22,25 @@ function truncate(text: string | null, maxLength: number): string {
 function ClickableCell({
   text,
   maxLength,
-  onClick,
+  href,
 }: {
   text: string | null;
   maxLength: number;
-  onClick: () => void;
+  href: string;
 }) {
   const truncated = truncate(text, maxLength);
   const isTruncated = text && text.length > maxLength;
+  if (!isTruncated) {
+    return <span>{truncated}</span>;
+  }
   return (
-    <span
-      onClick={isTruncated ? onClick : undefined}
-      className={isTruncated ? "cursor-pointer hover:underline" : ""}
-      title={isTruncated ? "Click to see full content" : undefined}
+    <a
+      href={href}
+      className="cursor-pointer hover:underline"
+      title="Click to see full content"
     >
       {truncated}
-    </span>
+    </a>
   );
 }
 
@@ -77,8 +80,7 @@ async function deleteSuggestion(
 export function makeColumnsForSkillSuggestions(
   owner: LightWorkspaceType,
   skillId: string,
-  onSuggestionDeleted: () => Promise<void>,
-  onSuggestionClick: (suggestion: SkillSuggestionType) => void
+  onSuggestionDeleted: () => Promise<void>
 ): ColumnDef<SkillSuggestionType>[] {
   return [
     {
@@ -86,6 +88,16 @@ export function makeColumnsForSkillSuggestions(
       header: ({ column }) => (
         <PokeColumnSortableHeader column={column} label="sId" />
       ),
+      cell: ({ row }) => {
+        return (
+          <a
+            href={`/${owner.sId}/suggestions/${row.original.sId}`}
+            className="text-action-500 hover:underline"
+          >
+            {row.original.sId}
+          </a>
+        );
+      },
     },
     {
       accessorKey: "kind",
@@ -139,18 +151,46 @@ export function makeColumnsForSkillSuggestions(
       },
     },
     {
-      accessorKey: "sourceConversationId",
+      accessorKey: "sourceConversationsCount",
       header: ({ column }) => (
-        <PokeColumnSortableHeader column={column} label="Conversation" />
+        <PokeColumnSortableHeader
+          column={column}
+          label="Source Conversations"
+        />
       ),
       cell: ({ row }) => {
-        const conversationId = row.original.sourceConversationId;
+        const { visibleSourceConversationIds } = row.original;
+        if (visibleSourceConversationIds.length === 0) {
+          return "-";
+        }
+        return (
+          <div className="flex flex-col gap-1">
+            {visibleSourceConversationIds.map((conversationId) => (
+              <a
+                key={conversationId}
+                href={`/poke/${owner.sId}/conversation/${conversationId}`}
+                className="text-action-500 hover:underline"
+              >
+                {conversationId}
+              </a>
+            ))}
+          </div>
+        );
+      },
+    },
+    {
+      accessorKey: "notificationConversationId",
+      header: ({ column }) => (
+        <PokeColumnSortableHeader column={column} label="Notification" />
+      ),
+      cell: ({ row }) => {
+        const conversationId = row.original.notificationConversationId;
         if (!conversationId) {
           return "-";
         }
         return (
           <a
-            href={`/${owner.sId}/conversation/${conversationId}`}
+            href={`/poke/${owner.sId}/conversation/${conversationId}`}
             className="text-action-500 hover:underline"
           >
             {conversationId}
@@ -168,7 +208,7 @@ export function makeColumnsForSkillSuggestions(
           <ClickableCell
             text={row.original.analysis}
             maxLength={MAX_ANALYSIS_LENGTH}
-            onClick={() => onSuggestionClick(row.original)}
+            href={`/${owner.sId}/suggestions/${row.original.sId}`}
           />
         );
       },
@@ -183,6 +223,28 @@ export function makeColumnsForSkillSuggestions(
       },
     },
     {
+      accessorKey: "updatedAt",
+      header: ({ column }) => (
+        <PokeColumnSortableHeader column={column} label="Updated at" />
+      ),
+      cell: ({ row }) => {
+        return formatTimestampToFriendlyDate(row.original.updatedAt);
+      },
+    },
+    {
+      accessorKey: "updatedBy",
+      header: ({ column }) => (
+        <PokeColumnSortableHeader column={column} label="Updated by" />
+      ),
+      cell: ({ row }) => {
+        const updatedBy = row.original.updatedBy;
+        if (!updatedBy) {
+          return "-";
+        }
+        return <span title={updatedBy.email}>{updatedBy.fullName}</span>;
+      },
+    },
+    {
       id: "content",
       header: "Content",
       cell: ({ row }) => {
@@ -191,7 +253,7 @@ export function makeColumnsForSkillSuggestions(
           <ClickableCell
             text={content}
             maxLength={MAX_CONTENT_LENGTH}
-            onClick={() => onSuggestionClick(row.original)}
+            href={`/${owner.sId}/suggestions/${row.original.sId}`}
           />
         );
       },

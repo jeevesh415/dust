@@ -104,6 +104,7 @@
  *       401:
  *         description: Unauthorized
  */
+// @migration-status: MIGRATED_TO_HONO
 import type { DataSourcesUsageByAgent } from "@app/lib/api/agent_data_sources";
 import {
   getDataSourcesUsageByCategory,
@@ -126,9 +127,8 @@ import type {
   DataSourceViewType,
 } from "@app/types/data_source_view";
 import type { WithAPIErrorResponse } from "@app/types/error";
-import { isLeft } from "fp-ts/lib/Either";
-import * as reporter from "io-ts-reporters";
 import type { NextApiRequest, NextApiResponse } from "next";
+import { fromError } from "zod-validation-error";
 
 export type GetSpaceDataSourceViewsResponseBody<
   IncludeDetails extends boolean = boolean,
@@ -274,20 +274,18 @@ async function handler(
         });
       }
 
-      const bodyValidation = PostDataSourceViewSchema.decode(req.body);
-      if (isLeft(bodyValidation)) {
-        const pathError = reporter.formatValidationErrors(bodyValidation.left);
-
+      const bodyValidation = PostDataSourceViewSchema.safeParse(req.body);
+      if (!bodyValidation.success) {
         return apiError(req, res, {
           status_code: 400,
           api_error: {
             type: "invalid_request_error",
-            message: `Invalid request body: ${pathError}`,
+            message: `Invalid request body: ${fromError(bodyValidation.error).toString()}`,
           },
         });
       }
 
-      const { dataSourceId, parentsIn } = bodyValidation.right;
+      const { dataSourceId, parentsIn } = bodyValidation.data;
 
       // Create a new view.
       const dataSource = await DataSourceResource.fetchById(auth, dataSourceId);

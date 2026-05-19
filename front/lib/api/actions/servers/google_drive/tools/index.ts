@@ -9,6 +9,11 @@ import {
   makeFileAuthorizationError,
   makePersonalAuthenticationError,
 } from "@app/lib/actions/mcp_internal_actions/utils";
+import { extractTextFromBuffer } from "@app/lib/actions/mcp_internal_actions/utils/attachment_processing";
+import {
+  getFileFromConversationAttachment,
+  sanitizeFilename,
+} from "@app/lib/actions/mcp_internal_actions/utils/file_utils";
 import { formatDocumentStructure } from "@app/lib/api/actions/servers/google_drive/format_document";
 import { formatPresentationStructure } from "@app/lib/api/actions/servers/google_drive/format_presentation";
 import {
@@ -24,9 +29,53 @@ import {
   MAX_FILE_SIZE,
   SUPPORTED_MIMETYPES,
 } from "@app/lib/api/actions/servers/google_drive/metadata";
+import { resolveDocOperations } from "@app/lib/api/actions/servers/google_drive/resolution/docs_resolver";
+import { resolveSpreadsheetOperations } from "@app/lib/api/actions/servers/google_drive/resolution/sheets_resolver";
+import { resolvePresentationOperations } from "@app/lib/api/actions/servers/google_drive/resolution/slides_resolver";
+import logger from "@app/logger/logger";
 import { Err, Ok } from "@app/types/shared/result";
 import { normalizeError } from "@app/types/shared/utils/error_utils";
 import { Common } from "googleapis";
+import { Readable } from "stream";
+
+export type BinaryFileResourceBlock = {
+  type: "resource";
+  resource: {
+    blob: string;
+    _meta: { text: string };
+    mimeType: string;
+    uri: string;
+  };
+};
+
+/**
+ * Builds a resource block for a binary Google Drive file so downstream tools
+ * (sandbox upload, file viewer, etc.) can consume the raw bytes alongside any
+ * extracted text. Exported for unit testing.
+ */
+export function buildBinaryFileResource({
+  buffer,
+  fileName,
+  mimeType,
+}: {
+  buffer: Buffer;
+  fileName: string | null | undefined;
+  mimeType: string;
+}): BinaryFileResourceBlock {
+  const safeFileName = sanitizeFilename(fileName ?? "unknown");
+  return {
+    type: "resource",
+    resource: {
+      blob: buffer.toString("base64"),
+      _meta: { text: `File: ${safeFileName}` },
+      mimeType,
+      uri: safeFileName,
+    },
+  };
+}
+
+const EXTRACTION_FAILED_PLACEHOLDER =
+  "[Text extraction failed — file attached as binary resource]";
 
 /**
  * Normalizes GaxiosError code to string for comparison.
@@ -80,6 +129,14 @@ export async function handleFileAccessError(
 
     // Handle general 403 errors with OAuth re-auth
     if (status === "403") {
+      if (authInfo?.extra?.connectionType === "workspace") {
+        return new Err(
+          new MCPError(
+            "The workspace Google Drive credentials are invalid or expired. A workspace admin needs to re-authenticate the Google Drive connection.",
+            { tracked: false }
+          )
+        );
+      }
       return new Ok(
         makePersonalAuthenticationError(
           "google_drive",
@@ -137,12 +194,23 @@ export async function handleFileAccessError(
  * Uses GAxios error typing for cleaner error handling.
  * Returns OAuth re-auth prompt for 403 errors, or generic error for others.
  */
-function handleDriveAccessError(err: unknown): ToolHandlerResult {
+function handleDriveAccessError(
+  err: unknown,
+  authInfo?: Pick<ToolHandlerExtra, "authInfo">["authInfo"]
+): ToolHandlerResult {
   if (err instanceof Common.GaxiosError) {
     const status = normalizeCode(err.code);
 
     // Handle 403 errors with OAuth re-auth
     if (status === "403") {
+      if (authInfo?.extra?.connectionType === "workspace") {
+        return new Err(
+          new MCPError(
+            "The workspace Google Drive credentials are invalid or expired. A workspace admin needs to re-authenticate the Google Drive connection.",
+            { tracked: false }
+          )
+        );
+      }
       return new Ok(
         makePersonalAuthenticationError(
           "google_drive",
@@ -357,6 +425,7 @@ const handlers: ToolHandlers<typeof GOOGLE_DRIVE_TOOLS_METADATA> = {
       }
 
       let content: string;
+      let binaryResource: BinaryFileResourceBlock | null = null;
 
       switch (file.mimeType) {
         case "application/vnd.google-apps.document":
@@ -391,6 +460,48 @@ const handlers: ToolHandlers<typeof GOOGLE_DRIVE_TOOLS_METADATA> = {
           content = downloadRes.data;
           break;
         }
+        case "application/pdf":
+        case "application/vnd.openxmlformats-officedocument.presentationml.presentation":
+        case "application/vnd.openxmlformats-officedocument.wordprocessingml.document": {
+          // Binary documents: download as an arraybuffer, extract text via Tika
+          // (OCR enabled), and always attach the raw bytes as a resource block
+          // so downstream tools can consume the file even when extraction yields
+          // little or nothing.
+          const downloadRes = await drive.files.get(
+            { fileId, alt: "media" },
+            { responseType: "arraybuffer" }
+          );
+          if (!(downloadRes.data instanceof ArrayBuffer)) {
+            return new Err(
+              new MCPError("Failed to download file content as arraybuffer")
+            );
+          }
+          const buffer = Buffer.from(downloadRes.data);
+
+          const extractionResult = await extractTextFromBuffer(
+            buffer,
+            file.mimeType
+          );
+          if (extractionResult.isErr()) {
+            logger.warn(
+              {
+                fileId,
+                mimeType: file.mimeType,
+                error: extractionResult.error,
+              },
+              "Text extraction failed for Google Drive binary file"
+            );
+          }
+          content = extractionResult.isOk()
+            ? extractionResult.value
+            : EXTRACTION_FAILED_PLACEHOLDER;
+          binaryResource = buildBinaryFileResource({
+            buffer,
+            fileName: file.name,
+            mimeType: file.mimeType,
+          });
+          break;
+        }
         default:
           return new Err(
             new MCPError(`Unsupported file type: ${file.mimeType}`, {
@@ -408,7 +519,10 @@ const handlers: ToolHandlers<typeof GOOGLE_DRIVE_TOOLS_METADATA> = {
       const hasMore = endIndex < content.length;
       const nextOffset = hasMore ? endIndex : undefined;
 
-      return new Ok([
+      const responseBlocks: (
+        | { type: "text"; text: string }
+        | BinaryFileResourceBlock
+      )[] = [
         {
           type: "text" as const,
           text: JSON.stringify(
@@ -433,9 +547,15 @@ const handlers: ToolHandlers<typeof GOOGLE_DRIVE_TOOLS_METADATA> = {
             2
           ),
         },
-      ]);
+      ];
+
+      if (binaryResource) {
+        responseBlocks.push(binaryResource);
+      }
+
+      return new Ok(responseBlocks);
     } catch (err) {
-      return handleDriveAccessError(err);
+      return handleDriveAccessError(err, authInfo);
     }
   },
 
@@ -454,7 +574,7 @@ const handlers: ToolHandlers<typeof GOOGLE_DRIVE_TOOLS_METADATA> = {
         { type: "text" as const, text: JSON.stringify(res.data, null, 2) },
       ]);
     } catch (err) {
-      return handleDriveAccessError(err);
+      return handleDriveAccessError(err, authInfo);
     }
   },
 
@@ -484,7 +604,7 @@ const handlers: ToolHandlers<typeof GOOGLE_DRIVE_TOOLS_METADATA> = {
         { type: "text" as const, text: JSON.stringify(res.data, null, 2) },
       ]);
     } catch (err) {
-      return handleDriveAccessError(err);
+      return handleDriveAccessError(err, authInfo);
     }
   },
   list_comments: async (
@@ -513,7 +633,7 @@ const handlers: ToolHandlers<typeof GOOGLE_DRIVE_TOOLS_METADATA> = {
         },
       ]);
     } catch (err) {
-      return handleDriveAccessError(err);
+      return handleDriveAccessError(err, authInfo);
     }
   },
   get_document_structure: async (
@@ -526,16 +646,11 @@ const handlers: ToolHandlers<typeof GOOGLE_DRIVE_TOOLS_METADATA> = {
     }
 
     try {
-      const res = await docs.documents.get({
-        documentId,
-      });
-
-      // Format as markdown for better readability
+      const res = await docs.documents.get({ documentId });
       const markdown = formatDocumentStructure(res.data, offset, limit);
-
       return new Ok([{ type: "text" as const, text: markdown }]);
     } catch (err) {
-      return handleDriveAccessError(err);
+      return handleDriveAccessError(err, authInfo);
     }
   },
   get_presentation_structure: async (
@@ -548,19 +663,13 @@ const handlers: ToolHandlers<typeof GOOGLE_DRIVE_TOOLS_METADATA> = {
     }
 
     try {
-      const res = await slides.presentations.get({
-        presentationId,
-      });
-
-      // Format as markdown for better readability
+      const res = await slides.presentations.get({ presentationId });
       const markdown = formatPresentationStructure(res.data, offset, limit);
-
       return new Ok([{ type: "text" as const, text: markdown }]);
     } catch (err) {
-      return handleDriveAccessError(err);
+      return handleDriveAccessError(err, authInfo);
     }
   },
-
   list_file_permissions: async ({ fileId, capabilities }, { authInfo }) => {
     const shareError = await ensureCapability(
       "canShare",
@@ -600,7 +709,7 @@ const handlers: ToolHandlers<typeof GOOGLE_DRIVE_TOOLS_METADATA> = {
         },
       ]);
     } catch (err) {
-      return handleDriveAccessError(err);
+      return handleDriveAccessError(err, authInfo);
     }
   },
 };
@@ -638,7 +747,7 @@ const writeHandlers: ToolHandlers<typeof GOOGLE_DRIVE_WRITE_TOOLS_METADATA> = {
         },
       ]);
     } catch (err) {
-      return handleDriveAccessError(err);
+      return handleDriveAccessError(err, authInfo);
     }
   },
 
@@ -672,7 +781,7 @@ const writeHandlers: ToolHandlers<typeof GOOGLE_DRIVE_WRITE_TOOLS_METADATA> = {
         },
       ]);
     } catch (err) {
-      return handleDriveAccessError(err);
+      return handleDriveAccessError(err, authInfo);
     }
   },
 
@@ -706,7 +815,7 @@ const writeHandlers: ToolHandlers<typeof GOOGLE_DRIVE_WRITE_TOOLS_METADATA> = {
         },
       ]);
     } catch (err) {
-      return handleDriveAccessError(err);
+      return handleDriveAccessError(err, authInfo);
     }
   },
 
@@ -742,7 +851,7 @@ const writeHandlers: ToolHandlers<typeof GOOGLE_DRIVE_WRITE_TOOLS_METADATA> = {
         fields: "id,name,mimeType,webViewLink",
       });
     } catch (err) {
-      return handleDriveAccessError(err);
+      return handleDriveAccessError(err, authInfo);
     }
 
     // Construct appropriate URL based on file type
@@ -874,7 +983,7 @@ const writeHandlers: ToolHandlers<typeof GOOGLE_DRIVE_WRITE_TOOLS_METADATA> = {
   },
 
   update_document: async (
-    { documentId, requests, capabilities },
+    { documentId, operations, capabilities },
     { authInfo, agentLoopContext }
   ) => {
     const accessError = await ensureCapability(
@@ -892,10 +1001,18 @@ const writeHandlers: ToolHandlers<typeof GOOGLE_DRIVE_WRITE_TOOLS_METADATA> = {
     }
 
     try {
+      const doc = await docs.documents.get({ documentId });
+      const resolved = resolveDocOperations(doc.data, operations);
+      if (resolved.isErr()) {
+        return new Err(
+          new MCPError(resolved.error.message, { tracked: false })
+        );
+      }
+
       const res = await docs.documents.batchUpdate(
         {
           documentId,
-          requestBody: { requests },
+          requestBody: { requests: resolved.value },
         },
         {}
       );
@@ -982,7 +1099,7 @@ const writeHandlers: ToolHandlers<typeof GOOGLE_DRIVE_WRITE_TOOLS_METADATA> = {
   },
 
   update_spreadsheet: async (
-    { spreadsheetId, requests, capabilities },
+    { spreadsheetId, operations, capabilities },
     { authInfo, agentLoopContext }
   ) => {
     const accessError = await ensureCapability(
@@ -1000,13 +1117,49 @@ const writeHandlers: ToolHandlers<typeof GOOGLE_DRIVE_WRITE_TOOLS_METADATA> = {
     }
 
     try {
-      const res = await sheets.spreadsheets.batchUpdate(
-        {
-          spreadsheetId,
-          requestBody: { requests: requests as any },
-        },
-        {}
+      const spreadsheet = await sheets.spreadsheets.get({ spreadsheetId });
+      const resolved = resolveSpreadsheetOperations(
+        spreadsheet.data,
+        operations
       );
+      if (resolved.isErr()) {
+        return new Err(
+          new MCPError(resolved.error.message, { tracked: false })
+        );
+      }
+      const { valueUpdates, batchRequests } = resolved.value;
+
+      // Cell-value writes and structural ops go through different Sheets APIs,
+      // so we issue them sequentially. If the structural batch fails after the
+      // value batch succeeded, the value writes will already have applied —
+      // the model will see the error in the response and can retry the
+      // structural ops alone.
+      let valueAppliedCount = 0;
+      if (valueUpdates.length > 0) {
+        const valueRes = await sheets.spreadsheets.values.batchUpdate({
+          spreadsheetId,
+          requestBody: {
+            valueInputOption: "USER_ENTERED",
+            data: valueUpdates.map((v) => ({
+              range: v.range,
+              values: v.values,
+            })),
+          },
+        });
+        valueAppliedCount = valueRes.data.totalUpdatedCells ?? 0;
+      }
+
+      let batchAppliedCount = 0;
+      if (batchRequests.length > 0) {
+        const batchRes = await sheets.spreadsheets.batchUpdate(
+          {
+            spreadsheetId,
+            requestBody: { requests: batchRequests },
+          },
+          {}
+        );
+        batchAppliedCount = batchRes.data.replies?.length ?? 0;
+      }
 
       return new Ok([
         {
@@ -1014,7 +1167,8 @@ const writeHandlers: ToolHandlers<typeof GOOGLE_DRIVE_WRITE_TOOLS_METADATA> = {
           text: JSON.stringify(
             {
               spreadsheetId,
-              appliedUpdates: res.data.replies?.length ?? 0,
+              appliedBatchUpdates: batchAppliedCount,
+              updatedCells: valueAppliedCount,
               url: `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
             },
             null,
@@ -1036,7 +1190,7 @@ const writeHandlers: ToolHandlers<typeof GOOGLE_DRIVE_WRITE_TOOLS_METADATA> = {
   },
 
   update_presentation: async (
-    { presentationId, requests, capabilities },
+    { presentationId, operations, capabilities },
     { authInfo, agentLoopContext }
   ) => {
     const accessError = await ensureCapability(
@@ -1054,9 +1208,20 @@ const writeHandlers: ToolHandlers<typeof GOOGLE_DRIVE_WRITE_TOOLS_METADATA> = {
     }
 
     try {
+      const presentation = await slides.presentations.get({ presentationId });
+      const resolved = resolvePresentationOperations(
+        presentation.data,
+        operations
+      );
+      if (resolved.isErr()) {
+        return new Err(
+          new MCPError(resolved.error.message, { tracked: false })
+        );
+      }
+
       const res = await slides.presentations.batchUpdate({
         presentationId,
-        requestBody: { requests },
+        requestBody: { requests: resolved.value },
       });
 
       return new Ok([
@@ -1254,6 +1419,70 @@ const writeHandlers: ToolHandlers<typeof GOOGLE_DRIVE_WRITE_TOOLS_METADATA> = {
         ),
       },
     ]);
+  },
+
+  upload_file: async (
+    { fileId, parentId, fileName },
+    { auth, authInfo, agentLoopContext }
+  ) => {
+    const drive = await getDriveClient(authInfo);
+    if (!drive) {
+      return new Err(new MCPError("Failed to authenticate with Google Drive"));
+    }
+
+    if (!agentLoopContext) {
+      return new Err(
+        new MCPError("No conversation context available for file access")
+      );
+    }
+
+    try {
+      const fileResult = await getFileFromConversationAttachment(
+        auth,
+        fileId,
+        agentLoopContext
+      );
+
+      if (fileResult.isErr()) {
+        return new Err(new MCPError(fileResult.error));
+      }
+
+      const { buffer, filename, contentType } = fileResult.value;
+
+      const uploadFileName = sanitizeFilename(fileName ?? filename);
+
+      const res = await drive.files.create({
+        requestBody: {
+          name: uploadFileName,
+          ...(parentId ? { parents: [parentId] } : {}),
+        },
+        media: {
+          mimeType: contentType,
+          body: Readable.from(buffer),
+        },
+        fields: "id, name, mimeType, size, webViewLink",
+        supportsAllDrives: true,
+      });
+
+      return new Ok([
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              fileId: res.data.id,
+              name: res.data.name,
+              mimeType: res.data.mimeType,
+              size: res.data.size,
+              url: res.data.webViewLink,
+            },
+            null,
+            2
+          ),
+        },
+      ]);
+    } catch (err) {
+      return handleDriveAccessError(err, authInfo);
+    }
   },
 };
 

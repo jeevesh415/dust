@@ -1,4 +1,5 @@
 /** @ignoreswagger */
+// @migration-status: MIGRATED_TO_HONO
 import {
   buildAuditLogTarget,
   emitAuditLogEvent,
@@ -30,7 +31,7 @@ async function handler(
           status_code: 400,
           api_error: {
             type: "invalid_request_error",
-            message: "You can only leave projects, not regular spaces.",
+            message: "You can only leave Pods, not regular spaces.",
           },
         });
       }
@@ -41,7 +42,7 @@ async function handler(
           status_code: 403,
           api_error: {
             type: "workspace_auth_error",
-            message: "You are not a member of this project.",
+            message: "You are not a member of this Pod.",
           },
         });
       }
@@ -95,7 +96,7 @@ async function handler(
         ],
         context: getAuditLogContext(auth, req),
         metadata: {
-          spaceName: space.name,
+          space_name: space.name,
         },
       });
 

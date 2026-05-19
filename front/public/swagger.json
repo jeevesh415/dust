@@ -65,6 +65,10 @@
       "description": "Triggers"
     },
     {
+      "name": "Skills",
+      "description": "Skills"
+    },
+    {
       "name": "Spaces",
       "description": "Spaces"
     },
@@ -230,8 +234,8 @@
     },
     "/api/v1/w/{wId}/analytics/export": {
       "get": {
-        "summary": "Export workspace analytics as CSV",
-        "description": "Export analytics data for the workspace identified by {wId} in CSV format.",
+        "summary": "Export workspace analytics",
+        "description": "Export analytics data for the workspace identified by {wId} in CSV or JSON format.",
         "tags": [
           "Workspace"
         ],
@@ -297,15 +301,36 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "format",
+            "required": false,
+            "description": "Output format (defaults to csv)",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "csv",
+                "json"
+              ]
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "The analytics data in CSV format",
+            "description": "The analytics data in CSV or JSON format",
             "content": {
               "text/csv": {
                 "schema": {
                   "type": "string"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object"
+                  }
                 }
               }
             }
@@ -314,7 +339,7 @@
             "description": "Invalid request query parameters"
           },
           "403": {
-            "description": "Requires an API key with at least builder role"
+            "description": "Requires an API key with admin scope"
           },
           "405": {
             "description": "Method not supported"
@@ -679,6 +704,25 @@
                       }
                     }
                   },
+                  "skills": {
+                    "type": "array",
+                    "description": "Replaces the skills enabled on the agent configuration.",
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "sId",
+                        "name"
+                      ],
+                      "properties": {
+                        "sId": {
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  },
                   "toolset": {
                     "type": "array",
                     "items": {
@@ -753,6 +797,73 @@
           },
           "405": {
             "description": "Method not supported. Only GET or PATCH is expected."
+          },
+          "500": {
+            "description": "Internal Server Error."
+          }
+        }
+      },
+      "delete": {
+        "summary": "Archive agent configuration",
+        "description": "Archive the agent configuration identified by {sId} in the workspace identified by {wId}. The agent is soft-archived and triggers/editor-group memberships associated with it are disabled.",
+        "tags": [
+          "Agents"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wId",
+            "required": true,
+            "description": "ID of the workspace",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "sId",
+            "required": true,
+            "description": "ID of the agent configuration",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully archived agent configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request. Invalid or missing parameters."
+          },
+          "401": {
+            "description": "Unauthorized. Invalid or missing authentication token."
+          },
+          "403": {
+            "description": "Forbidden. The caller is not allowed to archive this agent."
+          },
+          "404": {
+            "description": "Agent configuration not found."
+          },
+          "405": {
+            "description": "Method not supported. Only GET, PATCH or DELETE is expected."
           },
           "500": {
             "description": "Internal Server Error."
@@ -1344,6 +1455,74 @@
           },
           "500": {
             "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/v1/w/{wId}/assistant/conversations/{cId}/files/{rel}": {
+      "get": {
+        "tags": [
+          "Conversations"
+        ],
+        "summary": "Download a conversation-scoped file by path",
+        "description": "Download a file from a conversation's file system by its scoped path. The path must\nbe conversation-scoped, i.e. start with `conversation/` (as surfaced by agent file\nsystem tools). The file content is streamed directly from the conversation mount.\n",
+        "parameters": [
+          {
+            "name": "wId",
+            "in": "path",
+            "required": true,
+            "description": "ID of the workspace",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "cId",
+            "in": "path",
+            "required": true,
+            "description": "ID of the conversation",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "rel",
+            "in": "path",
+            "required": true,
+            "description": "Conversation-scoped file path, e.g. `conversation/foo.pdf` or\n`conversation/subdir/foo.pdf`. The `conversation/` prefix is required; any other\nscope prefix is rejected. Path traversal segments (`..`) are rejected.\n",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "File content streamed directly.",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or invalid path parameters (e.g. missing or wrong scope prefix)."
+          },
+          "403": {
+            "description": "Resolved path is outside the conversation scope."
+          },
+          "404": {
+            "description": "Conversation or file not found."
+          },
+          "405": {
+            "description": "Method not supported."
           }
         }
       }
@@ -2246,6 +2425,9 @@
           },
           "401": {
             "description": "Unauthorized. Invalid or missing authentication token."
+          },
+          "403": {
+            "description": "Forbidden. Workspace or usage limits exceeded, or access denied."
           },
           "429": {
             "description": "Rate limit exceeded."
@@ -3194,6 +3376,191 @@
           },
           "500": {
             "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/api/v1/w/{wId}/skills": {
+      "get": {
+        "summary": "List skills",
+        "description": "Retrieves the custom skills in the workspace. Active skills are returned by default.",
+        "tags": [
+          "Skills"
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wId",
+            "required": true,
+            "description": "Unique string identifier for the workspace",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "description": "Filter skills by status. Defaults to active.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "active",
+                "archived",
+                "suggested"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Skills available in the workspace.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "skills": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Skill"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request. Missing or invalid parameters."
+          },
+          "401": {
+            "description": "Unauthorized. Invalid or missing authentication token."
+          },
+          "404": {
+            "description": "Workspace not found."
+          },
+          "405": {
+            "description": "Method not supported."
+          }
+        }
+      },
+      "post": {
+        "summary": "Import skills from uploaded files",
+        "description": "Imports skills from uploaded files or ZIP archives into the workspace.",
+        "tags": [
+          "Skills"
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wId",
+            "required": true,
+            "description": "Unique string identifier for the workspace",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "files"
+                ],
+                "properties": {
+                  "files": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "format": "binary"
+                    },
+                    "description": "Skill files or ZIP archives to import."
+                  },
+                  "names": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Optional skill names to import from the uploaded files."
+                  },
+                  "onConflict": {
+                    "type": "string",
+                    "enum": [
+                      "error",
+                      "skip",
+                      "override"
+                    ],
+                    "description": "Conflict handling strategy. Defaults to error."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Skills import result.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "imported": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Skill"
+                      }
+                    },
+                    "updated": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Skill"
+                      }
+                    },
+                    "skipped": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": {
+                            "type": "string"
+                          },
+                          "message": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request. Missing or invalid uploaded files."
+          },
+          "401": {
+            "description": "Unauthorized. Invalid or missing authentication token."
+          },
+          "404": {
+            "description": "Workspace not found."
+          },
+          "405": {
+            "description": "Method not supported."
           }
         }
       }
@@ -6080,7 +6447,8 @@
                     "type": "string",
                     "enum": [
                       "cancel",
-                      "gracefully_stop"
+                      "gracefully_stop",
+                      "interrupt"
                     ]
                   },
                   "messageIds": {
@@ -6506,7 +6874,7 @@
       },
       "patch": {
         "summary": "Update a conversation",
-        "description": "Update a conversation's title, mark it as read, or move it to a different space.",
+        "description": "Update a conversation's title, mark it as read, move it to a different space, or control URL access mode.",
         "tags": [
           "Private Conversations"
         ],
@@ -6571,6 +6939,21 @@
                     "properties": {
                       "spaceId": {
                         "type": "string"
+                      }
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "required": [
+                      "accessMode"
+                    ],
+                    "properties": {
+                      "accessMode": {
+                        "type": "string",
+                        "enum": [
+                          "participants_only",
+                          "workspace_members"
+                        ]
                       }
                     }
                   }
@@ -7512,6 +7895,129 @@
         }
       }
     },
+    "/api/w/{wId}/assistant/conversations/{cId}/wakeups/{wuId}": {
+      "delete": {
+        "summary": "Cancel a wake-up",
+        "description": "Cancel a scheduled wake-up. Only the wake-up owner or a workspace admin can cancel.",
+        "tags": [
+          "Private Conversations"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wId",
+            "required": true,
+            "description": "ID of the workspace",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "cId",
+            "required": true,
+            "description": "ID of the conversation",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "wuId",
+            "required": true,
+            "description": "sId of the wake-up to cancel",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully cancelled (or already terminal)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "wakeUp": {
+                      "$ref": "#/components/schemas/PrivateWakeUp"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Caller is not the wake-up owner or a workspace admin"
+          },
+          "404": {
+            "description": "Wake-up not found in this conversation"
+          }
+        }
+      }
+    },
+    "/api/w/{wId}/assistant/conversations/{cId}/wakeups": {
+      "get": {
+        "summary": "List wake-ups for a conversation",
+        "description": "Retrieve all wake-ups scheduled in a conversation (any status).",
+        "tags": [
+          "Private Conversations"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wId",
+            "required": true,
+            "description": "ID of the workspace",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "cId",
+            "required": true,
+            "description": "ID of the conversation",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved wake-ups",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "wakeUps": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/PrivateWakeUp"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        }
+      }
+    },
     "/api/w/{wId}/assistant/conversations": {
       "get": {
         "summary": "List conversations",
@@ -7644,12 +8150,6 @@
                             }
                           },
                           "selectedMCPServerViewIds": {
-                            "type": "array",
-                            "items": {
-                              "type": "string"
-                            }
-                          },
-                          "selectedSkillIds": {
                             "type": "array",
                             "items": {
                               "type": "string"
@@ -8659,6 +9159,15 @@
                             "archivedAt": {
                               "type": "integer",
                               "nullable": true
+                            },
+                            "todoGenerationEnabled": {
+                              "type": "boolean",
+                              "description": "Whether automatic todo suggestions from project activity are enabled."
+                            },
+                            "lastTodoAnalysisAt": {
+                              "type": "integer",
+                              "nullable": true,
+                              "description": "Unix timestamp (ms) of the last automatic todo suggestion scan, if any."
                             }
                           }
                         }
@@ -8819,6 +9328,184 @@
           },
           "401": {
             "description": "Unauthorized"
+          }
+        }
+      }
+    },
+    "/api/w/{wId}/spaces/{spaceId}/project_notification_preferences": {
+      "get": {
+        "summary": "Get project notification preference",
+        "description": "Returns the current user's notification preference for a project space.",
+        "tags": [
+          "Private Spaces"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wId",
+            "required": true,
+            "description": "ID of the workspace",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "spaceId",
+            "required": true,
+            "description": "ID of the project space",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "userProjectNotificationPreference": {
+                      "type": "object",
+                      "nullable": true,
+                      "properties": {
+                        "sId": {
+                          "type": "string"
+                        },
+                        "spaceId": {
+                          "type": "string"
+                        },
+                        "userId": {
+                          "type": "string"
+                        },
+                        "preference": {
+                          "type": "string",
+                          "enum": [
+                            "all_messages",
+                            "only_mentions",
+                            "never"
+                          ]
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request (space is not a project)"
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        }
+      },
+      "patch": {
+        "summary": "Set project notification preference",
+        "description": "Sets the current user's notification preference for a project space.",
+        "tags": [
+          "Private Spaces"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wId",
+            "required": true,
+            "description": "ID of the workspace",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "spaceId",
+            "required": true,
+            "description": "ID of the project space",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "preference"
+                ],
+                "properties": {
+                  "preference": {
+                    "type": "string",
+                    "enum": [
+                      "all_messages",
+                      "only_mentions",
+                      "never"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "userProjectNotificationPreference": {
+                      "type": "object",
+                      "nullable": true,
+                      "properties": {
+                        "sId": {
+                          "type": "string"
+                        },
+                        "spaceId": {
+                          "type": "string"
+                        },
+                        "userId": {
+                          "type": "string"
+                        },
+                        "preference": {
+                          "type": "string",
+                          "enum": [
+                            "all_messages",
+                            "only_mentions",
+                            "never"
+                          ]
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request (space is not a project or invalid body)"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "405": {
+            "description": "Method not supported"
           }
         }
       }
@@ -9255,7 +9942,8 @@
           "id",
           "sId",
           "name",
-          "role"
+          "role",
+          "regionalModelsOnly"
         ],
         "properties": {
           "id": {
@@ -9294,6 +9982,10 @@
           },
           "ssoEnforced": {
             "type": "boolean"
+          },
+          "regionalModelsOnly": {
+            "type": "boolean",
+            "description": "When true, only models whose regionalAvailability includes the workspace's region are usable."
           },
           "metadata": {
             "type": "object",
@@ -9366,6 +10058,122 @@
             "type": "array",
             "items": {
               "type": "string"
+            }
+          },
+          "forkingData": {
+            "$ref": "#/components/schemas/PrivateConversationForkingData"
+          }
+        }
+      },
+      "PrivateConversationForkUser": {
+        "type": "object",
+        "properties": {
+          "sId": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "createdAt": {
+            "type": "integer"
+          },
+          "provider": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "auth0",
+              "github",
+              "google",
+              "okta",
+              "samlp",
+              "waad"
+            ]
+          },
+          "username": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string"
+          },
+          "firstName": {
+            "type": "string"
+          },
+          "lastName": {
+            "type": "string",
+            "nullable": true
+          },
+          "fullName": {
+            "type": "string"
+          },
+          "image": {
+            "type": "string",
+            "nullable": true
+          },
+          "lastLoginAt": {
+            "type": "integer",
+            "nullable": true
+          }
+        }
+      },
+      "PrivateConversationForkedFrom": {
+        "type": "object",
+        "required": [
+          "parentConversationId",
+          "parentConversationTitle",
+          "sourceMessageId",
+          "branchedAt",
+          "user"
+        ],
+        "properties": {
+          "parentConversationId": {
+            "type": "string"
+          },
+          "parentConversationTitle": {
+            "type": "string",
+            "nullable": true
+          },
+          "sourceMessageId": {
+            "type": "string"
+          },
+          "branchedAt": {
+            "type": "integer"
+          },
+          "user": {
+            "$ref": "#/components/schemas/PrivateConversationForkUser"
+          }
+        }
+      },
+      "PrivateConversationForkedChild": {
+        "type": "object",
+        "properties": {
+          "childConversationId": {
+            "type": "string"
+          },
+          "childConversationTitle": {
+            "type": "string",
+            "nullable": true
+          },
+          "sourceMessageId": {
+            "type": "string"
+          },
+          "branchedAt": {
+            "type": "integer"
+          },
+          "user": {
+            "$ref": "#/components/schemas/PrivateConversationForkUser"
+          }
+        }
+      },
+      "PrivateConversationForkingData": {
+        "type": "object",
+        "properties": {
+          "forkedFrom": {
+            "$ref": "#/components/schemas/PrivateConversationForkedFrom"
+          },
+          "forkedChildren": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrivateConversationForkedChild"
             }
           }
         }
@@ -9939,6 +10747,15 @@
             "nullable": true,
             "description": "Present for file content fragments"
           },
+          "path": {
+            "type": "string",
+            "nullable": true,
+            "description": "Path of this file inside the sandbox conversation mount."
+          },
+          "skipFileProcessing": {
+            "type": "boolean",
+            "description": "Whether upload-time file processing was skipped."
+          },
           "snippet": {
             "type": "string",
             "nullable": true
@@ -10006,6 +10823,10 @@
             "type": "integer"
           },
           "branchId": {
+            "type": "string",
+            "nullable": true
+          },
+          "sourceConversationId": {
             "type": "string",
             "nullable": true
           },
@@ -10355,6 +11176,15 @@
               "archivedAt": {
                 "type": "integer",
                 "nullable": true
+              },
+              "todoGenerationEnabled": {
+                "type": "boolean",
+                "description": "Whether automatic todo suggestions from project activity are enabled."
+              },
+              "lastTodoAnalysisAt": {
+                "type": "integer",
+                "nullable": true,
+                "description": "Unix timestamp (ms) of the last automatic todo suggestion scan, if any."
               }
             }
           }
@@ -10619,6 +11449,101 @@
           }
         }
       },
+      "PrivateWakeUp": {
+        "type": "object",
+        "description": "A wake-up scheduled in a conversation to re-invoke the agent at a later time.",
+        "required": [
+          "id",
+          "sId",
+          "createdAt",
+          "agentConfigurationId",
+          "scheduleConfig",
+          "reason",
+          "status",
+          "fireCount",
+          "maxFires"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "sId": {
+            "type": "string"
+          },
+          "createdAt": {
+            "type": "integer",
+            "description": "Unix timestamp (milliseconds)."
+          },
+          "agentConfigurationId": {
+            "type": "string"
+          },
+          "scheduleConfig": {
+            "oneOf": [
+              {
+                "type": "object",
+                "required": [
+                  "type",
+                  "fireAt"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "one_shot"
+                    ]
+                  },
+                  "fireAt": {
+                    "type": "integer",
+                    "description": "Unix timestamp (milliseconds) when the wake-up should fire."
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type",
+                  "cron",
+                  "timezone"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "cron"
+                    ]
+                  },
+                  "cron": {
+                    "type": "string",
+                    "description": "5-field cron expression."
+                  },
+                  "timezone": {
+                    "type": "string",
+                    "description": "IANA timezone name."
+                  }
+                }
+              }
+            ]
+          },
+          "reason": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "scheduled",
+              "fired",
+              "cancelled",
+              "expired"
+            ]
+          },
+          "fireCount": {
+            "type": "integer"
+          },
+          "maxFires": {
+            "type": "integer"
+          }
+        }
+      },
       "PrivateMention": {
         "type": "object",
         "description": "A mention in a message (agent or user).",
@@ -10741,6 +11666,7 @@
               "transcript",
               "triggered_programmatic",
               "triggered",
+              "wakeup",
               "zapier",
               "zendesk",
               "onboarding_conversation"
@@ -11829,6 +12755,9 @@
       },
       "Workspace": {
         "type": "object",
+        "required": [
+          "regionalModelsOnly"
+        ],
         "properties": {
           "id": {
             "type": "integer",
@@ -11869,6 +12798,11 @@
           "ssoEnforced": {
             "type": "boolean",
             "example": true
+          },
+          "regionalModelsOnly": {
+            "type": "boolean",
+            "description": "When true, only models whose regionalAvailability includes the workspace's region are usable.",
+            "example": false
           },
           "whiteListedProviders": {
             "type": "array",
@@ -12294,6 +13228,16 @@
             "description": "The id of the previously uploaded file (optional if `content` and `contentType` are set)",
             "example": "fil_123456"
           },
+          "path": {
+            "type": "string",
+            "nullable": true,
+            "description": "Path of this file inside the sandbox conversation mount.",
+            "example": "conversation/report.csv"
+          },
+          "skipFileProcessing": {
+            "type": "boolean",
+            "description": "Whether upload-time file processing was skipped."
+          },
           "nodeId": {
             "type": "string",
             "description": "The id of the content node (optional if `content` and `contentType` are set)",
@@ -12549,6 +13493,167 @@
           "spaceId": {
             "type": "string",
             "description": "ID of the space containing the data source view"
+          }
+        }
+      },
+      "SkillSourceMetadata": {
+        "type": "object",
+        "properties": {
+          "repoUrl": {
+            "type": "string",
+            "description": "URL of the source repository, when applicable",
+            "example": "https://github.com/dust-tt/skills"
+          },
+          "filePath": {
+            "type": "string",
+            "description": "Path to the source skill file",
+            "example": "support/SKILL.md"
+          }
+        }
+      },
+      "Skill": {
+        "type": "object",
+        "properties": {
+          "sId": {
+            "type": "string",
+            "description": "Unique string identifier for the skill",
+            "example": "skill_abc123"
+          },
+          "createdAt": {
+            "type": "number",
+            "nullable": true,
+            "description": "Timestamp of when the skill was created"
+          },
+          "updatedAt": {
+            "type": "number",
+            "nullable": true,
+            "description": "Timestamp of when the skill was last updated"
+          },
+          "editedBy": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Numeric identifier of the last editor"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "archived",
+              "suggested"
+            ],
+            "description": "Current status of the skill",
+            "example": "active"
+          },
+          "name": {
+            "type": "string",
+            "description": "Name of the skill",
+            "example": "Customer Support"
+          },
+          "agentFacingDescription": {
+            "type": "string",
+            "description": "Description shown to agents when selecting or using the skill",
+            "example": "Use this skill to answer customer support questions."
+          },
+          "userFacingDescription": {
+            "type": "string",
+            "description": "Description shown to workspace users",
+            "example": "Answers support questions with the right workspace context."
+          },
+          "icon": {
+            "type": "string",
+            "nullable": true,
+            "description": "Icon identifier for the skill",
+            "example": "ActionRobotIcon"
+          },
+          "source": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "web_app",
+              "github",
+              "api",
+              "local_file"
+            ],
+            "description": "Source used to create or import the skill"
+          },
+          "sourceMetadata": {
+            "type": "object",
+            "nullable": true,
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SkillSourceMetadata"
+              }
+            ]
+          },
+          "reinforcement": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "on",
+              "off"
+            ],
+            "description": "Reinforcement setting for the skill"
+          },
+          "lastReinforcementAnalysisAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "Timestamp of the last reinforcement analysis, when available"
+          },
+          "requestedSpaceIds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Space identifiers the skill needs access to"
+          },
+          "fileAttachments": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "fileId": {
+                  "type": "string",
+                  "description": "Unique string identifier for the attached file"
+                },
+                "fileName": {
+                  "type": "string",
+                  "description": "Name of the attached file"
+                }
+              }
+            }
+          },
+          "canWrite": {
+            "type": "boolean",
+            "description": "Whether the authenticated actor can edit the skill"
+          },
+          "isExtendable": {
+            "type": "boolean",
+            "description": "Whether this skill can be extended by another skill"
+          },
+          "isDefault": {
+            "type": "boolean",
+            "description": "Whether this skill is enabled by default"
+          },
+          "extendedSkillId": {
+            "type": "string",
+            "nullable": true,
+            "description": "Identifier of the extended skill, when applicable"
+          },
+          "instructions": {
+            "type": "string",
+            "nullable": true,
+            "description": "Instructions used by the agent when running the skill"
+          },
+          "instructionsHtml": {
+            "type": "string",
+            "nullable": true,
+            "description": "HTML representation of the skill instructions"
+          },
+          "tools": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MCPServerView"
+            }
           }
         }
       },

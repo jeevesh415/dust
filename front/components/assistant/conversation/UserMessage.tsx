@@ -17,7 +17,6 @@ import { useEditUserMessage } from "@app/hooks/useEditUserMessage";
 import { useHover } from "@app/hooks/useHover";
 import { useSendNotification } from "@app/hooks/useNotification";
 import config from "@app/lib/api/config";
-import { useFeatureFlags } from "@app/lib/auth/AuthContext";
 import { AGENT_MENTION_REGEX } from "@app/lib/mentions/format";
 import { useIsMobile } from "@app/lib/swr/useIsMobile";
 import { getConversationRoute } from "@app/lib/utils/router";
@@ -30,6 +29,7 @@ import {
   isAgentMention,
   isRichAgentMention,
 } from "@app/types/assistant/mentions";
+import { pluralize } from "@app/types/shared/utils/string_utils";
 import type { WorkspaceType } from "@app/types/user";
 import {
   ActionTimeIcon,
@@ -160,8 +160,6 @@ export function UserMessage({
     conversationId,
   });
   const confirm = useContext(ConfirmContext);
-  const { hasFeature } = useFeatureFlags();
-  const singleAgentInput = hasFeature("enable_steering");
 
   const originalAgentIds = useMemo(
     () =>
@@ -174,21 +172,18 @@ export function UserMessage({
   const handleSave = async () => {
     const { markdown, mentions } = editorService.getMarkdownAndMentions();
 
-    let content = markdown;
-    let filteredMentions = mentions;
-    if (singleAgentInput) {
-      filteredMentions = mentions.filter(
-        (m) => !isRichAgentMention(m) || originalAgentIds.has(m.id)
-      );
+    const filteredMentions = mentions.filter(
+      (m) => !isRichAgentMention(m) || originalAgentIds.has(m.id)
+    );
 
-      if (filteredMentions.length < mentions.length) {
-        // Strip agent mention syntax from the markdown to match the filtered mentions array.
-        content = markdown
-          .replaceAll(AGENT_MENTION_REGEX, (_match, _label, agentId) =>
-            originalAgentIds.has(agentId) ? _match : ""
-          )
-          .trim();
-      }
+    let content = markdown;
+    if (filteredMentions.length < mentions.length) {
+      // Strip agent mention syntax from the markdown to match the filtered mentions array.
+      content = markdown
+        .replaceAll(AGENT_MENTION_REGEX, (_match, _label, agentId) =>
+          originalAgentIds.has(agentId) ? _match : ""
+        )
+        .trim();
     }
 
     await editMessage({
@@ -205,9 +200,7 @@ export function UserMessage({
     conversationId,
     onEnterKeyDown: handleSave,
     disableAutoFocus: false,
-    // This editor is only mounted in edit mode, so singleAgentInput
-    // alone is sufficient to disable agent mentions (edit mode is implied).
-    disableAgentMentions: singleAgentInput,
+    disableAgentMentions: true,
   });
 
   const renderName = useCallback(
@@ -230,7 +223,11 @@ export function UserMessage({
   const methods = useVirtuosoMethods<VirtuosoMessage>();
 
   const isDeleted = message.visibility === "deleted";
-  const isEmpty = !message.content && message.contentFragments.length === 0;
+  const isPending = message.visibility === "pending";
+  const pendingMessageCount = methods.data
+    .get()
+    .filter((m) => isUserMessage(m) && m.visibility === "pending").length;
+  const isEmpty = !message.content;
   const isCurrentUser = message.user?.sId === currentUserId;
   const canDelete =
     (isCurrentUser || isAdmin) && !isDeleted && !isProjectArchived;
@@ -241,11 +238,17 @@ export function UserMessage({
       return;
     }
 
+    // Only mention the agent reply when the message actually triggered one.
+    const hasAgentReply = message.richMentions.some(isRichAgentMention);
+    const replyNote = hasAgentReply
+      ? " The agent's reply will also be removed."
+      : "";
+
     const confirmed = await confirm({
       title: isCurrentUser ? "Delete your message" : "Delete user message",
       message: isCurrentUser
-        ? "Are you sure you want to delete this message? This action cannot be undone."
-        : "Are you sure you want to delete this user's message? This the message will be deleted for all participants.",
+        ? `Are you sure you want to delete this message?${replyNote} This action cannot be undone.`
+        : `Are you sure you want to delete this user's message?${replyNote} This will be reflected for all participants.`,
       validateLabel: "Delete",
       validateVariant: "warning",
     });
@@ -270,6 +273,7 @@ export function UserMessage({
     deleteMessage,
     isCurrentUser,
     message.sId,
+    message.richMentions,
     methods,
   ]);
 
@@ -381,13 +385,22 @@ export function UserMessage({
               <ConversationMessageContent
                 citations={citations}
                 type="user"
-                className={cn(
-                  shouldShowBiggerUserMessage && "@sm:min-w-100",
-                  message.visibility === "pending" && "opacity-70"
-                )}
+                className={cn(shouldShowBiggerUserMessage && "@sm:min-w-100")}
                 reversed={isCurrentUser}
               >
-                <div className="flex items-center gap-2">
+                <div
+                  className={cn(
+                    "flex gap-2",
+                    isPending ? "items-start" : "items-center"
+                  )}
+                >
+                  {isPending && (
+                    <Icon
+                      visual={ActionTimeIcon}
+                      size="xs"
+                      className="mt-1 shrink-0 text-faint dark:text-faint-night"
+                    />
+                  )}
                   {isDeleted ? (
                     <DeletedMessage />
                   ) : isEmpty ? (
@@ -395,11 +408,19 @@ export function UserMessage({
                       (no message)
                     </div>
                   ) : (
-                    <UserMessageMarkdown
-                      owner={owner}
-                      message={message}
-                      isLastMessage={isLastMessage}
-                    />
+                    <div
+                      className={cn(
+                        "min-w-0",
+                        isPending &&
+                          "text-muted-foreground dark:text-muted-foreground-night"
+                      )}
+                    >
+                      <UserMessageMarkdown
+                        owner={owner}
+                        message={message}
+                        isLastMessage={isLastMessage}
+                      />
+                    </div>
                   )}
                 </div>
               </ConversationMessageContent>
@@ -441,7 +462,7 @@ export function UserMessage({
           </ConversationMessageContainer>
         </div>
       )}
-      {message.visibility === "pending" && isLastMessage && (
+      {isLastMessage && pendingMessageCount > 0 && (
         <div
           className={cn(
             "mt-1 mr-3 flex items-center gap-1 text-xs text-muted-foreground dark:text-muted-foreground-night",
@@ -449,7 +470,7 @@ export function UserMessage({
           )}
         >
           <Icon visual={ActionTimeIcon} size="xs" />
-          Waiting for the current step to finish
+          {`Message${pluralize(pendingMessageCount)} queued`}
         </div>
       )}
     </>
@@ -457,7 +478,7 @@ export function UserMessage({
 }
 
 function getChipDateFormat(date: Date) {
-  return date.toLocaleDateString("en-EN", {
+  return date.toLocaleDateString(undefined, {
     year: "numeric",
     month: "short",
     day: "numeric",
@@ -502,33 +523,30 @@ function TriggerChip({ message }: { message?: UserMessageType }) {
 
 // When the conversation container is narrow, the action menu sits below the message bubble.
 // When the conversation container is wider, it floats to the left (current user) or right (other user).
-const actionMenuContainerVariants = cva(
-  "flex items-center gap-1 absolute left-0 bottom-0",
-  {
-    variants: {
-      mode: {
-        side: "",
-        bottom: "translate-y-[calc(100%+4px)]",
-      },
-      isCurrentUser: {
-        true: "",
-        false: "",
-      },
+const actionMenuContainerVariants = cva("flex items-center gap-1", {
+  variants: {
+    mode: {
+      side: "absolute left-0 bottom-0",
+      bottom: "",
     },
-    compoundVariants: [
-      {
-        mode: "side",
-        isCurrentUser: true,
-        className: "-translate-x-full pr-2",
-      },
-      {
-        mode: "side",
-        isCurrentUser: false,
-        className: "left-auto right-0 translate-x-full pl-2",
-      },
-    ],
-  }
-);
+    isCurrentUser: {
+      true: "",
+      false: "",
+    },
+  },
+  compoundVariants: [
+    {
+      mode: "side",
+      isCurrentUser: true,
+      className: "-translate-x-full pr-2",
+    },
+    {
+      mode: "side",
+      isCurrentUser: false,
+      className: "left-auto right-0 translate-x-full pl-2",
+    },
+  ],
+});
 
 interface ActionMenuProps {
   mode: "side" | "bottom";

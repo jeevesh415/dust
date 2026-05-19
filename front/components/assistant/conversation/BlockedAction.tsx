@@ -33,8 +33,6 @@ export function BlockedAction({
           triggeringUser={triggeringUser}
           owner={owner}
           blockedAction={blockedAction}
-          conversationId={conversationId}
-          messageId={messageId}
         />
       );
 
@@ -47,12 +45,6 @@ export function BlockedAction({
           mcpServerId={blockedAction.metadata.mcpServerId}
           provider={blockedAction.authorizationInfo.provider}
           scope={blockedAction.authorizationInfo.scope}
-          retryHandler={() =>
-            retryHandler({
-              conversationId: blockedAction.conversationId,
-              messageId: blockedAction.messageId,
-            })
-          }
         />
       );
 

@@ -164,6 +164,17 @@ export class CreditResource extends BaseResource<CreditModel> {
     });
   }
 
+  /**
+   * Return the total remaining balance across all active credits (in microUSD).
+   */
+  static async getRemainingMicroUsd(auth: Authenticator): Promise<number> {
+    const activeCredits = await this.listActive(auth);
+    return activeCredits.reduce(
+      (sum, c) => sum + (c.initialAmountMicroUsd - c.consumedAmountMicroUsd),
+      0
+    );
+  }
+
   static async fetchByIds(auth: Authenticator, ids: string[]) {
     return this.baseFetch(auth, {
       where: {
@@ -360,7 +371,7 @@ export class CreditResource extends BaseResource<CreditModel> {
       expirationDate?: Date;
       transaction?: Transaction;
     } = {}
-  ): Promise<Result<void, Error>> {
+  ): Promise<Result<{ startDate: Date; expirationDate: Date }, Error>> {
     const effectiveStartDate = startDate ?? new Date();
     const effectiveExpirationDate =
       expirationDate ??
@@ -387,7 +398,10 @@ export class CreditResource extends BaseResource<CreditModel> {
         return new Err(new Error("Credit already started"));
       }
 
-      return new Ok(undefined);
+      return new Ok({
+        startDate: effectiveStartDate,
+        expirationDate: effectiveExpirationDate,
+      });
     } catch (error) {
       if (error instanceof UniqueConstraintError) {
         return new Err(
@@ -435,6 +449,19 @@ export class CreditResource extends BaseResource<CreditModel> {
         initialAmountMicroUsd,
       },
       transaction
+    );
+  }
+
+  async setMetronomeCreditId(
+    metronomeCreditId: string,
+    { transaction }: { transaction?: Transaction } = {}
+  ): Promise<void> {
+    await this.model.update(
+      { metronomeCreditId },
+      {
+        where: { id: this.id, workspaceId: this.workspaceId },
+        transaction,
+      }
     );
   }
 
@@ -501,6 +528,7 @@ export class CreditResource extends BaseResource<CreditModel> {
         : null,
       discount: this.discount,
       invoiceOrLineItemId: this.invoiceOrLineItemId,
+      metronomeCreditId: this.metronomeCreditId,
     };
   }
 

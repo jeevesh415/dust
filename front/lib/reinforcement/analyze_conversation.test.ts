@@ -18,6 +18,9 @@ function makeSkill(overrides: Partial<SkillType> = {}): SkillType {
     icon: null,
     source: null,
     sourceMetadata: null,
+    reinforcement: "auto",
+    selfImprovementLock: false,
+    selfImprovementCostsCapMicroUsd: null,
     requestedSpaceIds: [],
     tools: [],
     fileAttachments: [],
@@ -57,18 +60,18 @@ describe("buildSkillAnalysisPrompt", () => {
     expect(userMessage).toMatch(/<skill[^>]+><\/skill>/);
   });
 
-  it("includes instructions when present", () => {
+  it("includes instructions when instructionsHtml is present", () => {
     const skill = makeSkill({
-      instructions: "Always verify data before responding.",
+      instructionsHtml: "Always verify data before responding.",
     });
     const { userMessage } = buildSkillAnalysisPrompt("User: hello", [skill]);
 
-    expect(userMessage).toContain("<instructions>");
+    expect(userMessage).toContain('<instructions format="html">');
     expect(userMessage).toContain("Always verify data before responding.");
   });
 
   it("omits instructions when null", () => {
-    const skill = makeSkill({ instructions: null });
+    const skill = makeSkill({ instructions: null, instructionsHtml: null });
     const { userMessage } = buildSkillAnalysisPrompt("User: hello", [skill]);
 
     expect(userMessage).not.toContain("<instructions>");
@@ -101,6 +104,16 @@ describe("buildSkillAnalysisPrompt", () => {
 
     expect(systemPrompt).toContain("edit_skill");
     expect(systemPrompt).toContain("get_available_tools");
+  });
+
+  it("system prompt has guidance for agent-facing description edits", () => {
+    const { systemPrompt } = buildSkillAnalysisPrompt("User: hello", [
+      makeSkill(),
+    ]);
+
+    expect(systemPrompt).toContain("<agent_facing_description_guidance>");
+    // Description edits are about routing (when to enable the skill), not behavior.
+    expect(systemPrompt).toMatch(/routing|when to enable/i);
   });
 
   it("includes skill configured tools in user message", () => {

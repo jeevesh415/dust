@@ -1,14 +1,15 @@
 import { editorVariants } from "@app/components/editor/editorStyles";
 import { KNOWLEDGE_NODE_TYPE } from "@app/components/editor/extensions/skill_builder/KnowledgeNode";
 import type { KnowledgeItem } from "@app/components/editor/extensions/skill_builder/KnowledgeNodeView";
-import { stripHtmlAttributes } from "@app/components/editor/input_bar/cleanupPastedHTML";
 import {
   SkillInstructionsEditorContent,
   useSkillInstructionsEditor,
 } from "@app/components/editor/SkillInstructionsEditor";
 import { SKILL_BUILDER_INSTRUCTIONS_BLUR_EVENT } from "@app/components/skill_builder/events";
+import { useSkillBuilderContext } from "@app/components/skill_builder/SkillBuilderContext";
 import type { SkillBuilderFormData } from "@app/components/skill_builder/SkillBuilderFormContext";
 import { useSkillVersionComparisonContext } from "@app/components/skill_builder/SkillBuilderVersionContext";
+import { useSkillSuggestions } from "@app/hooks/useSkillSuggestions";
 import { useFeatureFlags } from "@app/lib/auth/AuthContext";
 import {
   postProcessMarkdown,
@@ -17,8 +18,10 @@ import {
 import { cn } from "@dust-tt/sparkle";
 import type { Transaction } from "@tiptap/pm/state";
 import type { Editor } from "@tiptap/react";
+import type { Config } from "dompurify";
+import DOMPurify from "dompurify";
 import debounce from "lodash/debounce";
-import { useCallback, useEffect, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import { useController, useFormContext } from "react-hook-form";
 
 const INSTRUCTIONS_FIELD_NAME = "instructions";
@@ -47,6 +50,19 @@ function toAttachedKnowledge(
   }));
 }
 
+function sanitizeSkillInstructionsHtml(html: string): string {
+  try {
+    const config: Config = {
+      ADD_TAGS: ["knowledge"],
+      ADD_ATTR: ["space", "dsv", "hasChildren"],
+      FORBID_ATTR: ["style", "class"],
+    };
+    return DOMPurify.sanitize(html, config);
+  } catch {
+    return html;
+  }
+}
+
 const INSTRUCTIONS_EDITOR_SIZE = "min-h-60 max-h-[1024px]";
 
 interface SkillBuilderInstructionsEditorProps {
@@ -57,9 +73,8 @@ export function SkillBuilderInstructionsEditor({
   onAddKnowledge,
 }: SkillBuilderInstructionsEditorProps) {
   const { compareVersion, isDiffMode } = useSkillVersionComparisonContext();
-  const { setValue } = useFormContext<SkillBuilderFormData>();
-  const { hasFeature } = useFeatureFlags();
-  const useHtmlInstructions = hasFeature("skill_builder_instructions_html");
+  const { resetField } = useFormContext<SkillBuilderFormData>();
+  const initializedAttachedKnowledgeEditorRef = useRef<Editor | null>(null);
 
   const { field: instructionsField, fieldState: instructionsFieldState } =
     useController<SkillBuilderFormData, typeof INSTRUCTIONS_FIELD_NAME>({
@@ -73,40 +88,52 @@ export function SkillBuilderInstructionsEditor({
     name: INSTRUCTIONS_HTML_FIELD_NAME,
   });
 
-  const { fieldState: attachedKnowledgeFieldState } = useController<
-    SkillBuilderFormData,
-    typeof ATTACHED_KNOWLEDGE_FIELD_NAME
-  >({
-    name: ATTACHED_KNOWLEDGE_FIELD_NAME,
-  });
+  const {
+    field: attachedKnowledgeField,
+    fieldState: attachedKnowledgeFieldState,
+  } = useController<SkillBuilderFormData, typeof ATTACHED_KNOWLEDGE_FIELD_NAME>(
+    {
+      name: ATTACHED_KNOWLEDGE_FIELD_NAME,
+    }
+  );
 
   const displayError =
     !!instructionsFieldState.error || !!attachedKnowledgeFieldState.error;
+
+  const syncAttachedKnowledgeFromEditor = useCallback(
+    (editor: Editor) => {
+      attachedKnowledgeField.onChange(
+        toAttachedKnowledge(collectKnowledgeItems(editor))
+      );
+    },
+    [attachedKnowledgeField.onChange]
+  );
+
+  const syncInstructionsFromEditor = useCallback(
+    (editor: Editor) => {
+      instructionsField.onChange(
+        postProcessMarkdown(editor.getMarkdown()).trim()
+      );
+      instructionsHtmlField.onChange(
+        sanitizeSkillInstructionsHtml(editor.getHTML())
+      );
+      syncAttachedKnowledgeFromEditor(editor);
+    },
+    [
+      instructionsField.onChange,
+      instructionsHtmlField.onChange,
+      syncAttachedKnowledgeFromEditor,
+    ]
+  );
 
   const debouncedUpdate = useMemo(
     () =>
       debounce((editor: Editor) => {
         if (!isDiffMode && !editor.isDestroyed) {
-          setValue(
-            INSTRUCTIONS_FIELD_NAME,
-            postProcessMarkdown(editor.getMarkdown()).trim(),
-            { shouldDirty: true }
-          );
-          if (useHtmlInstructions) {
-            setValue(
-              INSTRUCTIONS_HTML_FIELD_NAME,
-              stripHtmlAttributes(editor.getHTML()),
-              { shouldDirty: true }
-            );
-          }
-          setValue(
-            ATTACHED_KNOWLEDGE_FIELD_NAME,
-            toAttachedKnowledge(collectKnowledgeItems(editor)),
-            { shouldDirty: true }
-          );
+          syncInstructionsFromEditor(editor);
         }
       }, 250),
-    [isDiffMode, setValue, useHtmlInstructions]
+    [isDiffMode, syncInstructionsFromEditor]
   );
 
   const handleUpdate = useCallback(
@@ -126,27 +153,48 @@ export function SkillBuilderInstructionsEditor({
 
   const handleDelete = useCallback(
     (editorInstance: Editor) => {
-      setValue(
-        ATTACHED_KNOWLEDGE_FIELD_NAME,
-        toAttachedKnowledge(collectKnowledgeItems(editorInstance)),
-        { shouldDirty: true }
-      );
+      syncAttachedKnowledgeFromEditor(editorInstance);
     },
-    [setValue]
+    [syncAttachedKnowledgeFromEditor]
   );
 
-  const { editor } = useSkillInstructionsEditor({
+  const { owner, skillId, selectedSuggestionId, setAcceptInstructionEdits } =
+    useSkillBuilderContext();
+  const { hasFeature } = useFeatureFlags();
+  const hasReinforcementFeature =
+    hasFeature("reinforced_agents") && hasFeature("reinforcement_ui");
+  const { suggestions, isSuggestionsLoading } = useSkillSuggestions({
+    skillId,
+    states: ["pending"],
+    workspaceId: owner.sId,
+    disabled: !skillId || !hasReinforcementFeature,
+  });
+
+  const hasSuggestions = suggestions.length > 0;
+
+  const { editor, isContentReady } = useSkillInstructionsEditor({
     content: instructionsField.value ?? "",
-    htmlContent:
-      useHtmlInstructions && instructionsHtmlField.value
-        ? instructionsHtmlField.value
-        : undefined,
-    withDocumentExtensions: useHtmlInstructions,
-    isReadOnly: false,
+    htmlContent: instructionsHtmlField.value ?? undefined,
+    isReadOnly: hasSuggestions,
     onUpdate: handleUpdate,
     onBlur: handleBlur,
     onDelete: handleDelete,
   });
+
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) {
+      return;
+    }
+
+    // This allows RHF to focus this custom editor when validation fails.
+    instructionsField.ref(editor.view.dom);
+    attachedKnowledgeField.ref(editor.view.dom);
+
+    return () => {
+      instructionsField.ref(null);
+      attachedKnowledgeField.ref(null);
+    };
+  }, [attachedKnowledgeField.ref, editor, instructionsField.ref]);
 
   const handleAddKnowledge = useCallback(() => {
     if (!editor) {
@@ -183,6 +231,107 @@ export function SkillBuilderInstructionsEditor({
     }
   }, [editor, handleAddKnowledge, onAddKnowledge]);
 
+  // Register a callback that the suggestions panel can call to accept a
+  // suggestion directly via the editor's ProseMirror commands.
+  // Accepting the ProseMirror suggestion means we don't need to manipulate the HTML by hand again
+  // as we already did it to create the suggestion in ProseMirror.
+  useEffect(() => {
+    if (!editor) {
+      setAcceptInstructionEdits(null);
+      return;
+    }
+
+    // Wrap in arrow to avoid React treating the function as a state updater.
+    setAcceptInstructionEdits(() => (suggestionSId: string) => {
+      // Accept each edit of this suggestion via the PM command.
+      for (let i = 0; ; i++) {
+        const editId = `${suggestionSId}:${i}`;
+        const accepted = editor.commands.acceptSuggestion(editId);
+        if (!accepted) {
+          break;
+        }
+      }
+
+      syncInstructionsFromEditor(editor);
+    });
+
+    return () => {
+      setAcceptInstructionEdits(null);
+    };
+  }, [editor, syncInstructionsFromEditor, setAcceptInstructionEdits]);
+
+  useEffect(() => {
+    if (
+      !editor ||
+      !isContentReady ||
+      isDiffMode ||
+      initializedAttachedKnowledgeEditorRef.current === editor
+    ) {
+      return;
+    }
+
+    initializedAttachedKnowledgeEditorRef.current = editor;
+    resetField(ATTACHED_KNOWLEDGE_FIELD_NAME, {
+      defaultValue: toAttachedKnowledge(collectKnowledgeItems(editor)),
+      keepError: true,
+      keepTouched: true,
+    });
+  }, [editor, isContentReady, isDiffMode, resetField]);
+
+  // Apply pending instruction suggestions as inline diff decorations.
+  // "Reject all + re-apply current" on every change so that accepts and
+  // rejects from the suggestions panel are immediately reflected.
+  // Wait for isContentReady to be true so there is content on which the diff must be applied
+  useEffect(() => {
+    if (!editor || isSuggestionsLoading || !isContentReady) {
+      return;
+    }
+
+    editor.commands.rejectAllSuggestions();
+
+    for (const suggestion of suggestions) {
+      const { instructionEdits } = suggestion.suggestion;
+      if (!instructionEdits || instructionEdits.length === 0) {
+        continue;
+      }
+      for (let i = 0; i < instructionEdits.length; i++) {
+        const edit = instructionEdits[i];
+        editor.commands.applySuggestion({
+          id: `${suggestion.sId}:${i}`,
+          targetBlockId: edit.targetBlockId,
+          content: edit.content,
+        });
+      }
+    }
+
+    // Highlight all edits of the selected suggestion using prefix matching.
+    // may be null if no suggestion is selected
+    editor.commands.setHighlightedSuggestion(selectedSuggestionId);
+
+    // Scroll the editor to the first edit of the selected suggestion.
+    if (selectedSuggestionId) {
+      requestAnimationFrame(() => {
+        const firstEdit = editor.view.dom.querySelector(
+          `[data-suggestion-id^="${selectedSuggestionId}:"]`
+        );
+        firstEdit?.scrollIntoView({ behavior: "smooth", block: "center" });
+      });
+    }
+
+    // Make the editor read-only while suggestion diffs are displayed.
+    if (!isDiffMode) {
+      editor.setEditable(!hasSuggestions);
+    }
+  }, [
+    editor,
+    isContentReady,
+    suggestions,
+    isSuggestionsLoading,
+    selectedSuggestionId,
+    isDiffMode,
+    hasSuggestions,
+  ]);
+
   useEffect(() => {
     return () => {
       debouncedUpdate.cancel();
@@ -202,22 +351,18 @@ export function SkillBuilderInstructionsEditor({
             editorVariants({
               error: displayError,
               disabled: isDiffMode,
+              readOnly: hasSuggestions,
             }),
             INSTRUCTIONS_EDITOR_SIZE
           ),
         },
       },
     });
-  }, [editor, displayError, isDiffMode]);
+  }, [editor, displayError, isDiffMode, hasSuggestions]);
 
   // Sync external changes to the editor content
   useEffect(() => {
-    if (
-      !editor ||
-      (useHtmlInstructions
-        ? !instructionsHtmlField.value
-        : instructionsField.value === undefined)
-    ) {
+    if (!editor || isDiffMode || !instructionsHtmlField.value) {
       return;
     }
 
@@ -231,66 +376,78 @@ export function SkillBuilderInstructionsEditor({
       return;
     }
 
-    if (useHtmlInstructions) {
-      const incomingHtml = instructionsHtmlField.value;
-      const currentHtml = stripHtmlAttributes(editor.getHTML());
-      if (currentHtml !== incomingHtml) {
-        setTimeout(() => {
-          editor.commands.setContent(incomingHtml, { emitUpdate: false });
-        }, 0);
-      }
-    } else {
-      const incomingMarkdown = instructionsField.value;
-      const currentContent = postProcessMarkdown(editor.getMarkdown());
-      if (currentContent !== incomingMarkdown) {
-        setTimeout(() => {
-          editor.commands.setContent(
-            preprocessMarkdownForEditor(incomingMarkdown),
-            { emitUpdate: false, contentType: "markdown" }
-          );
-        }, 0);
-      }
+    const incomingHtml = instructionsHtmlField.value;
+    const currentHtml = sanitizeSkillInstructionsHtml(editor.getHTML());
+    if (currentHtml !== incomingHtml) {
+      editor.commands.setContent(incomingHtml, { emitUpdate: false });
     }
-  }, [
-    editor,
-    instructionsField.value,
-    instructionsHtmlField.value,
-    useHtmlInstructions,
-  ]);
+  }, [editor, isDiffMode, instructionsHtmlField.value]);
 
   useEffect(() => {
-    if (!editor) {
+    if (!editor || editor.isDestroyed) {
       return;
     }
 
-    if (compareVersion) {
-      if (editor.storage.agentInstructionDiff?.isDiffMode) {
-        editor.commands.exitDiff();
+    const frameId = requestAnimationFrame(() => {
+      if (!editor || editor.isDestroyed) {
+        return;
       }
 
-      const compareText = compareVersion.instructions ?? "";
-      const currentText = instructionsField.value ?? "";
+      if (compareVersion) {
+        if (editor.storage.agentInstructionDiff?.isDiffMode) {
+          editor.commands.exitDiff();
+        }
 
-      editor.commands.setContent(preprocessMarkdownForEditor(currentText), {
-        emitUpdate: false,
-        contentType: "markdown",
-      });
-      editor.commands.applyDiff(
-        preprocessMarkdownForEditor(compareText),
-        preprocessMarkdownForEditor(currentText)
-      );
-      editor.setEditable(false);
-    } else if (editor.storage.agentInstructionDiff?.isDiffMode) {
-      editor.commands.exitDiff();
-      editor.setEditable(true);
-    }
+        const compareText = compareVersion.instructions ?? "";
+        const currentText = instructionsField.value ?? "";
+
+        editor.commands.setContent(preprocessMarkdownForEditor(currentText), {
+          emitUpdate: false,
+          contentType: "markdown",
+        });
+        editor.commands.applyDiff(
+          preprocessMarkdownForEditor(compareText),
+          preprocessMarkdownForEditor(currentText)
+        );
+        editor.setEditable(false);
+      } else if (editor.storage.agentInstructionDiff?.isDiffMode) {
+        editor.commands.exitDiff();
+        editor.setEditable(true);
+
+        if (instructionsHtmlField.value) {
+          editor.commands.setContent(instructionsHtmlField.value, {
+            emitUpdate: false,
+          });
+        } else {
+          editor.commands.setContent(
+            preprocessMarkdownForEditor(instructionsField.value ?? ""),
+            {
+              emitUpdate: false,
+              contentType: "markdown",
+            }
+          );
+        }
+      }
+    });
+
+    return () => {
+      cancelAnimationFrame(frameId);
+    };
     // Re-run when instructionsField.value changes so that restoring a single
     // field updates the diff overlay.
-  }, [compareVersion, editor, instructionsField.value]);
+  }, [
+    compareVersion,
+    editor,
+    instructionsField.value,
+    instructionsHtmlField.value,
+  ]);
 
   return (
     <div className="space-y-1 p-px">
-      <SkillInstructionsEditorContent editor={editor} isReadOnly={false} />
+      <SkillInstructionsEditorContent
+        editor={editor}
+        isReadOnly={hasSuggestions}
+      />
 
       {instructionsFieldState.error && (
         <div className="dark:text-warning-night ml-2 text-xs text-warning">

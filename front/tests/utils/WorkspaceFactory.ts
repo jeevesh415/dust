@@ -27,16 +27,31 @@ export class WorkspaceFactory {
     return this.create(FREE_BYOK_PLAN_CODE, overrides);
   }
 
+  static async metronome(
+    overrides?: WorkspaceOverrides
+  ): Promise<WorkspaceType> {
+    return this.create(PRO_PLAN_SEAT_29_CODE, overrides, {
+      metronomeContractId: "test-metronome-contract-id",
+    });
+  }
+
   // Plans are seeded by the DB init script (admin/db.ts) to avoid deadlocks
   // from concurrent upserts in parallel test workers.
   private static async create(
     planCode: string,
-    overrides?: WorkspaceOverrides
+    overrides?: WorkspaceOverrides,
+    subscriptionOverrides?: { metronomeContractId?: string }
   ): Promise<WorkspaceType> {
+    const workspaceDescription =
+      `[DEBUG] ${expect.getState().currentTestName}\n\n${faker.company.catchPhrase()}`.slice(
+        0,
+        255
+      );
+
     const workspace = await WorkspaceModel.create({
       sId: generateRandomModelSId(),
       name: faker.company.name(),
-      description: `[DEBUG] ${expect.getState().currentTestName}\n\n${faker.company.catchPhrase()}`,
+      description: workspaceDescription,
       workOSOrganizationId: faker.string.alpha(10),
       ...(overrides?.whiteListedProviders !== undefined && {
         whiteListedProviders: overrides.whiteListedProviders,
@@ -57,6 +72,7 @@ export class WorkspaceFactory {
         startDate: new Date(),
         stripeSubscriptionId: null,
         endDate: null,
+        ...subscriptionOverrides,
       },
       renderPlanFromModel({ plan })
     );

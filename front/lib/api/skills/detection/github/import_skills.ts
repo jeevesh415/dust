@@ -15,7 +15,8 @@ import type {
 import { suggestMCPServersForDetectedSkill } from "@app/lib/api/skills/detection/suggest_mcp_servers";
 import { validateSkillsForImport } from "@app/lib/api/skills/detection/validate_skills";
 import { getSkillIconSuggestion } from "@app/lib/api/skills/icon_suggestion";
-import type { Authenticator } from "@app/lib/auth";
+import { type Authenticator, getFeatureFlags } from "@app/lib/auth";
+import { convertMarkdownToBlockHtml } from "@app/lib/reinforcement/skill_instructions_html";
 import { FileResource } from "@app/lib/resources/file_resource";
 import { SkillResource } from "@app/lib/resources/skill/skill_resource";
 import { concurrentExecutor } from "@app/lib/utils/async_utils";
@@ -49,6 +50,8 @@ export async function importSkillsFromGitHub(
     onConflict?: "error" | "skip";
   }
 ): Promise<Result<ImportSkillsResult, GitHubSkillDetectionError>> {
+  const featureFlags = await getFeatureFlags(auth);
+  const allowFileAttachments = featureFlags.includes("sandbox_tools");
   const accessToken = await getWorkspaceLevelGitHubAccessToken(auth);
   const clientResult = initGitHubRepoClient({ repoUrl, accessToken });
   if (clientResult.isErr()) {
@@ -114,23 +117,26 @@ export async function importSkillsFromGitHub(
         return;
       }
 
-      const skillDirPath = path.dirname(skill.skillMdPath);
-      const uploadResults = await concurrentExecutor(
-        skill.attachments,
-        (attachment) =>
-          uploadAttachment(auth, {
-            octokit,
-            owner,
-            repo,
-            attachment,
-            skillDirPath,
-          }),
-        { concurrency: IMPORT_CONCURRENCY }
-      );
+      let fileAttachments: FileResource[] = [];
+      if (allowFileAttachments) {
+        const skillDirPath = path.dirname(skill.skillMdPath);
+        const uploadResults = await concurrentExecutor(
+          skill.attachments,
+          (attachment) =>
+            uploadAttachment(auth, {
+              octokit,
+              owner,
+              repo,
+              attachment,
+              skillDirPath,
+            }),
+          { concurrency: IMPORT_CONCURRENCY }
+        );
 
-      const fileAttachments = uploadResults.filter(
-        (r): r is FileResource => r !== null
-      );
+        fileAttachments = uploadResults.filter(
+          (r): r is FileResource => r !== null
+        );
+      }
 
       if (existing) {
         const attachedKnowledge = await existing.getAttachedKnowledge(auth);
@@ -144,7 +150,7 @@ export async function importSkillsFromGitHub(
           mcpServerViews: existing.mcpServerViews,
           attachedKnowledge,
           requestedSpaceIds: existing.requestedSpaceIds,
-          fileAttachments,
+          ...(allowFileAttachments ? { fileAttachments } : {}),
           source: "github",
           sourceMetadata: {
             repoUrl,
@@ -152,9 +158,11 @@ export async function importSkillsFromGitHub(
           },
         });
 
-        await FileResource.bulkSetUseCaseMetadata(auth, fileAttachments, {
-          skillId: existing.sId,
-        });
+        if (allowFileAttachments) {
+          await FileResource.bulkSetUseCaseMetadata(auth, fileAttachments, {
+            skillId: existing.sId,
+          });
+        }
 
         updated.push(existing);
       } else {
@@ -186,6 +194,7 @@ export async function importSkillsFromGitHub(
             agentFacingDescription: skill.description,
             userFacingDescription: skill.description,
             instructions: skill.instructions,
+            instructionsHtml: convertMarkdownToBlockHtml(skill.instructions),
             editedBy: user.id,
             requestedSpaceIds: [],
             extendedSkillId: null,
@@ -197,12 +206,17 @@ export async function importSkillsFromGitHub(
             },
             isDefault: false,
           },
-          { mcpServerViews: detectedMCPServerViews, fileAttachments }
+          {
+            mcpServerViews: detectedMCPServerViews,
+            ...(allowFileAttachments ? { fileAttachments } : {}),
+          }
         );
 
-        await FileResource.bulkSetUseCaseMetadata(auth, fileAttachments, {
-          skillId: skillResource.sId,
-        });
+        if (allowFileAttachments) {
+          await FileResource.bulkSetUseCaseMetadata(auth, fileAttachments, {
+            skillId: skillResource.sId,
+          });
+        }
 
         imported.push(skillResource);
       }

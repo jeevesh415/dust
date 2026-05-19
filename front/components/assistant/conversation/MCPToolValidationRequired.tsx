@@ -23,9 +23,10 @@ type ToolOverride = {
     agentName: string,
     inputs: Record<string, unknown>
   ) => string;
+  detailsExpanded?: boolean;
 };
 
-/** Overrides title and alwaysAllowLabel for specific MCP tools */
+/** Overrides title, alwaysAllowLabel, and details expansion for specific MCP tools */
 const MCP_TOOL_OVERRIDES: Partial<
   Record<string, Partial<Record<string, ToolOverride>>>
 > = {
@@ -44,32 +45,36 @@ const MCP_TOOL_OVERRIDES: Partial<
       alwaysAllowLabel: () => "Allow all the interactions with this tab",
     },
   },
+  sandbox: {
+    add_egress_domain: {
+      detailsExpanded: true,
+    },
+  },
 };
 
 interface MCPToolValidationRequiredProps {
   triggeringUser: UserType | null;
   owner: LightWorkspaceType;
   blockedAction: BlockedToolExecution;
-  conversationId: string;
-  messageId: string;
 }
 
 export function MCPToolValidationRequired({
   triggeringUser,
   owner,
   blockedAction,
-  conversationId,
-  messageId,
 }: MCPToolValidationRequiredProps) {
   const { user } = useAuth();
   const [neverAskAgain, setNeverAskAgain] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  const { removeCompletedAction, isActionPulsing, stopPulsingAction } =
-    useBlockedActionsContext();
+  const {
+    getBlockedActions,
+    removeCompletedAction,
+    isActionPulsing,
+    stopPulsingAction,
+  } = useBlockedActionsContext();
   const { validateAction, isValidating } = useValidateAction({
     owner,
-    conversationId,
     onError: setErrorMessage,
   });
 
@@ -92,7 +97,6 @@ export function MCPToolValidationRequired({
 
     const result = await validateAction({
       validationRequest: blockedAction,
-      messageId,
       approved:
         approved === "approved" && neverAskAgain ? "always_approved" : approved,
     });
@@ -103,6 +107,28 @@ export function MCPToolValidationRequired({
     }
     removeCompletedAction(blockedAction.actionId);
     setNeverAskAgain(false);
+
+    // When the user grants always-allow, cascade to other queued
+    // confirmations of the same tool so they don't have to click each one.
+    if (approved === "approved" && neverAskAgain && user) {
+      const cascadable = getBlockedActions(user.sId).filter(
+        (c) =>
+          c.actionId !== blockedAction.actionId &&
+          c.status === "blocked_validation_required" &&
+          c.metadata.mcpServerName === blockedAction.metadata.mcpServerName &&
+          c.metadata.toolName === blockedAction.metadata.toolName
+      );
+
+      for (const cascadeAction of cascadable) {
+        const cascadeResult = await validateAction({
+          validationRequest: cascadeAction,
+          approved: "approved",
+        });
+        if (cascadeResult.success) {
+          removeCompletedAction(cascadeAction.actionId);
+        }
+      }
+    }
   };
 
   const toolOverride =
@@ -120,7 +146,11 @@ export function MCPToolValidationRequired({
         blockedAction.inputs
       );
     }
-    return `Allow ${asDisplayName(blockedAction.metadata.mcpServerName)} to ${asDisplayName(blockedAction.metadata.toolName)}?`;
+    const subject =
+      blockedAction.metadata.displayedAs === "agent"
+        ? blockedAction.metadata.agentName
+        : blockedAction.metadata.mcpServerName;
+    return `Allow ${asDisplayName(subject)} to ${asDisplayName(blockedAction.metadata.toolName)}?`;
   }
 
   function getAlwaysAllowLabel() {
@@ -140,7 +170,13 @@ export function MCPToolValidationRequired({
     const args = blockedAction.argumentsRequiringApproval ?? [];
     const argValues = args
       .filter((arg) => blockedAction.inputs[arg] != null)
-      .map((arg) => JSON.stringify(blockedAction.inputs[arg]));
+      .map((arg) => {
+        const value = blockedAction.inputs[arg];
+        if (Array.isArray(value)) {
+          return value.map(String).join(", ");
+        }
+        return JSON.stringify(value);
+      });
     return `Always allow @${blockedAction.metadata.agentName} to ${asDisplayName(blockedAction.metadata.toolName)} ${
       argValues.length > 0
         ? ` for the following parameters: ${argValues.join(", ")}`
@@ -160,17 +196,25 @@ export function MCPToolValidationRequired({
     >
       {isTriggeredByCurrentUser ? (
         <>
-          <ToolValidationDetails blockedAction={blockedAction} user={user} />
+          <ToolValidationDetails
+            blockedAction={blockedAction}
+            user={user}
+            defaultExpanded={toolOverride?.detailsExpanded}
+          />
           {errorMessage && (
             <div className="mt-2 text-sm font-medium text-warning-800 dark:text-warning-800-night">
               {errorMessage}
             </div>
           )}
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:mt-3">
+          <div className="flex flex-col gap-3 sm:mt-3">
             {(blockedAction.stake === "low" ||
               blockedAction.stake === "medium") && (
-              <Label className="flex w-fit cursor-pointer flex-row items-center gap-2 py-1 pr-2 text-xs">
+              <Label
+                htmlFor="never-ask-again"
+                className="flex w-fit cursor-pointer flex-row items-center gap-2 py-1 pr-2 text-xs"
+              >
                 <Checkbox
+                  id="never-ask-again"
                   checked={neverAskAgain}
                   onCheckedChange={(check) => {
                     setNeverAskAgain(!!check);
@@ -182,7 +226,7 @@ export function MCPToolValidationRequired({
               </Label>
             )}
             <div className="hidden sm:block sm:flex-grow" />
-            <div className="flex flex-row gap-3">
+            <div className="flex flex-row gap-3 self-end">
               <Button
                 label="Decline"
                 variant="outline"

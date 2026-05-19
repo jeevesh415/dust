@@ -59,9 +59,9 @@ describe("INTERNAL_MCP_SERVERS", () => {
       { name: "common_utilities", id: 1017 },
       { name: "skill_management", id: 1019 },
       { name: "schedules_management", id: 1020 },
-      { name: "project_manager", id: 1021 },
+      { name: "pod_manager", id: 1021 },
       {
-        name: "project_todos",
+        name: "pod_tasks",
         id: 1029,
       },
       { name: "agent_sidekick_context", id: 1022 },
@@ -69,6 +69,9 @@ describe("INTERNAL_MCP_SERVERS", () => {
       { name: "sandbox", id: 1024 },
       { name: "user_mentions", id: 1026 },
       { name: "ask_user_question", id: 1028 },
+      { name: "wakeups", id: 1031 },
+      { name: "plan_mode", id: 1032 },
+      { name: "files", id: 1033 },
     ];
     expect(
       autoInternalTools,

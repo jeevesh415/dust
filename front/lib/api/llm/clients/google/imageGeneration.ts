@@ -9,7 +9,7 @@ import {
   type ImageGenerationOutput,
 } from "@app/lib/api/llm/imageGeneration";
 import type { Authenticator } from "@app/lib/auth";
-import { concurrentExecutor } from "@app/temporal/utils";
+import { concurrentExecutor } from "@app/temporal/workflow_utils";
 import type { ImageModelIdType } from "@app/types/assistant/models/models";
 import type { ModelProviderIdType } from "@app/types/assistant/models/types";
 import { Err, Ok, type Result } from "@app/types/shared/result";
@@ -69,20 +69,15 @@ export class ImageGenerationGoogleLLM extends ImageGenerationLLM {
   async generateImage(
     params: ImageGenerationInput
   ): Promise<Result<ImageGenerationOutput, ImageGenerationError>> {
-    const { prompt, aspectRatio, fileResources, quality } = params;
+    const { prompt, aspectRatio, referenceFiles, quality } = params;
 
     let imageParts: Part[] = [];
 
-    if (fileResources && fileResources.length > 0) {
+    if (referenceFiles && referenceFiles.length > 0) {
       imageParts = await concurrentExecutor(
-        fileResources,
-        async (fileResource) => {
-          const signedUrl = await fileResource.getSignedUrlForDownload(
-            this.auth,
-            "original"
-          );
-          return createPartFromUri(signedUrl, fileResource.contentType);
-        },
+        referenceFiles,
+        async (referenceFile) =>
+          createPartFromUri(referenceFile.signedUrl, referenceFile.contentType),
         { concurrency: 8 }
       );
     }

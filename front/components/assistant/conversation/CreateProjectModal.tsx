@@ -3,17 +3,23 @@ import { useAppRouter } from "@app/lib/platform";
 import { useCheckProjectName } from "@app/lib/swr/projects";
 import { useCreateSpace } from "@app/lib/swr/spaces";
 import { getProjectRoute } from "@app/lib/utils/router";
+import { areOpenProjectsAllowed } from "@app/lib/workspace_policies";
 import type { LightWorkspaceType } from "@app/types/user";
 import {
   Button,
+  ButtonsSwitch,
+  ButtonsSwitchList,
   Dialog,
   DialogContainer,
   DialogContent,
   DialogFooter,
   DialogHeader,
   DialogTitle,
+  GlobeAltIcon,
   Input,
-  SliderToggle,
+  Label,
+  LockIcon,
+  Tooltip,
 } from "@dust-tt/sparkle";
 import { useCallback, useEffect, useState } from "react";
 
@@ -24,12 +30,16 @@ interface CreateProjectModalProps {
   owner: LightWorkspaceType;
 }
 
+const OPEN_PROJECTS_DISABLED_TOOLTIP =
+  "Open Pods are disabled by your workspace admin.";
+
 export function CreateProjectModal({
   isOpen,
   onClose,
   onCreated,
   owner,
 }: CreateProjectModalProps) {
+  const areWorkspaceOpenProjectsAllowed = areOpenProjectsAllowed(owner);
   const [projectName, setProjectName] = useState<string>("");
   const [isSaving, setIsSaving] = useState(false);
   const [isPublic, setIsPublic] = useState(false);
@@ -54,15 +64,23 @@ export function CreateProjectModal({
     if (isOpen) {
       setProjectName("");
       setIsSaving(false);
+      setIsPublic(false);
       setNameToCheck("");
     }
   }, [isOpen, setNameToCheck]);
+
+  useEffect(() => {
+    if (!areWorkspaceOpenProjectsAllowed && isPublic) {
+      setIsPublic(false);
+    }
+  }, [areWorkspaceOpenProjectsAllowed, isPublic]);
 
   const handleClose = useCallback(() => {
     onClose();
     setTimeout(() => {
       setProjectName("");
       setIsSaving(false);
+      setIsPublic(false);
       setNameToCheck("");
     }, 500);
   }, [onClose, setNameToCheck]);
@@ -83,8 +101,8 @@ export function CreateProjectModal({
         spaceKind: "project",
       },
       {
-        title: "Project created",
-        description: `Project "${trimmedName}" has been created.`,
+        title: "Pod created",
+        description: `Pod "${trimmedName}" has been created.`,
       }
     );
 
@@ -124,14 +142,14 @@ export function CreateProjectModal({
     <Dialog open={isOpen} onOpenChange={handleClose}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Create a new Project</DialogTitle>
+          <DialogTitle>Create a new Pod</DialogTitle>
         </DialogHeader>
         <DialogContainer>
           <div className="flex w-full flex-col gap-y-4">
             <div className="flex flex-col">
               <Input
-                label="Project name"
-                placeholder="Enter project name"
+                label="Pod name"
+                placeholder="Enter Pod name"
                 value={projectName}
                 name="projectName"
                 onChange={(e) => {
@@ -144,24 +162,22 @@ export function CreateProjectModal({
               />
               {nameNotAvailable && (
                 <div className="mt-1 text-xs text-warning-500 dark:text-warning-500">
-                  A project or space with this name already exists.
+                  A Pod or space with this name already exists.
                 </div>
               )}
             </div>
-            <div className="flex items-start justify-between gap-4">
-              <div className="flex flex-col">
-                <div className="text-sm font-semibold text-foreground dark:text-foreground-night">
-                  Open to everyone
-                </div>
-                <div className="text-sm text-muted-foreground dark:text-muted-foreground-night">
-                  Anyone in the workspace can find and join the project.
-                </div>
-              </div>
-              <SliderToggle
-                size="xs"
-                selected={isPublic}
-                onClick={() => setIsPublic((prev) => !prev)}
+            <div className="flex flex-col items-start gap-1">
+              <Label>Visibility</Label>
+              <VisibilitySwitch
+                isPublic={isPublic}
+                disabled={!areWorkspaceOpenProjectsAllowed}
+                onChange={setIsPublic}
               />
+              <div className="text-xs text-muted-foreground dark:text-muted-foreground-night">
+                {isPublic
+                  ? "Anyone in the workspace can find and join this Pod."
+                  : "Only invited members can access this Pod."}
+              </div>
             </div>
           </div>
         </DialogContainer>
@@ -178,4 +194,36 @@ export function CreateProjectModal({
       </DialogContent>
     </Dialog>
   );
+}
+
+interface VisibilitySwitchProps {
+  isPublic: boolean;
+  disabled: boolean;
+  onChange: (isPublic: boolean) => void;
+}
+
+function VisibilitySwitch({
+  isPublic,
+  disabled,
+  onChange,
+}: VisibilitySwitchProps) {
+  const switchList = (
+    <ButtonsSwitchList
+      size="xs"
+      defaultValue={isPublic ? "open" : "restricted"}
+      onValueChange={(value) => onChange(value === "open")}
+      disabled={disabled}
+    >
+      <ButtonsSwitch value="open" label="Open" icon={GlobeAltIcon} />
+      <ButtonsSwitch value="restricted" label="Restricted" icon={LockIcon} />
+    </ButtonsSwitchList>
+  );
+
+  if (disabled) {
+    return (
+      <Tooltip label={OPEN_PROJECTS_DISABLED_TOOLTIP} trigger={switchList} />
+    );
+  }
+
+  return switchList;
 }

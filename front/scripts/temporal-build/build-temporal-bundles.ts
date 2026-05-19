@@ -35,13 +35,15 @@ function getWorkerDirectory(workerName: WorkerName): string | null {
     case "agent_loop":
       return path.join(baseDir, "temporal/agent_loop");
     case "agent_schedule":
-      return path.join(baseDir, "temporal/triggers/common");
+      return path.join(baseDir, "temporal/triggers");
     case "agent_trigger_webhook":
-      return path.join(baseDir, "temporal/triggers/webhook");
+      return path.join(baseDir, "temporal/triggers_garbage_collect");
     case "analytics_queue":
       return path.join(baseDir, "temporal/analytics_queue");
-    case "project_todo":
-      return path.join(baseDir, "temporal/project_todo");
+    case "conversation_fork_queue":
+      return path.join(baseDir, "temporal/conversation_fork_queue");
+    case "project_task":
+      return path.join(baseDir, "temporal/project_task");
     case "credit_alerts":
       return path.join(baseDir, "temporal/credit_alerts");
     case "data_retention":
@@ -78,8 +80,6 @@ function getWorkerDirectory(workerName: WorkerName): string | null {
       return path.join(baseDir, "temporal/es_indexation");
     case "workos_events_queue":
       return path.join(baseDir, "temporal/workos_events_queue");
-    case "reinforced_agent":
-      return path.join(baseDir, "temporal/reinforced_agent");
     case "reinforcement":
       return path.join(baseDir, "temporal/reinforcement");
     default:

@@ -15,7 +15,6 @@ import {
   AgentMessageSkillModel,
   ConversationSkillModel,
 } from "@app/lib/models/skill/conversation_skill";
-import { SkillSuggestionModel } from "@app/lib/models/skill/skill_suggestion";
 import { AgentMCPActionResource } from "@app/lib/resources/agent_mcp_action_resource";
 import { AgentStepContentResource } from "@app/lib/resources/agent_step_content_resource";
 import { ContentFragmentResource } from "@app/lib/resources/content_fragment_resource";
@@ -24,9 +23,10 @@ import type { ConversationResource } from "@app/lib/resources/conversation_resou
 import { DataSourceResource } from "@app/lib/resources/data_source_resource";
 import { SandboxResource } from "@app/lib/resources/sandbox_resource";
 import {
-  ProjectTodoConversationModel,
-  ProjectTodoSourceModel,
-} from "@app/lib/resources/storage/models/project_todo";
+  ProjectTaskConversationModel,
+  ProjectTaskSourceModel,
+} from "@app/lib/resources/storage/models/project_task";
+import { WakeUpResource } from "@app/lib/resources/wakeup_resource";
 import type { ConversationWithoutContentType } from "@app/types/assistant/conversation";
 import type { ModelId } from "@app/types/shared/model_id";
 import type { Result } from "@app/types/shared/result";
@@ -41,22 +41,30 @@ async function destroyActionsRelatedResources(
   auth: Authenticator,
   agentMessageIds: Array<ModelId>
 ) {
-  // First, retrieve the MCP actions.
-  const mcpActions = await AgentMCPActionResource.listByAgentMessageIds(
-    auth,
-    agentMessageIds
-  );
+  if (agentMessageIds.length === 0) {
+    return;
+  }
+
+  const actionModelIds =
+    await AgentMCPActionResource.listModelIdsByAgentMessageIds(
+      auth,
+      agentMessageIds
+    );
 
   // Destroy MCP action output items (including GCS cleanup).
   await AgentMCPActionResource.destroyOutputItemsByActionIds(
     auth,
-    mcpActions.map((a) => a.id)
+    actionModelIds
   );
 
   // Destroy the actions.
-  await AgentMCPActionResource.deleteByAgentMessageId(auth, {
-    agentMessageIds,
-  });
+  const deleteActionsResult =
+    await AgentMCPActionResource.deleteByAgentMessageId(auth, {
+      agentMessageIds,
+    });
+  if (deleteActionsResult.isErr()) {
+    throw deleteActionsResult.error;
+  }
 }
 
 async function destroyMessageRelatedResources(
@@ -284,13 +292,6 @@ export async function destroyConversation(
     },
   });
 
-  await SkillSuggestionModel.destroy({
-    where: {
-      workspaceId: owner.id,
-      sourceConversationId: conversation.id,
-    },
-  });
-
   await ConversationSkillModel.destroy({
     where: {
       workspaceId: owner.id,
@@ -298,10 +299,12 @@ export async function destroyConversation(
     },
   });
 
-  await ProjectTodoConversationModel.destroy({
+  await WakeUpResource.deleteByConversation(auth, conversation.toJSON());
+
+  await ProjectTaskConversationModel.destroy({
     where: { workspaceId: owner.id, conversationId: conversation.id },
   });
-  await ProjectTodoSourceModel.destroy({
+  await ProjectTaskSourceModel.destroy({
     where: { workspaceId: owner.id, sourceId: conversation.sId },
   });
 

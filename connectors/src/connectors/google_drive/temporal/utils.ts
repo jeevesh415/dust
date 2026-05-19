@@ -245,23 +245,43 @@ export async function getAuthObject(
   connectionId: string
 ): Promise<OAuth2Client> {
   const oauth2Client = new google.auth.OAuth2();
-  const token = await getOAuthConnectionAccessTokenWithThrow({
-    logger,
-    provider: "google_drive",
-    connectionId,
-  });
 
-  // Do not set expiry_date: without it, googleapis will not attempt to
-  // auto-refresh the token (which fails because we don't set a refresh_token,
-  // by design). If a token expires mid-activity, the API returns a 401 and
-  // Temporal retries the activity with a fresh token.
-  oauth2Client.setCredentials({
+  oauth2Client.refreshHandler = async () => {
+    const token = await getOAuthConnectionAccessTokenWithThrow({
+      logger,
+      provider: "google_drive",
+      connectionId,
+    });
+
+    return getGoogleDriveOAuthCredentials(token);
+  };
+
+  oauth2Client.setCredentials(
+    getGoogleDriveOAuthCredentials(
+      await getOAuthConnectionAccessTokenWithThrow({
+        logger,
+        provider: "google_drive",
+        connectionId,
+      })
+    )
+  );
+
+  return oauth2Client;
+}
+
+function getGoogleDriveOAuthCredentials(
+  token: Awaited<ReturnType<typeof getOAuthConnectionAccessTokenWithThrow>>
+) {
+  if (token.access_token_expiry === null) {
+    throw new Error("Google Drive access token expiry is missing");
+  }
+
+  return {
     access_token: token.access_token,
     scope: (token.scrubbed_raw_json as { scope: string }).scope,
     token_type: (token.scrubbed_raw_json as { token_type: string }).token_type,
-  });
-
-  return oauth2Client;
+    expiry_date: token.access_token_expiry,
+  };
 }
 
 export async function getDriveClient(

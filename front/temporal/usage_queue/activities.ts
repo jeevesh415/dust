@@ -10,7 +10,11 @@ import {
   buildLlmUsageEvents,
   buildToolUseEvents,
 } from "@app/lib/metronome/events";
-import { syncMauCount } from "@app/lib/metronome/mau_sync";
+import {
+  hasMauSubscriptionInContract,
+  syncMauCount,
+} from "@app/lib/metronome/mau_sync";
+import { getActiveContract } from "@app/lib/metronome/plan_type";
 import {
   AgentMessageModel,
   MessageModel,
@@ -214,6 +218,7 @@ export async function emitMetronomeUsageEventsActivity(
   }
   const auth = authResult.value;
   const workspace = auth.getNonNullableWorkspace();
+  const isByok = auth.getNonNullablePlan().isByok;
   const { agentMessageId, conversationId, userMessageId } = agentLoopArgs;
   const userMessageOrigin = agentLoopArgs.userMessageOrigin ?? "web";
 
@@ -234,6 +239,12 @@ export async function emitMetronomeUsageEventsActivity(
 
   const agentMessage = agentMessageRow?.agentMessage;
   if (!agentMessage) {
+    return;
+  }
+
+  // Only send usage events for statuses we track for billing. This ensures
+  // Metronome stays consistent with ES analytics and credit consumption.
+  if (!AGENT_MESSAGE_STATUSES_TO_TRACK.includes(agentMessage.status)) {
     return;
   }
 
@@ -341,6 +352,7 @@ export async function emitMetronomeUsageEventsActivity(
   // Build and ingest events.
   const llmEvents = buildLlmUsageEvents({
     workspaceId: workspace.sId,
+    isByok,
     conversationId,
     userId,
     agentMessageId,
@@ -413,11 +425,27 @@ export async function syncMauCountToMetronomeForAllWorkspacesActivity(): Promise
       }
 
       try {
-        await syncMauCount({
+        const contract = await getActiveContract(workspace.sId);
+        if (!contract) {
+          return;
+        }
+        if (!hasMauSubscriptionInContract(contract)) {
+          return;
+        }
+
+        const result = await syncMauCount({
           metronomeCustomerId: workspace.metronomeCustomerId,
           contractId: subscription.metronomeContractId,
           workspace: renderLightWorkspaceType({ workspace }),
+          contract,
         });
+        if (result.isErr()) {
+          logger.error(
+            { workspaceId: workspace.sId, error: result.error },
+            "[Metronome] Failed to sync MAU count for workspace"
+          );
+          return;
+        }
       } catch (err) {
         logger.error(
           { workspaceId: workspace.sId, error: err },

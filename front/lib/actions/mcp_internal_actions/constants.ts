@@ -14,6 +14,7 @@ import { AGENT_SIDEKICK_AGENT_STATE_SERVER } from "@app/lib/api/actions/servers/
 import { AGENT_SIDEKICK_CONTEXT_SERVER } from "@app/lib/api/actions/servers/agent_sidekick_context/metadata";
 import { ASHBY_SERVER } from "@app/lib/api/actions/servers/ashby/metadata";
 import { ASK_USER_QUESTION_SERVER } from "@app/lib/api/actions/servers/ask_user_question/metadata";
+import { CLARI_COPILOT_SERVER } from "@app/lib/api/actions/servers/clari_copilot/metadata";
 import { COMMON_UTILITIES_SERVER } from "@app/lib/api/actions/servers/common_utilities/metadata";
 import { CONFLUENCE_SERVER } from "@app/lib/api/actions/servers/confluence/metadata";
 import { CONVERSATION_FILES_SERVER } from "@app/lib/api/actions/servers/conversation_files/metadata";
@@ -23,6 +24,7 @@ import { DATABRICKS_SERVER } from "@app/lib/api/actions/servers/databricks/metad
 import { EXTRACT_DATA_SERVER } from "@app/lib/api/actions/servers/extract_data/metadata";
 import { FATHOM_SERVER } from "@app/lib/api/actions/servers/fathom/metadata";
 import { FILE_GENERATION_SERVER } from "@app/lib/api/actions/servers/file_generation/metadata";
+import { FILES_SERVER } from "@app/lib/api/actions/servers/files/metadata";
 import { FRESHSERVICE_SERVER } from "@app/lib/api/actions/servers/freshservice/metadata";
 import { FRONT_SERVER } from "@app/lib/api/actions/servers/front/metadata";
 import { GITHUB_SERVER } from "@app/lib/api/actions/servers/github/metadata";
@@ -48,11 +50,12 @@ import { NOTION_SERVER } from "@app/lib/api/actions/servers/notion/metadata";
 import { OPENAI_USAGE_SERVER } from "@app/lib/api/actions/servers/openai_usage/metadata";
 import { OUTLOOK_CALENDAR_SERVER } from "@app/lib/api/actions/servers/outlook/calendar_metadata";
 import { OUTLOOK_MAIL_SERVER } from "@app/lib/api/actions/servers/outlook/mail_metadata";
+import { PLAN_MODE_SERVER } from "@app/lib/api/actions/servers/plan_mode/metadata";
+import { POD_MANAGER_SERVER } from "@app/lib/api/actions/servers/pod_manager/metadata";
+import { POD_TASKS_SERVER } from "@app/lib/api/actions/servers/pod_tasks/metadata";
 import { POKE_SERVER } from "@app/lib/api/actions/servers/poke/metadata";
 import { PRIMITIVE_TYPES_DEBUGGER_SERVER } from "@app/lib/api/actions/servers/primitive_types_debugger/metadata";
 import { PRODUCTBOARD_SERVER } from "@app/lib/api/actions/servers/productboard/metadata";
-import { PROJECT_MANAGER_SERVER } from "@app/lib/api/actions/servers/project_manager/metadata";
-import { PROJECT_TODOS_SERVER } from "@app/lib/api/actions/servers/project_todos/metadata";
 import {
   QUERY_TABLES_V2_SERVER,
   TABLE_QUERY_V2_SERVER_NAME,
@@ -79,6 +82,7 @@ import { UKG_READY_SERVER } from "@app/lib/api/actions/servers/ukg_ready/metadat
 import { USER_MENTIONS_SERVER } from "@app/lib/api/actions/servers/user_mentions/metadata";
 import { VAL_TOWN_SERVER } from "@app/lib/api/actions/servers/val_town/metadata";
 import { VANTA_SERVER } from "@app/lib/api/actions/servers/vanta/metadata";
+import { WAKEUPS_SERVER } from "@app/lib/api/actions/servers/wakeups/metadata";
 import {
   WEB_SEARCH_BROWSE_SERVER,
   WEB_SEARCH_BROWSE_SERVER_NAME,
@@ -143,8 +147,10 @@ export const AVAILABLE_INTERNAL_MCP_SERVER_NAMES = [
   "agent_memory",
   "agent_router",
   ASHBY_SERVER_NAME,
+  "clari_copilot",
   "confluence",
   "conversation_files",
+  "files",
   "databricks",
   "data_sources_file_system",
   DATA_WAREHOUSE_SERVER_NAME,
@@ -202,11 +208,13 @@ export const AVAILABLE_INTERNAL_MCP_SERVER_NAMES = [
   TABLE_QUERY_V2_SERVER_NAME,
   "skill_management",
   "schedules_management",
-  "project_manager",
-  "project_todos",
+  "pod_manager",
+  "pod_tasks",
   "poke",
   "sandbox",
   "ask_user_question",
+  "wakeups",
+  "plan_mode",
 ] as const;
 
 export const INTERNAL_SERVERS_WITH_WEBSEARCH = [
@@ -322,7 +330,7 @@ export const INTERNAL_MCP_SERVERS = {
     availability: "manual",
     allowMultipleInstances: true,
     isRestricted: ({ featureFlags }) =>
-      featureFlags.includes("official_notion_mcp"),
+      !featureFlags.includes("allow_old_notion_mcp"),
     isPreview: false,
     tools_arguments_requiring_approval: undefined,
     tools_retry_policies: undefined,
@@ -554,9 +562,7 @@ export const INTERNAL_MCP_SERVERS = {
     id: 31,
     availability: "manual" as const,
     allowMultipleInstances: true,
-    isRestricted: ({ featureFlags }) => {
-      return !featureFlags.includes("slack_bot_mcp");
-    },
+    isRestricted: undefined,
     isPreview: true,
     tools_arguments_requiring_approval: undefined,
     tools_retry_policies: undefined,
@@ -828,9 +834,7 @@ export const INTERNAL_MCP_SERVERS = {
     id: 52,
     availability: "manual",
     allowMultipleInstances: true,
-    isRestricted: ({ featureFlags }) => {
-      return !featureFlags.includes("gong_tool");
-    },
+    isRestricted: undefined,
     isPreview: false,
     tools_arguments_requiring_approval: undefined,
     tools_retry_policies: undefined,
@@ -1001,7 +1005,7 @@ export const INTERNAL_MCP_SERVERS = {
     timeoutMs: undefined,
     metadata: SCHEDULES_MANAGEMENT_SERVER,
   },
-  project_manager: {
+  pod_manager: {
     id: 1021,
     availability: "auto_hidden_builder",
     allowMultipleInstances: false,
@@ -1010,14 +1014,14 @@ export const INTERNAL_MCP_SERVERS = {
       return !featureFlags.includes("projects");
     },
     tools_arguments_requiring_approval: {
-      create_conversation: ["dustProject"],
-      add_message_to_conversation: ["dustProject"],
+      create_conversation: ["dustPod"],
+      add_message_to_conversation: ["dustPod"],
     },
     tools_retry_policies: undefined,
     timeoutMs: undefined,
-    metadata: PROJECT_MANAGER_SERVER,
+    metadata: POD_MANAGER_SERVER,
   },
-  project_todos: {
+  pod_tasks: {
     id: 1029,
     availability: "auto_hidden_builder",
     allowMultipleInstances: false,
@@ -1028,7 +1032,7 @@ export const INTERNAL_MCP_SERVERS = {
     tools_arguments_requiring_approval: undefined,
     tools_retry_policies: undefined,
     timeoutMs: undefined,
-    metadata: PROJECT_TODOS_SERVER,
+    metadata: POD_TASKS_SERVER,
   },
   agent_sidekick_context: {
     id: 1022,
@@ -1091,14 +1095,58 @@ export const INTERNAL_MCP_SERVERS = {
     id: 1028,
     availability: "auto",
     allowMultipleInstances: false,
-    isPreview: true,
-    isRestricted: ({ featureFlags }) => {
-      return !featureFlags.includes("ask_user_question_tool");
-    },
+    isPreview: false,
+    isRestricted: undefined,
     tools_arguments_requiring_approval: undefined,
     tools_retry_policies: undefined,
     timeoutMs: undefined,
     metadata: ASK_USER_QUESTION_SERVER,
+  },
+  wakeups: {
+    id: 1031,
+    availability: "auto",
+    allowMultipleInstances: false,
+    isPreview: false,
+    isRestricted: undefined,
+    tools_arguments_requiring_approval: undefined,
+    tools_retry_policies: undefined,
+    timeoutMs: undefined,
+    metadata: WAKEUPS_SERVER,
+  },
+  clari_copilot: {
+    id: 1030,
+    availability: "manual",
+    allowMultipleInstances: true,
+    isRestricted: ({ featureFlags }) =>
+      !featureFlags.includes("clari_copilot_mcp"),
+    isPreview: true,
+    requiresBearerToken: true,
+    tools_arguments_requiring_approval: undefined,
+    tools_retry_policies: undefined,
+    timeoutMs: undefined,
+    metadata: CLARI_COPILOT_SERVER,
+  },
+  plan_mode: {
+    id: 1032,
+    availability: "auto_hidden_builder",
+    allowMultipleInstances: false,
+    isRestricted: ({ featureFlags }) => !featureFlags.includes("plan_mode"),
+    isPreview: true,
+    tools_arguments_requiring_approval: undefined,
+    tools_retry_policies: undefined,
+    timeoutMs: undefined,
+    metadata: PLAN_MODE_SERVER,
+  },
+  files: {
+    id: 1033,
+    availability: "auto_hidden_builder",
+    allowMultipleInstances: false,
+    isRestricted: undefined,
+    isPreview: false,
+    tools_arguments_requiring_approval: undefined,
+    tools_retry_policies: undefined,
+    timeoutMs: undefined,
+    metadata: FILES_SERVER,
   },
   // Using satisfies here instead of: type to avoid TypeScript widening the type and breaking the type inference for AutoInternalMCPServerNameType.
 } satisfies {
@@ -1124,6 +1172,7 @@ type InternalMCPServerEntryCommon = {
   tools_retry_policies: Record<string, MCPToolRetryPolicyType> | undefined;
   timeoutMs: number | undefined;
   requiresBearerToken?: boolean;
+  sensitivityLabelProvider?: string;
   // When false, the server is hidden from direct execution contexts (e.g. sandbox CLI).
   // Defaults to true.
 };
@@ -1288,9 +1337,26 @@ export function getInternalMCPServerNameFromSId(
 export function getInternalMCPServerIconByName(
   name: InternalMCPServerNameType
 ): InternalAllowedIconType {
-  const server: InternalMCPServerEntry = INTERNAL_MCP_SERVERS[name];
+  const server: InternalMCPServerEntry | undefined = INTERNAL_MCP_SERVERS[name];
+  if (!server) {
+    return "ActionRobotIcon";
+  }
 
   return server.metadata.serverInfo.icon;
+}
+
+export function getInternalMCPServerDisplayedAs(
+  toolServerId: string
+): "agent" | "server" | undefined {
+  const name = getInternalMCPServerNameFromSId(toolServerId);
+  if (!name) {
+    return undefined;
+  }
+  const server: InternalMCPServerEntry | undefined = INTERNAL_MCP_SERVERS[name];
+  if (!server) {
+    return undefined;
+  }
+  return server.metadata.serverInfo.displayedAs;
 }
 
 export function getInternalMCPServerToolStakes(
@@ -1372,4 +1438,22 @@ export function getInternalMCPServerMetadata<
   const server = INTERNAL_MCP_SERVERS[name];
 
   return server.metadata;
+}
+
+const SENSITIVITY_LABEL_PROVIDER_BY_SERVER: Partial<
+  Record<InternalMCPServerNameType, "microsoft">
+> = {
+  outlook: "microsoft",
+  microsoft_drive: "microsoft",
+  microsoft_teams: "microsoft",
+};
+
+export function getSensitivityLabelProviderForServerId(
+  sId: string
+): "microsoft" | null {
+  const r = getInternalMCPServerNameAndWorkspaceId(sId);
+  if (r.isErr()) {
+    return null;
+  }
+  return SENSITIVITY_LABEL_PROVIDER_BY_SERVER[r.value.name] ?? null;
 }

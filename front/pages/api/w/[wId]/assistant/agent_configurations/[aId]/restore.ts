@@ -1,4 +1,5 @@
 /** @ignoreswagger */
+// @migration-status: MIGRATED_TO_HONO
 import {
   getAgentConfiguration,
   restoreAgentConfiguration,
@@ -56,6 +57,14 @@ async function handler(
               status_code: 400,
               api_error: {
                 type: "invalid_request_error",
+                message: restoredResult.error.message,
+              },
+            });
+          case "unauthorized":
+            return apiError(req, res, {
+              status_code: 403,
+              api_error: {
+                type: "app_auth_error",
                 message: restoredResult.error.message,
               },
             });

@@ -25,6 +25,7 @@ import type {
 } from "@app/lib/actions/mcp";
 import {
   MCPServerPersonalAuthenticationRequiredError,
+  MCPServerRateLimitedError,
   MCPServerRequiresAdminAuthenticationError,
 } from "@app/lib/actions/mcp_authentication";
 import {
@@ -86,6 +87,7 @@ import { MCPServerViewResource } from "@app/lib/resources/mcp_server_view_resour
 import { RemoteMCPServerToolMetadataResource } from "@app/lib/resources/remote_mcp_server_tool_metadata_resource";
 import { RemoteMCPServerResource } from "@app/lib/resources/remote_mcp_servers_resource";
 import { generateRandomModelSId } from "@app/lib/resources/string_ids_server";
+import { isInShutdown } from "@app/lib/shutdown_signal";
 import { concurrentExecutor } from "@app/lib/utils/async_utils";
 import { fromEvent } from "@app/lib/utils/events";
 import logger from "@app/logger/logger";
@@ -114,6 +116,9 @@ const MCP_NOTIFICATION_EVENT_NAME = "mcp-notification";
 const MCP_TOOL_DONE_EVENT_NAME = "TOOL_DONE" as const;
 const MCP_TOOL_ERROR_EVENT_NAME = "TOOL_ERROR" as const;
 const MCP_TOOL_HEARTBEAT_EVENT_NAME = "TOOL_HEARTBEAT" as const;
+const TOOL_EXECUTION_CANCELLED_MESSAGE = "The tool execution was cancelled.";
+const TOOL_EXECUTION_INTERRUPTED_MESSAGE =
+  "A tool was interrupted before Dust could confirm the result. Please check whether it completed, then retry.";
 
 const EMPTY_INPUT_SCHEMA: JSONSchema = {
   properties: {},
@@ -217,6 +222,7 @@ export function makeServerSideMCPToolConfigurations(
     childAgentId: config.childAgentId,
     timeFrame: config.timeFrame,
     jsonSchema: config.jsonSchema,
+    meta: config.meta,
     additionalConfiguration: config.additionalConfiguration,
     permission: tool.stakeLevel,
     toolServerId: tool.toolServerId,
@@ -258,6 +264,7 @@ function makeClientSideMCPToolConfigurations(
     icon: config.icon,
     argumentsRequiringApproval: tool.argumentsRequiringApproval,
     displayLabels: tool.displayLabels,
+    ...(tool.timeoutMs && { timeoutMs: tool.timeoutMs }),
   }));
 }
 
@@ -451,6 +458,7 @@ export async function* tryCallMCPTool(
             name: toolConfiguration.originalName,
             arguments: inputs,
             _meta: {
+              ...toolConfiguration.meta,
               progressToken,
             },
           },
@@ -524,7 +532,9 @@ export async function* tryCallMCPTool(
     } catch (toolError) {
       if (abortSignal?.aborted) {
         return makeMCPToolExit({
-          message: "The tool execution was cancelled.",
+          message: isInShutdown()
+            ? TOOL_EXECUTION_INTERRUPTED_MESSAGE
+            : TOOL_EXECUTION_CANCELLED_MESSAGE,
           isError: true,
         });
       }
@@ -1279,6 +1289,7 @@ async function listToolsForClientSideMCPServer(
           stakeLevel:
             dustMeta?.stake ?? DEFAULT_CLIENT_SIDE_MCP_TOOL_STAKE_LEVEL,
           argumentsRequiringApproval: dustMeta?.argumentsRequiringApproval,
+          ...(dustMeta?.timeoutMs && { timeoutMs: dustMeta.timeoutMs }),
         };
       }),
     ];
@@ -1410,37 +1421,44 @@ async function listMCPServerToolsAndServerInstructions(
       agentLoopContext: { listToolsContext: agentLoopListToolsContext },
     });
     if (r.isErr()) {
-      // When the workspace connection is broken (admin token revoked/expired),
+      // When the workspace connection is broken (admin token revoked/expired) or hit the rate limit,
       // fall back to cached tools so users are not blocked.
       if (
-        MCPServerRequiresAdminAuthenticationError.is(r.error) &&
         isConnectViaMCPServerId(connectionParams) &&
         isServerSideMCPServerConfiguration(config)
       ) {
-        const remoteMCPServer = await RemoteMCPServerResource.fetchById(
-          auth,
-          connectionParams.mcpServerId
+        const isRateLimited = MCPServerRateLimitedError.is(r.error);
+        const isAuthError = MCPServerRequiresAdminAuthenticationError.is(
+          r.error
         );
-        if (remoteMCPServer?.cachedTools?.length) {
-          logger.warn(
-            {
-              workspaceId: owner.sId,
-              mcpServerId: connectionParams.mcpServerId,
-              cachedToolCount: remoteMCPServer.cachedTools.length,
-            },
-            "Workspace connection broken for remote MCP server, falling back to cached tools"
-          );
-          const cachedToolsRes = await buildToolConfigurationsFromRawTools(
+        if (isRateLimited || isAuthError) {
+          const remoteMCPServer = await RemoteMCPServerResource.fetchById(
             auth,
-            connectionParams.mcpServerId,
-            config,
-            remoteMCPServer.cachedTools
+            connectionParams.mcpServerId
           );
-          if (cachedToolsRes.isOk()) {
-            return new Ok({
-              instructions: undefined,
-              tools: cachedToolsRes.value,
-            });
+          if (remoteMCPServer?.cachedTools?.length) {
+            logger.warn(
+              {
+                workspaceId: owner.sId,
+                mcpServerId: connectionParams.mcpServerId,
+                cachedToolCount: remoteMCPServer.cachedTools.length,
+              },
+              isRateLimited
+                ? "Remote MCP server rate limited, falling back to cached tools"
+                : "Workspace connection broken for remote MCP server, falling back to cached tools"
+            );
+            const cachedToolsRes = await buildToolConfigurationsFromRawTools(
+              auth,
+              connectionParams.mcpServerId,
+              config,
+              remoteMCPServer.cachedTools
+            );
+            if (cachedToolsRes.isOk()) {
+              return new Ok({
+                instructions: undefined,
+                tools: cachedToolsRes.value,
+              });
+            }
           }
         }
       }

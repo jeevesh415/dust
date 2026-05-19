@@ -9,7 +9,10 @@ export class ProjectMetadataModel extends WorkspaceAwareModel<ProjectMetadataMod
   declare createdAt: CreationOptional<Date>;
   declare updatedAt: CreationOptional<Date>;
   declare archivedAt: CreationOptional<Date | null>;
-
+  declare lastTodoAnalysisAt: CreationOptional<Date | null>;
+  declare todoGenerationEnabled: CreationOptional<boolean>;
+  /** First-run window only; cleared after first successful analysis. Internal / workflow. */
+  declare initialTodoAnalysisLookback: CreationOptional<string | null>;
   declare spaceId: ForeignKey<SpaceModel["id"]>;
 
   declare description: string | null;
@@ -33,6 +36,19 @@ ProjectMetadataModel.init(
     },
     archivedAt: {
       type: DataTypes.DATE,
+      allowNull: true,
+    },
+    lastTodoAnalysisAt: {
+      type: DataTypes.DATE,
+      allowNull: true,
+    },
+    todoGenerationEnabled: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+    initialTodoAnalysisLookback: {
+      type: DataTypes.STRING,
       allowNull: true,
     },
   },

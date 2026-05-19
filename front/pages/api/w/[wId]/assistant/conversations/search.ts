@@ -1,4 +1,5 @@
 /** @ignoreswagger */
+// @migration-status: MIGRATED_TO_HONO
 import { withSessionAuthenticationForWorkspace } from "@app/lib/api/auth_wrappers";
 import { getPaginationParams } from "@app/lib/api/pagination";
 import type { Authenticator } from "@app/lib/auth";
@@ -32,7 +33,7 @@ async function handler(
     });
   }
 
-  const paginationRes = getPaginationParams(req, {
+  const paginationRes = getPaginationParams(req.query, {
     defaultLimit: 20,
     defaultOrderColumn: "updatedAt",
     defaultOrderDirection: "desc",

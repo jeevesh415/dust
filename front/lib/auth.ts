@@ -64,14 +64,12 @@ const DUST_INTERNAL_EMAIL_REGEXP = /^[^@]+@dust\.tt$/;
 
 const DustApiKeyNameHeader = "x-dust-api-key-name";
 
-const SANDBOX_TOKEN_AUTH_METHOD = "sandbox_token" as const;
-
 export type AuthMethodType =
   | "system_api_key"
   | "api_key"
   | "oauth"
   | "session"
-  | typeof SANDBOX_TOKEN_AUTH_METHOD
+  | "sandbox_token"
   | "internal";
 
 export const isSandboxTokenPrefix = (token: string): boolean =>
@@ -97,7 +95,7 @@ export interface AuthenticatorType {
  * This is a class that will be used to check if a user can perform an action on a resource.
  * It acts as a central place to enforce permissioning across all of Dust.
  *
- * It explicitely does not store a reference to the current user to make sure our permissions are
+ * It explicitly does not store a reference to the current user to make sure our permissions are
  * workspace oriented. Use `getUserFromSession` if needed.
  */
 export class Authenticator {
@@ -487,7 +485,7 @@ export class Authenticator {
 
     const [workspace, user] = await Promise.all([
       WorkspaceResource.fetchById(wId),
-      UserResource.fetchById(claims.uId),
+      claims.uId ? UserResource.fetchById(claims.uId) : Promise.resolve(null),
     ]);
 
     if (!workspace) {
@@ -500,7 +498,7 @@ export class Authenticator {
       });
     }
 
-    if (!user) {
+    if (claims.uId && !user) {
       return new Err({
         status_code: 401,
         api_error: {
@@ -510,42 +508,76 @@ export class Authenticator {
       });
     }
 
-    const authData = await this.fetchRoleGroupsAndSubscription({
-      user,
-      workspace,
-    });
+    let role: RoleType;
+    let baseGroupModelIds: ModelId[];
+    let subscription: SubscriptionResource | null;
 
-    if (authData.role === "none") {
-      return new Err({
-        status_code: 401,
-        api_error: {
-          type: "invalid_sandbox_token_error",
-          message: "The user is not a member of this workspace.",
-        },
+    if (user) {
+      const authData = await this.fetchRoleGroupsAndSubscription({
+        user,
+        workspace,
       });
+
+      if (authData.role === "none") {
+        return new Err({
+          status_code: 401,
+          api_error: {
+            type: "invalid_sandbox_token_error",
+            message: "The user is not a member of this workspace.",
+          },
+        });
+      }
+
+      role = authData.role;
+      baseGroupModelIds = authData.groupModelIds;
+      subscription = authData.subscription;
+    } else {
+      // Userless sandbox token: conversation was driven by a non-human actor
+      // (e.g. Slack bot user). Grant the lowest authenticated workspace role
+      // and start from the workspace global group; conversation-space
+      // restriction below still applies.
+      const [globalGroup, activeSubscription] = await Promise.all([
+        GroupResource.internalFetchWorkspaceGlobalGroup(workspace.id),
+        SubscriptionResource.fetchActiveByWorkspaceModelId(workspace.id),
+      ]);
+
+      if (!globalGroup) {
+        return new Err({
+          status_code: 500,
+          api_error: {
+            type: "invalid_sandbox_token_error",
+            message:
+              "Could not resolve workspace global group for userless sandbox token.",
+          },
+        });
+      }
+
+      role = "user";
+      baseGroupModelIds = [globalGroup.id];
+      subscription = activeSubscription;
     }
 
     // Restrict groups to the conversation's spaces so the sandbox auth can only
     // access resources visible to the conversation, not everything the user can.
     const groupModelIds = await this.restrictGroupsToConversationSpaces(
-      authData.groupModelIds,
+      baseGroupModelIds,
       claims.cId,
       workspace.id
     );
 
     const providersHealth = await this.fetchByokProvidersHealth(
       workspace,
-      authData.subscription
+      subscription
     );
 
     return new Ok(
       new Authenticator({
-        authMethod: SANDBOX_TOKEN_AUTH_METHOD,
+        authMethod: "sandbox_token",
         workspace,
-        user,
-        role: authData.role,
+        user: user ?? undefined,
+        role,
         groupModelIds,
-        subscription: authData.subscription,
+        subscription,
         providersHealth,
       })
     );
@@ -704,52 +736,6 @@ export class Authenticator {
     };
   }
 
-  // /!\ This method is intended exclusively for use within the registry lookup context.
-  // It securely authenticates access by verifying a provided secret against the
-  // configured registry secret. If the secret is valid, it retrieves the specified
-  // workspace and its associated group resources using a system API key.
-  // Modifications to this method should be handled with caution, as it involves
-  // sensitive operations related to secret validation and workspace access.
-  static async fromRegistrySecret({
-    groupIds,
-    secret,
-    workspaceId,
-  }: {
-    groupIds: string[];
-    secret: string;
-    workspaceId: string;
-  }) {
-    if (secret !== config.getDustRegistrySecret()) {
-      throw new Error("Invalid secret for registry lookup");
-    }
-
-    const workspace = await WorkspaceResource.fetchById(workspaceId);
-    if (!workspace) {
-      throw new Error(`Could not find workspace with sId ${workspaceId}`);
-    }
-
-    // We use the system key for the workspace to fetch the groups.
-    const systemKeyForWorkspaceRes = await getOrCreateSystemApiKey(
-      renderLightWorkspaceType({ workspace })
-    );
-    if (systemKeyForWorkspaceRes.isErr()) {
-      throw new Error(`Could not get system key for workspace ${workspaceId}`);
-    }
-
-    const groups = await GroupResource.listGroupsWithSystemKey(
-      systemKeyForWorkspaceRes.value,
-      groupIds
-    );
-
-    return new Authenticator({
-      authMethod: "internal",
-      groupModelIds: groups.map((g) => g.id),
-      role: "builder",
-      subscription: null,
-      workspace,
-    });
-  }
-
   /**
    * Creates an Authenticator for a given workspace (with role `builder`). Used for internal calls
    * to the Dust API or other functions, when the system is calling something for the workspace.
@@ -905,6 +891,7 @@ export class Authenticator {
       user,
       subscription: auth._subscription,
       workspace: auth._workspace,
+      providersHealth: auth._providersHealth,
     });
   }
 
@@ -918,6 +905,7 @@ export class Authenticator {
       subscription: this._subscription,
       workspace: this._workspace,
       clientIp: this._clientIp,
+      providersHealth: this._providersHealth,
     });
   }
 
@@ -958,7 +946,7 @@ export class Authenticator {
   }
 
   isSandboxToken(): boolean {
-    return this._authMethod === SANDBOX_TOKEN_AUTH_METHOD;
+    return this._authMethod === "sandbox_token";
   }
 
   authMethod(): AuthMethodType {
@@ -975,6 +963,7 @@ export class Authenticator {
           // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
           segmentation: this._workspace.segmentation || null,
           ssoEnforced: this._workspace.ssoEnforced,
+          regionalModelsOnly: this._workspace.regionalModelsOnly,
           workOSOrganizationId: this._workspace.workOSOrganizationId,
           whiteListedProviders: this._workspace.whiteListedProviders,
           defaultEmbeddingProvider: this._workspace.defaultEmbeddingProvider,
@@ -1290,14 +1279,12 @@ export async function getSession(
 }
 
 /**
- * Gets the Bearer token from the request.
- * @param req
- * @returns
+ * Extracts the Bearer token from an Authorization header value.
  */
 export async function getBearerToken(
-  req: NextApiRequest
+  authHeader: string | undefined
 ): Promise<Result<string, APIErrorWithStatusCode>> {
-  if (!req.headers.authorization) {
+  if (!authHeader) {
     return new Err({
       status_code: 401,
       api_error: {
@@ -1307,9 +1294,7 @@ export async function getBearerToken(
     });
   }
 
-  const parse = req.headers.authorization.match(
-    /^Bearer\s+([A-Za-z0-9-._~+/]+=*)$/i
-  );
+  const parse = authHeader.match(/^Bearer\s+([A-Za-z0-9-._~+/]+=*)$/i);
   if (!parse || !parse[1]) {
     return new Err({
       status_code: 401,
@@ -1340,9 +1325,9 @@ export type BearerTokenError =
  * or Ok(null) if no bearer token is present, or Ok(session) on success.
  */
 export async function getSessionFromBearerToken(
-  req: NextApiRequest
+  authHeader: string | undefined
 ): Promise<Result<SessionWithUser | null, BearerTokenError>> {
-  const bearerTokenRes = await getBearerToken(req);
+  const bearerTokenRes = await getBearerToken(authHeader);
   if (bearerTokenRes.isErr()) {
     return new Ok(null);
   }
@@ -1395,14 +1380,13 @@ export async function getSessionFromBearerToken(
 }
 
 /**
- * Retrieves the API Key from the request.
- * @param req NextApiRequest request object
+ * Retrieves the API Key from the Authorization header value.
  * @returns Result<Key, APIErrorWithStatusCode>
  */
 export async function getAPIKey(
-  req: NextApiRequest
+  authHeader: string | undefined
 ): Promise<Result<KeyResource, APIErrorWithStatusCode>> {
-  const token = await getBearerToken(req);
+  const token = await getBearerToken(authHeader);
 
   if (token.isErr()) {
     return new Err(token.error);

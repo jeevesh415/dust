@@ -12,7 +12,7 @@ import { CharacterCount, Placeholder } from "@tiptap/extensions";
 import type { Transaction } from "@tiptap/pm/state";
 import type { Editor } from "@tiptap/react";
 import { EditorContent, useEditor } from "@tiptap/react";
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 function useEditorService(editor: Editor | null) {
   return useMemo(() => {
@@ -88,7 +88,6 @@ function useEditorService(editor: Editor | null) {
 interface UseSkillInstructionsEditorProps {
   content: string;
   htmlContent?: string;
-  withDocumentExtensions?: boolean;
   isReadOnly: boolean;
   onUpdate?: (props: { editor: Editor; transaction: Transaction }) => void;
   onBlur?: () => void;
@@ -111,7 +110,6 @@ const skillInstructionsEditableExtensions = [
 export function useSkillInstructionsEditor({
   content,
   htmlContent,
-  withDocumentExtensions = false,
   isReadOnly,
   onUpdate,
   onBlur,
@@ -121,14 +119,14 @@ export function useSkillInstructionsEditor({
     () =>
       buildSkillInstructionsExtensions(
         isReadOnly,
-        skillInstructionsEditableExtensions,
-        { withDocumentExtensions }
+        skillInstructionsEditableExtensions
       ),
-    [isReadOnly, withDocumentExtensions]
+    [isReadOnly]
   );
 
   // Track if initial content has been set
   const initialContentSetRef = useRef(false);
+  const [isContentReady, setIsContentReady] = useState(false);
 
   const editor = useEditor(
     {
@@ -166,12 +164,13 @@ export function useSkillInstructionsEditor({
             });
           }
           initialContentSetRef.current = true;
+          setIsContentReady(true);
         }
       });
     }
   }, [editor, content, htmlContent]);
 
-  return { editor, editorService };
+  return { editor, editorService, isContentReady };
 }
 
 const readOnlyStyles = cn(

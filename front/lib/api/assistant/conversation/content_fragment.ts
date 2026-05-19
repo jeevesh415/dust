@@ -21,14 +21,19 @@ import {
   isContentFragmentInputWithFileId,
   isSupportedContentNodeFragmentContentType,
 } from "@app/types/api/internal/assistant";
+import type { ConversationWithoutContentType } from "@app/types/assistant/conversation";
 import type {
   ContentNodeType,
   CoreAPIContentNode,
 } from "@app/types/core/content_node";
 import { DATA_SOURCE_NODE_ID } from "@app/types/core/content_node";
 import { CoreAPI } from "@app/types/core/core_api";
-import type { SupportedFileContentType } from "@app/types/files";
-import { extensionsForContentType } from "@app/types/files";
+import type { AllSupportedFileContentType } from "@app/types/files";
+import {
+  extensionsForContentType,
+  isAllSupportedFileContentType,
+  isConversationFileUseCase,
+} from "@app/types/files";
 import type { ModelId } from "@app/types/shared/model_id";
 import type { Result } from "@app/types/shared/result";
 import { Err, Ok } from "@app/types/shared/result";
@@ -37,13 +42,12 @@ import type { DustMimeType } from "@dust-tt/client";
 
 import {
   DATA_SOURCE_MIME_TYPE,
-  isSupportedFileContentType,
   // biome-ignore lint/plugin/enforceClientTypesInPublicApi: existing usage
 } from "@dust-tt/client";
 import assert from "assert";
 
 interface ContentFragmentBlob {
-  contentType: DustMimeType | SupportedFileContentType;
+  contentType: DustMimeType | AllSupportedFileContentType;
   fileId: ModelId | null;
   nodeId: string | null;
   nodeDataSourceViewId: ModelId | null;
@@ -56,11 +60,15 @@ interface ContentFragmentBlob {
 export async function toFileContentFragment(
   auth: Authenticator,
   {
+    conversation,
     contentFragment,
     fileName,
+    skipDataSourceIndexing,
   }: {
+    conversation: ConversationWithoutContentType;
     contentFragment: ContentFragmentInputWithInlinedContent;
     fileName?: string;
+    skipDataSourceIndexing?: boolean;
   }
 ): Promise<
   Result<ContentFragmentInputWithFileIdType, ProcessAndStoreFileError>
@@ -74,7 +82,9 @@ export async function toFileContentFragment(
     userId: auth.user()?.id,
     workspaceId: auth.getNonNullableWorkspace().id,
     useCase: "conversation",
-    useCaseMetadata: null,
+    useCaseMetadata: skipDataSourceIndexing
+      ? { skipDataSourceIndexing: true, conversationId: conversation.sId }
+      : { conversationId: conversation.sId },
   });
 
   const processRes = await processAndStoreFile(auth, {
@@ -114,12 +124,14 @@ export async function getContentFragmentBlob(
     }
 
     assert(
-      isSupportedFileContentType(file.contentType),
+      isAllSupportedFileContentType(file.contentType),
       "File must have a supported content type."
     );
 
-    if (file.useCase !== "conversation") {
-      return new Err(new Error("File not meant to be used in a conversation."));
+    if (!isConversationFileUseCase(file.useCase)) {
+      return new Err(
+        new Error("File not meant to be attached in a conversation.")
+      );
     }
 
     if (!file.isReady) {

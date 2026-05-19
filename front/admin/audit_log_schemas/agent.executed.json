@@ -9,8 +9,12 @@
     }
   ],
   "metadata": {
-    "conversationId": "string",
-    "agentName": "string",
-    "origin": "string"
+    "agent_name": "string",
+    "conversation_id": "string",
+    "origin": "string",
+    "trigger_id": "string",
+    "actor_type": "string",
+    "initiating_user_id": "string",
+    "initiating_user_email": "string"
   }
 }

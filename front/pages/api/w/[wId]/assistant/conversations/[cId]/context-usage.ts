@@ -1,4 +1,5 @@
 /** @ignoreswagger */
+// @migration-status: MIGRATED_TO_HONO
 import { withSessionAuthenticationForWorkspace } from "@app/lib/api/auth_wrappers";
 import type { Authenticator } from "@app/lib/auth";
 import { getModelConfigByModelId } from "@app/lib/llms/model_configurations";
@@ -10,9 +11,15 @@ import { isString } from "@app/types/shared/utils/general";
 import type { NextApiRequest, NextApiResponse } from "next";
 
 export type GetConversationContextUsageResponse = {
-  model: SupportedModel;
-  contextUsage: number;
-  contextSize: number;
+  model: SupportedModel | null;
+  contextUsage: number | null;
+  contextSize: number | null;
+};
+
+const PENDING_CONTEXT_USAGE_RESPONSE: GetConversationContextUsageResponse = {
+  model: null,
+  contextUsage: null,
+  contextSize: null,
 };
 
 async function handler(
@@ -46,43 +53,77 @@ async function handler(
         });
       }
 
-      const run = await conversation.getLatestAgentMessageRun(auth);
-      if (!run) {
-        return apiError(req, res, {
-          status_code: 404,
-          api_error: {
-            type: "conversation_context_usage_not_found",
-            message: "Latest agent message has no run data.",
+      const [lastAgentRun, lastCompactionRun] = await Promise.all([
+        conversation.getLatestAgentMessageRun(auth),
+        conversation.getLatestCompactionMessageRun(auth),
+      ]);
+
+      if (
+        lastCompactionRun &&
+        lastCompactionRun.rank >= (lastAgentRun?.rank || 0)
+      ) {
+        // If the lastest run is a compaction run we provide a best guess estimate of the context
+        // usage with the compaction generated tokens. This misses the system prompt context usage
+        // but this will recover at the next agent message and allow us in a somewhat hacky but
+        // minimal way to show reduciton of context usage as soon as possible.
+        const usages = await lastCompactionRun.run.listRunUsages(auth);
+        if (usages.length === 0) {
+          return res.status(200).json(PENDING_CONTEXT_USAGE_RESPONSE);
+        }
+
+        const maxUsage = usages.reduce((max, u) =>
+          u.completionTokens > max.completionTokens ? u : max
+        );
+
+        const modelConfig = getModelConfigByModelId(maxUsage.modelId);
+
+        return res.status(200).json({
+          model: {
+            providerId: maxUsage.providerId,
+            modelId: maxUsage.modelId,
           },
+          contextUsage: maxUsage.completionTokens,
+          contextSize: modelConfig?.contextSize ?? 0,
+        });
+      } else {
+        if (!lastAgentRun) {
+          return res.status(200).json(PENDING_CONTEXT_USAGE_RESPONSE);
+        }
+
+        let usages = await lastAgentRun.run.listRunUsages(auth);
+
+        if (usages.length === 0) {
+          // The latest run has no usage rows yet (still processing). Fall back to the previous
+          // completed run so the indicator stays stable instead of dropping to 0%.
+          const previousAgentRun = await conversation.getLatestAgentMessageRun(
+            auth,
+            { maxRank: lastAgentRun.rank - 1 }
+          );
+          if (previousAgentRun) {
+            usages = await previousAgentRun.run.listRunUsages(auth);
+          }
+        }
+
+        if (usages.length === 0) {
+          return res.status(200).json(PENDING_CONTEXT_USAGE_RESPONSE);
+        }
+
+        // Take the max promptTokens across usages of the run — this represents the peak
+        // context usage as seen by the model.
+        const maxUsage = usages.reduce((max, u) =>
+          u.promptTokens > max.promptTokens ? u : max
+        );
+        const modelConfig = getModelConfigByModelId(maxUsage.modelId);
+
+        return res.status(200).json({
+          model: {
+            providerId: maxUsage.providerId,
+            modelId: maxUsage.modelId,
+          },
+          contextUsage: maxUsage.promptTokens,
+          contextSize: modelConfig?.contextSize ?? 0,
         });
       }
-
-      const usages = await run.listRunUsages(auth);
-      if (usages.length === 0) {
-        return apiError(req, res, {
-          status_code: 404,
-          api_error: {
-            type: "conversation_context_usage_not_found",
-            message: "No run usage found for the last agent message.",
-          },
-        });
-      }
-
-      // Take the max promptTokens across usages of the latest run — this represents the peak
-      // context usage as seen by the model.
-      const maxUsage = usages.reduce((max, u) =>
-        u.promptTokens > max.promptTokens ? u : max
-      );
-      const modelConfig = getModelConfigByModelId(maxUsage.modelId);
-
-      return res.status(200).json({
-        model: {
-          providerId: maxUsage.providerId,
-          modelId: maxUsage.modelId,
-        },
-        contextUsage: maxUsage.promptTokens,
-        contextSize: modelConfig?.contextSize ?? 0,
-      });
     }
 
     default:

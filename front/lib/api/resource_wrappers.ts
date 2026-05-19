@@ -1,3 +1,8 @@
+import {
+  buildAuditLogTarget,
+  emitAuditLogEvent,
+  getAuditLogContext,
+} from "@app/lib/api/audit/workos_audit";
 import { Authenticator } from "@app/lib/auth";
 import type { SessionWithUser } from "@app/lib/iam/provider";
 import { DataSourceResource } from "@app/lib/resources/data_source_resource";
@@ -6,6 +11,14 @@ import { SpaceResource } from "@app/lib/resources/space_resource";
 import { apiError } from "@app/logger/withlogging";
 import type { WithAPIErrorResponse } from "@app/types/error";
 import type { NextApiRequest, NextApiResponse } from "next";
+
+function deriveAccessMethod(auth: Authenticator): string {
+  const key = auth.key();
+  if (key) {
+    return key.isSystem ? "system_key" : "api_key";
+  }
+  return "ui";
+}
 
 const RESOURCE_KEYS = ["space", "dataSource", "dataSourceView"] as const;
 
@@ -130,6 +143,7 @@ export function withResourceFetchingFromRoute<
       options: Partial<OptionsMap<ResourceKey>>,
       sessionOrKeyAuth: A
     ) => {
+      console.log(req.url);
       const keys = RESOURCE_KEYS.filter((key) => key in options);
       if (!isResourceMap<U>(resources, keys)) {
         return apiError(req, res, {
@@ -191,13 +205,33 @@ function withSpaceFromRoute<T, A extends SessionOrKeyAuthType>(
           : // casting is fine since conditions checked above exclude
             // possibility of `spaceId` being undefined
             await SpaceResource.fetchById(auth, spaceId as string);
-
       if (!spaceCheck(space) || !hasPermission(auth, space, options.space)) {
         return apiError(req, res, {
           status_code: 404,
           api_error: {
             type: "space_not_found",
             message: "The space you requested was not found.",
+          },
+        });
+      }
+
+      // Emit space.accessed for restricted spaces only — unrestricted spaces
+      // would produce high-volume noise with limited security value.
+      const spaceJSON = space.toJSON();
+      if (spaceJSON.isRestricted) {
+        void emitAuditLogEvent({
+          auth,
+          action: "space.accessed",
+          targets: [
+            buildAuditLogTarget("workspace", auth.getNonNullableWorkspace()),
+            buildAuditLogTarget("space", space),
+          ],
+          context: getAuditLogContext(auth, req),
+          metadata: {
+            space_name: space.name,
+            space_kind: spaceJSON.kind,
+            is_restricted: "true",
+            access_method: deriveAccessMethod(auth),
           },
         });
       }

@@ -11,17 +11,29 @@ export class SandboxFactory {
     opts?: {
       status?: SandboxStatus;
       statusChangedAt?: Date | null;
+      baseImage?: string;
+      version?: string;
+      killRequestedAt?: Date | null;
     }
   ): Promise<SandboxResource> {
     const sandbox = await SandboxResource.makeNew(auth, {
       conversationId: conversation.id,
       providerId: `test-provider-${Date.now()}`,
       status: opts?.status ?? "running",
+      baseImage: opts?.baseImage ?? "dust-base",
+      version: opts?.version ?? "0.0.0-test",
     });
 
     if (opts?.statusChangedAt !== undefined) {
       await SandboxModel.update(
         { statusChangedAt: opts.statusChangedAt } as Partial<SandboxModel>,
+        { where: { id: sandbox.id } }
+      );
+    }
+
+    if (opts?.killRequestedAt !== undefined) {
+      await SandboxModel.update(
+        { killRequestedAt: opts.killRequestedAt } as Partial<SandboxModel>,
         { where: { id: sandbox.id } }
       );
     }

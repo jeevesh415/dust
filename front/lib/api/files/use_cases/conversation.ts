@@ -14,6 +14,8 @@ const SUPPORTED_CONTENT_TYPES: Set<AllSupportedFileContentType> = new Set([
   "audio/wav",
   "audio/x-wav",
   "audio/webm",
+  // Chrome sometimes uses video/webm for audio files, and we can still process them as audio only files
+  "video/webm",
   "audio/ogg",
   "audio/x-m4a",
 
@@ -31,6 +33,7 @@ const SUPPORTED_CONTENT_TYPES: Set<AllSupportedFileContentType> = new Set([
   "application/vnd.ms-excel",
   "text/csv",
   "text/tab-separated-values",
+  "text/tsv",
 
   // Plain text and code (used as-is).
   "application/octet-stream",

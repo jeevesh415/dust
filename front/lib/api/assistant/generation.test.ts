@@ -12,9 +12,11 @@ import {
 import type { Authenticator } from "@app/lib/auth";
 import { getSupportedModelConfigs } from "@app/lib/llms/model_configurations";
 import { AgentMemoryResource } from "@app/lib/resources/agent_memory_resource";
+import { SkillResource } from "@app/lib/resources/skill/skill_resource";
 import { AgentConfigurationFactory } from "@app/tests/utils/AgentConfigurationFactory";
 import { ConversationFactory } from "@app/tests/utils/ConversationFactory";
 import { createResourceTest } from "@app/tests/utils/generic_resource_tests";
+import { SkillFactory } from "@app/tests/utils/SkillFactory";
 import type { AgentConfigurationType } from "@app/types/assistant/agent";
 import { GLOBAL_AGENTS_SID } from "@app/types/assistant/assistant";
 import type {
@@ -25,6 +27,18 @@ import type {
 import type { ModelConfigurationType } from "@app/types/assistant/models/types";
 import type { WorkspaceType } from "@app/types/user";
 import { beforeEach, describe, expect, it } from "vitest";
+
+function createForkedData(user: NonNullable<UserMessageType["user"]>) {
+  return {
+    forkedFrom: {
+      parentConversationId: "conv_parent",
+      parentConversationTitle: "Parent conversation",
+      sourceMessageId: "msg_parent_source",
+      branchedAt: Date.now(),
+      user,
+    },
+  };
+}
 
 describe("constructPromptMultiActions - system prompt stability", () => {
   // This test ensures that the system prompt remains stable across multiple calls
@@ -42,6 +56,7 @@ describe("constructPromptMultiActions - system prompt stability", () => {
   let agentConfig2: AgentConfigurationType;
   let userMessage2: UserMessageType;
   let conversation2: ConversationType;
+  let branchingUser1: NonNullable<UserMessageType["user"]>;
 
   let modelConfig: ModelConfigurationType;
 
@@ -72,6 +87,10 @@ describe("constructPromptMultiActions - system prompt stability", () => {
       origin: "web",
     });
     userMessage1 = um1;
+    if (!um1.user) {
+      throw new Error("Expected test user message to have a user.");
+    }
+    branchingUser1 = um1.user;
 
     // Set up second workspace with different conversation
     const setup2 = await createResourceTest({ role: "admin" });
@@ -115,6 +134,7 @@ describe("constructPromptMultiActions - system prompt stability", () => {
       model: modelConfig,
       hasAvailableActions: true,
       agentsList: null,
+      systemSkills: [],
       enabledSkills: [],
       equippedSkills: [],
     };
@@ -133,6 +153,7 @@ describe("constructPromptMultiActions - system prompt stability", () => {
       model: modelConfig,
       hasAvailableActions: true,
       agentsList: null,
+      systemSkills: [],
       enabledSkills: [],
       equippedSkills: [],
     };
@@ -176,6 +197,7 @@ describe("constructPromptMultiActions - system prompt stability", () => {
       model: modelConfig,
       hasAvailableActions: true,
       agentsList: null,
+      systemSkills: [],
       enabledSkills: [],
       equippedSkills: [],
       conversation: conversation1,
@@ -187,6 +209,7 @@ describe("constructPromptMultiActions - system prompt stability", () => {
       model: modelConfig,
       hasAvailableActions: true,
       agentsList: null,
+      systemSkills: [],
       enabledSkills: [],
       equippedSkills: [],
       conversation: conversation2,
@@ -213,6 +236,7 @@ describe("constructPromptMultiActions - system prompt stability", () => {
       model: modelConfig,
       hasAvailableActions: true,
       agentsList: null,
+      systemSkills: [],
       enabledSkills: [],
       equippedSkills: [],
     };
@@ -240,6 +264,7 @@ describe("constructPromptMultiActions - system prompt stability", () => {
       model: modelConfig,
       hasAvailableActions: true,
       agentsList: null,
+      systemSkills: [],
       enabledSkills: [],
       equippedSkills: [],
     };
@@ -276,6 +301,7 @@ describe("constructPromptMultiActions - system prompt stability", () => {
       model: modelConfig,
       hasAvailableActions: true,
       agentsList: null,
+      systemSkills: [],
       enabledSkills: [],
       equippedSkills: [],
       userContext: userCtx,
@@ -308,6 +334,84 @@ describe("constructPromptMultiActions - system prompt stability", () => {
     expect(userSection?.content).toContain("Engineering");
   });
 
+  it("should include branch context in flat prompts using user-facing branch wording", () => {
+    const params = {
+      userMessage: userMessage1,
+      agentConfiguration: agentConfig1,
+      model: modelConfig,
+      hasAvailableActions: true,
+      agentsList: null,
+      systemSkills: [],
+      enabledSkills: [],
+      equippedSkills: [],
+      conversation: {
+        ...conversation1,
+        forkingData: createForkedData(branchingUser1),
+      } satisfies ConversationWithoutContentType,
+    };
+
+    const sections = constructPromptMultiActions(authenticator1, params);
+    const text = systemPromptToText(sections);
+
+    expect(text).toContain("# BRANCH CONTEXT");
+    expect(text).toContain(
+      'This conversation was branched from "Parent conversation".'
+    );
+    expect(text).toContain(
+      "This conversation starts from a summary of the parent conversation at the branch point."
+    );
+    expect(text).toContain(
+      "Available tools and enabled skills from the parent conversation were carried over into this conversation."
+    );
+    expect(text).toContain(
+      "Conversation attachments and tool outputs available at the branch point were also carried over into this conversation."
+    );
+    expect(text).not.toContain("child conversation");
+    expect(text).not.toContain("source message");
+  });
+
+  it("should place branch context in ephemeral tier for structured prompts", () => {
+    const deepDiveConfig = {
+      ...agentConfig1,
+      sId: GLOBAL_AGENTS_SID.DEEP_DIVE,
+      scope: "global" as const,
+    };
+
+    const params = {
+      userMessage: userMessage1,
+      agentConfiguration: deepDiveConfig,
+      model: modelConfig,
+      hasAvailableActions: true,
+      agentsList: null,
+      systemSkills: [],
+      enabledSkills: [],
+      equippedSkills: [],
+      conversation: {
+        ...conversation1,
+        forkingData: createForkedData(branchingUser1),
+      } satisfies ConversationWithoutContentType,
+    };
+
+    const sections = constructPromptMultiActions(authenticator1, params);
+    const { instructions, sharedContext, ephemeralContext } =
+      normalizePrompt(sections);
+
+    expect(instructions[0]?.content).not.toContain("# BRANCH CONTEXT");
+    expect(
+      sharedContext.some((section) =>
+        section.content.includes("# BRANCH CONTEXT")
+      )
+    ).toBe(false);
+
+    const branchSection = ephemeralContext.find((section) =>
+      section.content.includes("# BRANCH CONTEXT")
+    );
+    expect(branchSection).toBeDefined();
+    expect(branchSection?.content).toContain(
+      'This conversation was branched from "Parent conversation".'
+    );
+  });
+
   it("should include memoriesContext in prompt output when provided", () => {
     const memoriesContext =
       "<existing_memories>\n- User prefers TypeScript (saved Jan 15, 2025).\n</existing_memories>";
@@ -318,6 +422,7 @@ describe("constructPromptMultiActions - system prompt stability", () => {
       model: modelConfig,
       hasAvailableActions: true,
       agentsList: null,
+      systemSkills: [],
       enabledSkills: [],
       equippedSkills: [],
       memoriesContext,
@@ -330,6 +435,46 @@ describe("constructPromptMultiActions - system prompt stability", () => {
     expect(text).toContain("User prefers TypeScript");
   });
 
+  it("should include system skills in the enabled skills section when passed separately", async () => {
+    await SkillFactory.linkGlobalSkillToAgent(authenticator1, {
+      globalSkillId: "discover_skills",
+      agentConfigurationId: agentConfig1.id,
+    });
+
+    const { systemSkills } = await SkillResource.listForAgentLoop(
+      authenticator1,
+      {
+        agentConfiguration: agentConfig1,
+        conversation: conversation1,
+      }
+    );
+    const discoverSkills = systemSkills.find(
+      (skill) => skill.sId === "discover_skills"
+    );
+    if (!discoverSkills) {
+      throw new Error("Expected discover_skills system skill to exist.");
+    }
+
+    const params = {
+      userMessage: userMessage1,
+      agentConfiguration: agentConfig1,
+      model: modelConfig,
+      hasAvailableActions: true,
+      agentsList: null,
+      systemSkills: [discoverSkills],
+      enabledSkills: [],
+      equippedSkills: [],
+    };
+
+    const sections = constructPromptMultiActions(authenticator1, params);
+    const text = systemPromptToText(sections);
+
+    expect(text).toContain("### ENABLED SKILLS");
+    expect(text).toContain(
+      "Some of the available skills come from the workspace"
+    );
+  });
+
   it("should produce a valid prompt when memoriesContext is omitted", () => {
     const params = {
       userMessage: userMessage1,
@@ -337,6 +482,7 @@ describe("constructPromptMultiActions - system prompt stability", () => {
       model: modelConfig,
       hasAvailableActions: true,
       agentsList: null,
+      systemSkills: [],
       enabledSkills: [],
       equippedSkills: [],
     };
@@ -347,6 +493,127 @@ describe("constructPromptMultiActions - system prompt stability", () => {
     // Prompt works without memoriesContext (no crash, contains instructions).
     expect(text).toContain("# INSTRUCTIONS");
     expect(text).not.toContain("<existing_memories>");
+  });
+
+  it("should keep equipped skills out of the system prompt", async () => {
+    const equippedSkills = [
+      await SkillFactory.create(authenticator1, {
+        name: "commit",
+        agentFacingDescription:
+          "Create a git commit with a descriptive message.",
+      }),
+    ];
+
+    const params = {
+      userMessage: userMessage1,
+      agentConfiguration: agentConfig1,
+      model: modelConfig,
+      hasAvailableActions: true,
+      agentsList: null,
+      systemSkills: [],
+      enabledSkills: [],
+      equippedSkills,
+      renderSkillsAsUserMessages: true,
+    };
+
+    const sections = constructPromptMultiActions(authenticator1, params);
+    const text = systemPromptToText(sections);
+
+    expect(text).toContain("## SKILLS");
+    expect(text).toContain(
+      "Skills are modular capabilities that extend your abilities for specific tasks."
+    );
+    expect(text).toContain("skill_management__enable_skill");
+    expect(text).not.toContain(
+      "Create a git commit with a descriptive message."
+    );
+    expect(text).not.toContain("## AVAILABLE SKILLS");
+  });
+
+  it("should keep equipped skills in the system prompt on the legacy path", async () => {
+    const equippedSkills = [
+      await SkillFactory.create(authenticator1, {
+        name: "commit",
+        agentFacingDescription:
+          "Create a git commit with a descriptive message.",
+      }),
+    ];
+
+    const params = {
+      userMessage: userMessage1,
+      agentConfiguration: agentConfig1,
+      model: modelConfig,
+      hasAvailableActions: true,
+      agentsList: null,
+      systemSkills: [],
+      enabledSkills: [],
+      equippedSkills,
+    };
+
+    const sections = constructPromptMultiActions(authenticator1, params);
+    const text = systemPromptToText(sections);
+
+    expect(text).toContain("## AVAILABLE SKILLS");
+    expect(text).toContain(
+      "- **commit**: Create a git commit with a descriptive message."
+    );
+  });
+
+  it("should not show enabled skills in available skills on the legacy path", async () => {
+    const commitSkill = await SkillFactory.create(authenticator1, {
+      name: "commit",
+      agentFacingDescription: "Create a git commit with a descriptive message.",
+    });
+
+    const params = {
+      userMessage: userMessage1,
+      agentConfiguration: agentConfig1,
+      model: modelConfig,
+      hasAvailableActions: true,
+      agentsList: null,
+      systemSkills: [],
+      enabledSkills: [SkillFactory.withExtendedSkill(commitSkill)],
+      equippedSkills: [commitSkill],
+    };
+
+    const sections = constructPromptMultiActions(authenticator1, params);
+    const text = systemPromptToText(sections);
+
+    expect(text).toContain("### ENABLED SKILLS");
+    expect(text).not.toContain("### AVAILABLE SKILLS");
+    expect(text).not.toContain(
+      "- **commit**: Create a git commit with a descriptive message."
+    );
+  });
+
+  it("should keep system skill instructions in the system prompt", async () => {
+    const discoverSkills = await SkillResource.fetchById(
+      authenticator1,
+      "discover_skills"
+    );
+    expect(discoverSkills).not.toBeNull();
+    if (!discoverSkills) {
+      return;
+    }
+
+    const params = {
+      userMessage: userMessage1,
+      agentConfiguration: agentConfig1,
+      model: modelConfig,
+      hasAvailableActions: true,
+      agentsList: null,
+      systemSkills: [discoverSkills],
+      enabledSkills: [],
+      equippedSkills: [],
+      renderSkillsAsUserMessages: true,
+    };
+
+    const sections = constructPromptMultiActions(authenticator1, params);
+    const text = systemPromptToText(sections);
+
+    expect(text).toContain("## SKILLS");
+    expect(text).toContain("### SYSTEM SKILLS");
+    expect(text).toContain(discoverSkills.instructions);
   });
 
   it("should keep memory_guidelines in instructions but existing_memories in ephemeral tier for dust-like agents", () => {
@@ -366,6 +633,7 @@ describe("constructPromptMultiActions - system prompt stability", () => {
       model: modelConfig,
       hasAvailableActions: true,
       agentsList: null,
+      systemSkills: [],
       enabledSkills: [],
       equippedSkills: [],
       memoriesContext,

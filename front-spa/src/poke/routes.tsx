@@ -4,6 +4,7 @@ import { AssistantInstructionsPage } from "@dust-tt/front/components/poke/pages/
 import { CacheLookupPage } from "@dust-tt/front/components/poke/pages/CacheLookupPage";
 import { ConnectorRedirectPage } from "@dust-tt/front/components/poke/pages/ConnectorRedirectPage";
 import { ConversationPage } from "@dust-tt/front/components/poke/pages/ConversationPage";
+import { CouponsPage } from "@dust-tt/front/components/poke/pages/CouponsPage";
 import { DashboardPage } from "@dust-tt/front/components/poke/pages/DashboardPage";
 import { DataSourcePage } from "@dust-tt/front/components/poke/pages/DataSourcePage";
 import { DataSourceQueryPage } from "@dust-tt/front/components/poke/pages/DataSourceQueryPage";
@@ -23,6 +24,7 @@ import { PluginsPage } from "@dust-tt/front/components/poke/pages/PluginsPage";
 import { PokefyPage } from "@dust-tt/front/components/poke/pages/PokefyPage";
 import { ProductionChecksPage } from "@dust-tt/front/components/poke/pages/ProductionChecksPage";
 import { SkillDetailsPage } from "@dust-tt/front/components/poke/pages/SkillDetailsPage";
+import { SkillSuggestionDetailsPage } from "@dust-tt/front/components/poke/pages/SkillSuggestionDetailsPage";
 import { SpaceDataSourceViewPage } from "@dust-tt/front/components/poke/pages/SpaceDataSourceViewPage";
 import { SpacePage } from "@dust-tt/front/components/poke/pages/SpacePage";
 import { TemplateDetailPage } from "@dust-tt/front/components/poke/pages/TemplateDetailPage";
@@ -70,6 +72,7 @@ export const routes: RouteObject[] = [
           { index: true, element: <DashboardPage /> },
           { path: "kill", element: <KillPage /> },
           { path: "plans", element: <PlansPage /> },
+          { path: "coupons", element: <CouponsPage /> },
           { path: "pokefy", element: <PokefyPage /> },
           { path: "production-checks", element: <ProductionChecksPage /> },
           { path: "email-templates", element: <EmailTemplatesPage /> },
@@ -124,6 +127,10 @@ export const routes: RouteObject[] = [
           { path: "groups/:groupId", element: <GroupPage /> },
           { path: "files/:sId", element: <FramePage /> },
           { path: "skills/:sId", element: <SkillDetailsPage /> },
+          {
+            path: "suggestions/:suggestionId",
+            element: <SkillSuggestionDetailsPage />,
+          },
           { path: "spaces/:spaceId", element: <SpacePage /> },
           { path: "spaces/:spaceId/apps/:appId", element: <AppPage /> },
           {

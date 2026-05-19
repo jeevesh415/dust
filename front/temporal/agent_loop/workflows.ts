@@ -16,6 +16,7 @@ import { makeAgentLoopConversationTitleWorkflowId } from "@app/temporal/agent_lo
 import {
   cancelAgentLoopSignal,
   gracefullyStopAgentLoopSignal,
+  interruptAgentLoopSignal,
 } from "@app/temporal/agent_loop/signals";
 import type { AgentLoopInstrumentationSinks } from "@app/temporal/agent_loop/sinks";
 import { MAX_STEPS_USE_PER_RUN_LIMIT } from "@app/types/assistant/agent";
@@ -23,6 +24,7 @@ import type {
   AgentLoopArgs,
   AgentLoopArgsWithTiming,
 } from "@app/types/assistant/agent_run";
+import type { CompactionSourceConversation } from "@app/types/assistant/compaction";
 import type { SupportedModel } from "@app/types/assistant/models/types";
 import { WorkflowExecutionAlreadyStartedError } from "@temporalio/common";
 import type {
@@ -109,9 +111,9 @@ const { ensureConversationTitleActivity } = proxyActivities<
 });
 
 const { compactionActivity } = proxyActivities<typeof compactionActivities>({
-  startToCloseTimeout: "10 minutes",
+  startToCloseTimeout: "20 minutes",
   retry: {
-    // Do not retry compaction, the mesage is marked as failed, not idempotent
+    // Do not retry compaction, the message is marked as failed, not idempotent.
     maximumAttempts: 1,
   },
 });
@@ -120,6 +122,7 @@ const {
   finalizeSuccessfulAgentLoopActivity,
   finalizeGracefullyStoppedAgentLoopActivity,
   finalizeCancelledAgentLoopActivity,
+  finalizeInterruptedAgentLoopActivity,
   finalizeErroredAgentLoopActivity,
 } = proxyActivities<typeof finalizeActivities>({
   startToCloseTimeout: "1 minute",
@@ -141,18 +144,21 @@ export async function compactionWorkflow({
   compactionMessageId,
   compactionMessageVersion,
   model,
+  sourceConversation,
 }: {
   authType: AuthenticatorType;
   conversationId: string;
   compactionMessageId: string;
   compactionMessageVersion: number;
   model: SupportedModel;
+  sourceConversation?: CompactionSourceConversation;
 }) {
   await compactionActivity(authType, {
     conversationId,
     compactionMessageId,
     compactionMessageVersion,
     model,
+    sourceConversation,
   });
 }
 
@@ -175,6 +181,15 @@ export async function agentLoopWorkflow({
 
   setHandler(cancelAgentLoopSignal, () => {
     cancelRequested = true;
+    executionScope.cancel();
+  });
+
+  // Interrupt: same immediate kill as cancel, but pending queued messages will be processed
+  // afterwards (unlike a full cancel which abandons the queue).
+  let interruptRequested = false;
+
+  setHandler(interruptAgentLoopSignal, () => {
+    interruptRequested = true;
     executionScope.cancel();
   });
 
@@ -315,10 +330,16 @@ export async function agentLoopWorkflow({
       startStep,
     };
 
-    if (cancelRequested) {
-      await CancellationScope.nonCancellable(async () =>
-        finalizeCancelledAgentLoopActivity(authType, argsWithRunIds)
-      );
+    if (cancelRequested || interruptRequested) {
+      await CancellationScope.nonCancellable(async () => {
+        // Interrupt takes precedence over cancel: the user chose to redirect rather than abort,
+        // so pending queued messages should still be promoted.
+        if (interruptRequested) {
+          await finalizeInterruptedAgentLoopActivity(authType, argsWithRunIds);
+        } else {
+          await finalizeCancelledAgentLoopActivity(authType, argsWithRunIds);
+        }
+      });
       return;
     }
 

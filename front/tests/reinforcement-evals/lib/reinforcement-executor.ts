@@ -9,8 +9,6 @@ import type { LLMEvent } from "@app/lib/api/llm/types/events";
 import type { LLMStreamParameters } from "@app/lib/api/llm/types/options";
 import { getLlmCredentials } from "@app/lib/api/provider_credentials";
 import type { Authenticator } from "@app/lib/auth";
-import type { ExploratoryToolCallInfo as AgentExploratoryToolCallInfo } from "@app/lib/reinforced_agent/types";
-import { buildContinuationMessages } from "@app/lib/reinforced_agent/utils";
 import { buildSkillAggregationPrompt } from "@app/lib/reinforcement/aggregate_suggestions";
 import { buildSkillAnalysisPrompt } from "@app/lib/reinforcement/analyze_conversation";
 import { MAX_REINFORCED_ANALYSIS_STEPS } from "@app/lib/reinforcement/constants";
@@ -18,7 +16,9 @@ import {
   buildReinforcedSkillsLLMParams,
   classifySkillToolCalls,
 } from "@app/lib/reinforcement/run_reinforced_analysis";
+import { convertMarkdownToBlockHtml } from "@app/lib/reinforcement/skill_instructions_html";
 import { DESCRIBE_MCP_TOOL_NAME } from "@app/lib/reinforcement/types";
+import { buildContinuationMessages } from "@app/lib/reinforcement/utils";
 import {
   BATCH_POLL_INTERVAL_MS,
   MODEL_ID,
@@ -28,8 +28,10 @@ import {
   buildConversationText,
   type CategorizedTestCase,
   type ExecutionResult,
+  isAggregationTestCase,
   isAnalysisTestCase,
   type MockMcpDescription,
+  type MockSearchKnowledgeNode,
   type MockSkillConfig,
   type TestCase,
   type ToolCall,
@@ -50,10 +52,15 @@ function makeSkillType(config: MockSkillConfig): SkillType {
     agentFacingDescription: config.description ?? "",
     userFacingDescription: config.description ?? "",
     instructions: config.instructions ?? null,
-    instructionsHtml: null,
+    instructionsHtml: config.instructions
+      ? convertMarkdownToBlockHtml(config.instructions)
+      : null,
     icon: null,
     source: null,
     sourceMetadata: null,
+    reinforcement: "auto",
+    selfImprovementLock: false,
+    selfImprovementCostsCapMicroUsd: null,
     requestedSpaceIds: [],
     tools: (config.tools ?? []).map((t) => ({
       id: 0,
@@ -195,6 +202,26 @@ function simulateExploratoryTool(
         mockDescriptionToFormatInput(mcpName, desc)
       );
     }
+    case "search_knowledge": {
+      const nodes = workspaceContext.searchKnowledgeNodes ?? [];
+      const dsvMap = new Map<string, MockSearchKnowledgeNode>();
+      for (const node of nodes) {
+        if (!dsvMap.has(node.dataSourceViewId)) {
+          dsvMap.set(node.dataSourceViewId, node);
+        }
+      }
+      const dataSourceViews = [...dsvMap.values()].map((n) => ({
+        dataSourceViewId: n.dataSourceViewId,
+        name: n.title,
+        connectorProvider: n.connectorProvider ?? null,
+        category: "folder",
+        spaceId: n.spaceId,
+        childrenCount: nodes.filter(
+          (x) => x.dataSourceViewId === n.dataSourceViewId
+        ).length,
+      }));
+      return JSON.stringify({ dataSourceViews, nodes }, null, 2);
+    }
     default:
       return `Unknown exploratory tool: ${toolName}`;
   }
@@ -255,11 +282,8 @@ async function executeMultiStep(
     }
 
     // Build continuation messages and extend conversation.
-    // The ExploratoryToolCallInfo shapes are compatible between the two modules.
-    // The skills ExploratoryToolCallInfo has the same shape as the agent one
-    // (name is a subset: "get_available_tools" vs "get_available_tools" | "get_available_skills").
     const continuationMessages = buildContinuationMessages(
-      exploratoryToolCalls as AgentExploratoryToolCallInfo[],
+      exploratoryToolCalls,
       toolResults
     );
 
@@ -300,7 +324,10 @@ export async function executeReinforced(
 ): Promise<ExecutionResult> {
   const llm = await getLLMInstance(auth);
   const prompt = buildPromptForTestCase(testCase);
-  const params = buildReinforcedSkillsLLMParams(prompt);
+  const operationType = isAggregationTestCase(testCase)
+    ? "reinforcement_aggregate_suggestions"
+    : "reinforcement_analyze_conversation";
+  const params = buildReinforcedSkillsLLMParams(prompt, operationType);
 
   return executeMultiStep(
     llm,
@@ -348,7 +375,13 @@ export async function executeBatch(
   let pendingParams = new Map<string, LLMStreamParameters>();
   for (const tc of testCases) {
     const prompt = buildPromptForTestCase(tc);
-    pendingParams.set(tc.scenarioId, buildReinforcedSkillsLLMParams(prompt));
+    const operationType = isAggregationTestCase(tc)
+      ? "reinforcement_aggregate_suggestions"
+      : "reinforcement_analyze_conversation";
+    pendingParams.set(
+      tc.scenarioId,
+      buildReinforcedSkillsLLMParams(prompt, operationType)
+    );
   }
 
   const results = new Map<string, ExecutionResult>();
@@ -400,9 +433,7 @@ export async function executeBatch(
         }
 
         const continuationMessages = buildContinuationMessages(
-          exploratoryToolCalls as unknown as Parameters<
-            typeof buildContinuationMessages
-          >[0],
+          exploratoryToolCalls,
           toolResultsMap
         );
 

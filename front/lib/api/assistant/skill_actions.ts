@@ -1,5 +1,6 @@
 import { buildServerSideMCPServerConfiguration } from "@app/lib/actions/configuration/helpers";
 import type { MCPServerConfigurationType } from "@app/lib/actions/mcp";
+import type { AutoInternalMCPServerNameType } from "@app/lib/actions/mcp_internal_actions/constants";
 import { getMCPServerRequirements } from "@app/lib/actions/mcp_internal_actions/input_configuration";
 import type { DataSourceConfiguration } from "@app/lib/api/assistant/configuration/types";
 import type { Authenticator } from "@app/lib/auth";
@@ -7,7 +8,6 @@ import { isRemoteDatabase } from "@app/lib/data_sources";
 import { DataSourceViewResource } from "@app/lib/resources/data_source_view_resource";
 import { MCPServerViewResource } from "@app/lib/resources/mcp_server_view_resource";
 import { SkillResource } from "@app/lib/resources/skill/skill_resource";
-import { concurrentExecutor } from "@app/lib/utils/async_utils";
 import type {
   AgentConfigurationType,
   LightAgentConfigurationType,
@@ -26,17 +26,17 @@ export async function getSkillServers(
     skills,
   }: {
     agentConfiguration: LightAgentConfigurationType;
-    skills: (SkillResource & { extendedSkill: SkillResource | null })[];
+    skills: (SkillResource & { extendedSkill?: SkillResource | null })[];
   }
 ): Promise<MCPServerConfigurationType[]> {
-  const rawInheritedDataSourceViews = await concurrentExecutor(
-    skills,
-    (skill) => skill.listInheritedDataSourceViews(auth, agentConfiguration),
-    { concurrency: 5 }
-  );
-  const inheritedDataSourceViews = removeNulls(
-    rawInheritedDataSourceViews.flat()
-  );
+  let inheritedDataSourceViews: DataSourceViewResource[] = [];
+  if (skills.some((skill) => skill.inheritsAgentConfigurationDataSources)) {
+    inheritedDataSourceViews = await DataSourceViewResource.listBySpaceIds(
+      auth,
+      agentConfiguration.requestedSpaceIds,
+      { includeGlobalSpace: true }
+    );
+  }
 
   const remoteDbViews = inheritedDataSourceViews.filter((v) =>
     isRemoteDatabase(v.dataSource)
@@ -81,20 +81,35 @@ export async function getSkillServers(
     })
   );
 
-  // Add knowledge servers (file system / data warehouse) from skills with attached data sources.
   const {
     documentDataSourceConfigurations,
     warehouseDataSourceConfigurations,
   } = await getSkillDataSourceConfigurations(auth, { skills });
 
-  const [fileSystemServer, dataWarehouseServer] = await Promise.all([
-    createSkillKnowledgeFileSystemServer(auth, {
-      dataSourceConfigurations: documentDataSourceConfigurations,
-    }),
-    createSkillKnowledgeDataWarehouseServer(auth, {
-      dataSourceConfigurations: warehouseDataSourceConfigurations,
-    }),
-  ]);
+  const namesToFetch: AutoInternalMCPServerNameType[] = [];
+  if (documentDataSourceConfigurations.length > 0) {
+    namesToFetch.push("data_sources_file_system");
+  }
+  if (warehouseDataSourceConfigurations.length > 0) {
+    namesToFetch.push("data_warehouses");
+  }
+
+  const autoInternalViews =
+    namesToFetch.length > 0
+      ? await MCPServerViewResource.getMCPServerViewsForAutoInternalToolsAsMap(
+          auth,
+          namesToFetch
+        )
+      : new Map<AutoInternalMCPServerNameType, MCPServerViewResource>();
+
+  const fileSystemServer = createSkillKnowledgeFileSystemServer({
+    dataSourceConfigurations: documentDataSourceConfigurations,
+    mcpServerView: autoInternalViews.get("data_sources_file_system") ?? null,
+  });
+  const dataWarehouseServer = createSkillKnowledgeDataWarehouseServer({
+    dataSourceConfigurations: warehouseDataSourceConfigurations,
+    mcpServerView: autoInternalViews.get("data_warehouses") ?? null,
+  });
 
   return [
     ...mcpServers,
@@ -212,29 +227,14 @@ export async function getSkillDataSourceConfigurations(
   };
 }
 
-/**
- * Creates a file system server configuration scoped to the provided data source configurations.
- * Returns null if no configurations are provided or the server view doesn't exist.
- */
-async function createSkillKnowledgeFileSystemServer(
-  auth: Authenticator,
-  {
-    dataSourceConfigurations,
-  }: {
-    dataSourceConfigurations: DataSourceConfiguration[];
-  }
-): Promise<MCPServerConfigurationType | null> {
-  if (dataSourceConfigurations.length === 0) {
-    return null;
-  }
-
-  const mcpServerView =
-    await MCPServerViewResource.getMCPServerViewForAutoInternalTool(
-      auth,
-      "data_sources_file_system"
-    );
-
-  if (!mcpServerView) {
+function createSkillKnowledgeFileSystemServer({
+  dataSourceConfigurations,
+  mcpServerView,
+}: {
+  dataSourceConfigurations: DataSourceConfiguration[];
+  mcpServerView: MCPServerViewResource | null;
+}): MCPServerConfigurationType | null {
+  if (dataSourceConfigurations.length === 0 || !mcpServerView) {
     return null;
   }
 
@@ -245,29 +245,14 @@ async function createSkillKnowledgeFileSystemServer(
   });
 }
 
-/**
- * Creates a data warehouse server configuration scoped to the provided data source configurations.
- * Returns null if no configurations are provided or the server view doesn't exist.
- */
-async function createSkillKnowledgeDataWarehouseServer(
-  auth: Authenticator,
-  {
-    dataSourceConfigurations,
-  }: {
-    dataSourceConfigurations: DataSourceConfiguration[];
-  }
-): Promise<MCPServerConfigurationType | null> {
-  if (dataSourceConfigurations.length === 0) {
-    return null;
-  }
-
-  const mcpServerView =
-    await MCPServerViewResource.getMCPServerViewForAutoInternalTool(
-      auth,
-      "data_warehouses"
-    );
-
-  if (!mcpServerView) {
+function createSkillKnowledgeDataWarehouseServer({
+  dataSourceConfigurations,
+  mcpServerView,
+}: {
+  dataSourceConfigurations: DataSourceConfiguration[];
+  mcpServerView: MCPServerViewResource | null;
+}): MCPServerConfigurationType | null {
+  if (dataSourceConfigurations.length === 0 || !mcpServerView) {
     return null;
   }
 
@@ -291,17 +276,22 @@ export async function resolveSkillMCPServers(
     conversation: ConversationType;
   }
 ): Promise<MCPServerConfigurationType[]> {
-  const { enabledSkills } = await SkillResource.listForAgentLoop(auth, {
-    agentConfiguration,
-    conversation,
-  });
+  const { enabledSkills, systemSkills } = await SkillResource.listForAgentLoop(
+    auth,
+    {
+      agentConfiguration,
+      conversation,
+    }
+  );
 
-  if (enabledSkills.length === 0) {
+  const activeSkills = [...systemSkills, ...enabledSkills];
+
+  if (activeSkills.length === 0) {
     return [];
   }
 
   return getSkillServers(auth, {
     agentConfiguration,
-    skills: enabledSkills,
+    skills: activeSkills,
   });
 }

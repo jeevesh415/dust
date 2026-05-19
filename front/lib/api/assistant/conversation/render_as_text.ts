@@ -1,5 +1,6 @@
 import type {
   AgentMessageType,
+  AgentMessageWithFeedbackType,
   CompactionMessageType,
   ConversationType,
   LightAgentMessageType,
@@ -30,6 +31,12 @@ export interface RenderConversationAsTextOptions {
   includeActions?: boolean;
   // Include action input params and output (requires includeActions).
   includeActionDetails?: boolean;
+  // Truncate action input (params) to this many characters.
+  truncateActionInputChars?: number;
+  // Truncate action output to this many characters.
+  truncateActionOutputChars?: number;
+  // Include user feedback inline after each agent message.
+  includeFeedback?: boolean;
   // Skip agent messages with status "created" (still running).
   skipRunningAgentMessages?: boolean;
   // Truncate each message's content to this many characters.
@@ -118,7 +125,7 @@ export function renderConversationAsText(
       continue;
     }
 
-    totalChars += rendered.contentLength;
+    totalChars += rendered.text.length;
     parts.unshift(rendered.text);
 
     // A succeeded compaction message is a history boundary. Include it and stop.
@@ -248,6 +255,14 @@ function renderUserMessageAsText(
   };
 }
 
+function hasFeedback(
+  msg: AgentMessageType | LightAgentMessageType
+): msg is AgentMessageWithFeedbackType {
+  return (
+    "feedback" in msg && Array.isArray(msg.feedback) && msg.feedback.length > 0
+  );
+}
+
 function renderAgentMessageAsText(
   msg: AgentMessageType | LightAgentMessageType,
   lastReadMs: number | null,
@@ -288,11 +303,15 @@ function renderAgentMessageAsText(
 
       if (options.includeActionDetails) {
         const paramsStr = JSON.stringify(action.params);
-        lines.push(`  Input: ${paramsStr}`);
+        lines.push(
+          `  Input: ${options.truncateActionInputChars ? truncateString(paramsStr, options.truncateActionInputChars) : paramsStr}`
+        );
         if (action.output) {
           const outputText = serializeActionOutput(action.output);
           if (outputText) {
-            lines.push(`  Output: ${outputText}`);
+            lines.push(
+              `  Output: ${options.truncateActionOutputChars ? truncateString(outputText, options.truncateActionOutputChars) : outputText}`
+            );
           }
         }
       }
@@ -300,12 +319,29 @@ function renderAgentMessageAsText(
   }
 
   lines.push(content);
+
+  if (options.includeFeedback && hasFeedback(msg)) {
+    lines.push("User feedback:");
+    for (const f of msg.feedback) {
+      const sentiment = f.thumbDirection === "up" ? "Positive" : "Negative";
+      const comment = f.content ? `: ${f.content}` : "";
+      lines.push(`- ${sentiment}: ${comment}`);
+    }
+  }
+
   lines.push("");
 
   return {
     text: lines.join("\n"),
     contentLength: content.length,
   };
+}
+
+function truncateString(str: string, maxChars: number): string {
+  if (str.length <= maxChars) {
+    return str;
+  }
+  return str.slice(0, maxChars) + " (truncated)";
 }
 
 function serializeActionOutput(

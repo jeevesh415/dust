@@ -19,6 +19,7 @@ import {
   XMarkIcon,
 } from "@dust-tt/sparkle";
 import { useCallback } from "react";
+import { ProjectNotificationMenu } from "../ProjectNotificationMenu";
 
 interface ProjectHeaderActionsProps {
   isMember: boolean;
@@ -76,7 +77,7 @@ export function ProjectHeaderActions({
                 visual: member.image ?? undefined,
                 isRounded: true,
               }))}
-              nbVisibleItems={8}
+              nbVisibleItems={5}
               size="sm"
             />
           </div>
@@ -91,25 +92,30 @@ export function ProjectHeaderActions({
                 tooltip="Project options"
               />
             </DropdownMenuTrigger>
-            <DropdownMenuContent>
+            <DropdownMenuContent collisionPadding={8}>
               {!canLeaveProject ? (
                 <DropdownTooltipTrigger
-                  description="You are the last editor of this project and cannot leave it."
+                  description="You are the last editor of this Pod and cannot leave it."
                   side="left"
                 >
                   <DropdownMenuItem
-                    label="Leave the project"
+                    label="Leave the Pod"
                     icon={XMarkIcon}
                     disabled={true}
                   />
                 </DropdownTooltipTrigger>
               ) : (
                 <DropdownMenuItem
-                  label="Leave the project"
+                  label="Leave the Pod"
                   icon={XMarkIcon}
                   onClick={openLeaveDialog}
                 />
               )}
+              <ProjectNotificationMenu
+                activeSpaceId={spaceId}
+                owner={owner}
+                shouldWaitBeforeFetching={false}
+              />
             </DropdownMenuContent>
           </DropdownMenu>
         )}

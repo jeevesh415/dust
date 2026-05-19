@@ -9,6 +9,7 @@ import {
   makeCompactionWorkflowId,
 } from "@app/temporal/agent_loop/lib/workflow_ids";
 import type { AgentLoopArgs } from "@app/types/assistant/agent_run";
+import type { CompactionSourceConversation } from "@app/types/assistant/compaction";
 import type { SupportedModel } from "@app/types/assistant/models/types";
 import type { Result } from "@app/types/shared/result";
 import { Err, Ok } from "@app/types/shared/result";
@@ -119,12 +120,14 @@ export async function launchCompactionWorkflow({
   compactionMessageId,
   compactionMessageVersion,
   model,
+  sourceConversation,
 }: {
   auth: Authenticator;
   conversationId: string;
   compactionMessageId: string;
   compactionMessageVersion: number;
   model: SupportedModel;
+  sourceConversation?: CompactionSourceConversation;
 }): Promise<
   Result<undefined, Error | DustError<"compaction_already_running">>
 > {
@@ -136,7 +139,6 @@ export async function launchCompactionWorkflow({
     workspaceId,
     conversationId,
   });
-
   try {
     await client.workflow.start(compactionWorkflow, {
       args: [
@@ -146,6 +148,7 @@ export async function launchCompactionWorkflow({
           compactionMessageId,
           compactionMessageVersion,
           model,
+          sourceConversation,
         },
       ],
       taskQueue: QUEUE_NAME,

@@ -1,4 +1,5 @@
 /** @ignoreswagger */
+// @migration-status: MIGRATED_TO_HONO
 import {
   buildAuditLogTarget,
   emitAuditLogEvent,
@@ -31,7 +32,7 @@ async function handler(
           status_code: 400,
           api_error: {
             type: "invalid_request_error",
-            message: "You can only join projects, not regular spaces.",
+            message: "You can only join Pods, not regular spaces.",
           },
         });
       }
@@ -41,8 +42,7 @@ async function handler(
           status_code: 403,
           api_error: {
             type: "workspace_auth_error",
-            message:
-              "This project is restricted. You need to be invited to join.",
+            message: "This Pod is restricted. You need to be invited to join.",
           },
         });
       }
@@ -53,7 +53,7 @@ async function handler(
           api_error: {
             type: "invalid_request_error",
             message:
-              "You cannot join this project, its members are not managed manually.",
+              "You cannot join this Pod, its members are not managed manually.",
           },
         });
       }
@@ -63,7 +63,7 @@ async function handler(
           status_code: 400,
           api_error: {
             type: "invalid_request_error",
-            message: "You are already a member of this project.",
+            message: "You are already a member of this Pod.",
           },
         });
       }
@@ -78,8 +78,7 @@ async function handler(
           status_code: 500,
           api_error: {
             type: "internal_server_error",
-            message:
-              "There should be exactly one member group for the project.",
+            message: "There should be exactly one member group for the Pod.",
           },
         });
       }
@@ -108,7 +107,7 @@ async function handler(
         ],
         context: getAuditLogContext(auth, req),
         metadata: {
-          spaceName: space.name,
+          space_name: space.name,
         },
       });
 

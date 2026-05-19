@@ -1,4 +1,5 @@
 import {
+  cn,
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -21,8 +22,23 @@ interface SlashCommandTooltip {
   media?: React.ReactNode;
 }
 
+const DEFAULT_EMPTY_MESSAGE = "No commands found";
+
+const DEFAULT_LIST_MAX_HEIGHT_CLASS_NAME = "max-h-96";
+
+interface ScrollFadeState {
+  hasContentAbove: boolean;
+  hasContentBelow: boolean;
+}
+
+const EMPTY_SCROLL_FADE_STATE: ScrollFadeState = {
+  hasContentAbove: false,
+  hasContentBelow: false,
+};
+
 export interface SlashCommand {
   action: string;
+  description?: string;
   icon: React.ComponentType<any>;
   id: string;
   label: string;
@@ -30,7 +46,17 @@ export interface SlashCommand {
 }
 
 export interface SlashCommandDropdownProps
-  extends SuggestionProps<SlashCommand> {}
+  extends Pick<
+    SuggestionProps<SlashCommand>,
+    "clientRect" | "command" | "items"
+  > {
+  emptyMessage?: string;
+  header?: string;
+  listMaxHeightClassName?: `max-h-${string}`;
+  onClose?: () => void;
+  showScrollFade?: boolean;
+  size?: "default" | "wide";
+}
 
 export interface SlashCommandDropdownRef {
   onKeyDown: (props: { event: KeyboardEvent }) => boolean;
@@ -39,141 +65,275 @@ export interface SlashCommandDropdownRef {
 export const SlashCommandDropdown = forwardRef<
   SlashCommandDropdownRef,
   SlashCommandDropdownProps
->(({ items, command, clientRect }, ref) => {
-  const [selectedIndex, setSelectedIndex] = useState(0);
-  const containerRef = useRef<HTMLDivElement>(null);
-  const triggerRef = useRef<HTMLDivElement>(null);
-  const [virtualTriggerStyle, setVirtualTriggerStyle] =
-    useState<React.CSSProperties>({});
-
-  const selectItem = useCallback(
-    (index: number) => {
-      const item = items[index];
-      if (item) {
-        command(item);
-      }
+>(
+  (
+    {
+      items,
+      command,
+      clientRect,
+      emptyMessage = DEFAULT_EMPTY_MESSAGE,
+      header,
+      listMaxHeightClassName = DEFAULT_LIST_MAX_HEIGHT_CLASS_NAME,
+      onClose,
+      showScrollFade = false,
+      size = "default",
     },
-    [command, items]
-  );
+    ref
+  ) => {
+    const [selectedIndex, setSelectedIndex] = useState(0);
+    const [scrollFadeState, setScrollFadeState] = useState<ScrollFadeState>(
+      EMPTY_SCROLL_FADE_STATE
+    );
+    const itemCount = items.length;
+    const listRef = useRef<HTMLDivElement>(null);
+    const topScrollSentinelRef = useRef<HTMLDivElement>(null);
+    const bottomScrollSentinelRef = useRef<HTMLDivElement>(null);
+    const [virtualTriggerStyle, setVirtualTriggerStyle] =
+      useState<React.CSSProperties>({});
 
-  useImperativeHandle(
-    ref,
-    () => ({
-      onKeyDown: ({ event }) => {
-        if (event.key === "ArrowDown") {
-          event.preventDefault();
-          setSelectedIndex((selectedIndex + 1) % items.length);
-          return true;
+    const selectItem = useCallback(
+      (index: number) => {
+        const item = items[index];
+        if (item) {
+          command(item);
         }
-
-        if (event.key === "ArrowUp") {
-          event.preventDefault();
-          setSelectedIndex((selectedIndex + items.length - 1) % items.length);
-          return true;
-        }
-
-        if (event.key === "Enter" || event.key === "Tab") {
-          event.preventDefault();
-          selectItem(selectedIndex);
-          return true;
-        }
-
-        return false;
       },
-    }),
-    [selectItem, selectedIndex, items.length]
-  );
+      [command, items]
+    );
 
-  // Reset selected index when items change.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: ignored using `--suppress`
-  useEffect(() => {
-    setSelectedIndex(0);
-  }, [items.length]);
+    useImperativeHandle(
+      ref,
+      () => ({
+        onKeyDown: ({ event }) => {
+          if (items.length === 0) {
+            return false;
+          }
 
-  // Update virtual trigger position.
-  const updateTriggerPosition = useCallback(() => {
-    const triggerRect = clientRect?.();
-    if (triggerRect && triggerRef.current) {
-      setVirtualTriggerStyle({
-        position: "fixed",
-        left: triggerRect.left,
-        top: triggerRect.top + (window.visualViewport?.offsetTop ?? 0),
-        width: 1,
-        height: triggerRect.height || 1,
-        pointerEvents: "none",
-        zIndex: -1,
-      });
-    }
-  }, [clientRect]);
-
-  useEffect(() => {
-    updateTriggerPosition();
-
-    const viewport = window.visualViewport;
-    if (viewport) {
-      // Event triggered when hitting CMD +/-.
-      viewport.addEventListener("resize", updateTriggerPosition);
-      return () => {
-        viewport.removeEventListener("resize", updateTriggerPosition);
-      };
-    }
-  }, [updateTriggerPosition]);
-
-  return (
-    <DropdownMenu open={true}>
-      <DropdownMenuTrigger asChild>
-        <div ref={triggerRef} style={virtualTriggerStyle} />
-      </DropdownMenuTrigger>
-      <DropdownMenuContent
-        ref={containerRef}
-        className="w-64"
-        align="start"
-        side="bottom"
-        sideOffset={4}
-        onCloseAutoFocus={(e) => e.preventDefault()}
-        onOpenAutoFocus={(e) => e.preventDefault()}
-      >
-        {items.length === 0 ? (
-          <div className="px-2 py-4 text-center text-sm text-muted-foreground">
-            No commands found
-          </div>
-        ) : (
-          items.map((item, index) => {
-            const menuItem = (
-              <DropdownMenuItem
-                key={item.id}
-                icon={item.icon}
-                label={item.label}
-                truncateText
-                onClick={() => selectItem(index)}
-                onMouseEnter={() => setSelectedIndex(index)}
-                className={
-                  index === selectedIndex ? "bg-gray-100 dark:bg-gray-800" : ""
-                }
-              />
+          if (event.key === "ArrowDown") {
+            event.preventDefault();
+            setSelectedIndex(
+              (prevSelectedIndex) => (prevSelectedIndex + 1) % items.length
             );
+            return true;
+          }
 
-            // Wrap with DropdownTooltipTrigger if command has tooltip property.
-            if (item.tooltip) {
-              return (
-                <DropdownTooltipTrigger
-                  key={item.id}
-                  description={item.tooltip.description}
-                  media={item.tooltip.media}
-                  side="right"
-                  sideOffset={8}
-                >
-                  {menuItem}
-                </DropdownTooltipTrigger>
-              );
+          if (event.key === "ArrowUp") {
+            event.preventDefault();
+            setSelectedIndex(
+              (prevSelectedIndex) =>
+                (prevSelectedIndex + items.length - 1) % items.length
+            );
+            return true;
+          }
+
+          if (event.key === "Enter" || event.key === "Tab") {
+            event.preventDefault();
+            selectItem(selectedIndex);
+            return true;
+          }
+
+          return false;
+        },
+      }),
+      [selectItem, selectedIndex, items.length]
+    );
+
+    useEffect(() => {
+      const list = listRef.current;
+      const topScrollSentinel = topScrollSentinelRef.current;
+      const bottomScrollSentinel = bottomScrollSentinelRef.current;
+
+      if (
+        !showScrollFade ||
+        itemCount === 0 ||
+        !list ||
+        !topScrollSentinel ||
+        !bottomScrollSentinel ||
+        typeof IntersectionObserver === "undefined"
+      ) {
+        setScrollFadeState((previousState) =>
+          previousState.hasContentAbove || previousState.hasContentBelow
+            ? EMPTY_SCROLL_FADE_STATE
+            : previousState
+        );
+        return;
+      }
+
+      const observer = new IntersectionObserver(
+        (entries) => {
+          setScrollFadeState((previousState) => {
+            const nextState = { ...previousState };
+
+            for (const entry of entries) {
+              if (entry.target === topScrollSentinel) {
+                nextState.hasContentAbove = !entry.isIntersecting;
+              } else if (entry.target === bottomScrollSentinel) {
+                nextState.hasContentBelow = !entry.isIntersecting;
+              }
             }
 
-            return menuItem;
-          })
-        )}
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
-});
+            return previousState.hasContentAbove ===
+              nextState.hasContentAbove &&
+              previousState.hasContentBelow === nextState.hasContentBelow
+              ? previousState
+              : nextState;
+          });
+        },
+        { root: list }
+      );
+
+      observer.observe(topScrollSentinel);
+      observer.observe(bottomScrollSentinel);
+
+      return () => observer.disconnect();
+    }, [itemCount, showScrollFade]);
+
+    // Reset selected index when items change.
+    // biome-ignore lint/correctness/useExhaustiveDependencies: ignored using `--suppress`
+    useEffect(() => {
+      setSelectedIndex(0);
+    }, [items]);
+
+    // Update virtual trigger position.
+    const updateTriggerPosition = useCallback(() => {
+      const triggerRect = clientRect?.();
+      if (triggerRect) {
+        setVirtualTriggerStyle({
+          position: "fixed",
+          left: triggerRect.left,
+          top: triggerRect.top + (window.visualViewport?.offsetTop ?? 0),
+          width: 1,
+          height: triggerRect.height || 1,
+          pointerEvents: "none",
+          zIndex: -1,
+        });
+      }
+    }, [clientRect]);
+
+    useEffect(() => {
+      updateTriggerPosition();
+
+      const viewport = window.visualViewport;
+      if (viewport) {
+        // Event triggered when hitting CMD +/-.
+        viewport.addEventListener("resize", updateTriggerPosition);
+        return () => {
+          viewport.removeEventListener("resize", updateTriggerPosition);
+        };
+      }
+    }, [updateTriggerPosition]);
+
+    return (
+      <DropdownMenu open={true}>
+        <DropdownMenuTrigger asChild>
+          <div style={virtualTriggerStyle} />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent
+          className={size === "wide" ? "w-80" : "w-64"}
+          align="start"
+          avoidCollisions
+          collisionPadding={12}
+          highlightedItemId={items[selectedIndex]?.id}
+          side="bottom"
+          sideOffset={4}
+          onEscapeKeyDown={onClose}
+          onInteractOutside={onClose}
+          onCloseAutoFocus={(e) => e.preventDefault()}
+          onOpenAutoFocus={(e) => e.preventDefault()}
+          scrollHighlightedItemIntoView
+        >
+          {header ? (
+            <div className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground dark:text-muted-foreground-night">
+              {header}
+            </div>
+          ) : null}
+          {items.length === 0 ? (
+            <div className="px-2 py-4 text-center text-sm text-muted-foreground dark:text-muted-foreground-night">
+              {emptyMessage}
+            </div>
+          ) : (
+            <div className="relative">
+              <div
+                ref={listRef}
+                className={cn("overflow-y-auto", listMaxHeightClassName)}
+              >
+                <div className="relative">
+                  <div
+                    ref={topScrollSentinelRef}
+                    className="pointer-events-none absolute left-0 top-0 h-px w-px"
+                    aria-hidden
+                  />
+                  <div
+                    ref={bottomScrollSentinelRef}
+                    className="pointer-events-none absolute bottom-0 left-0 h-px w-px"
+                    aria-hidden
+                  />
+                  {items.map((item, index) => {
+                    const menuItem = (
+                      <DropdownMenuItem
+                        key={item.id}
+                        icon={item.icon}
+                        itemId={item.id}
+                        label={item.label}
+                        description={item.description}
+                        truncateText
+                        onClick={() => selectItem(index)}
+                        onMouseEnter={() => setSelectedIndex(index)}
+                        className={
+                          index === selectedIndex
+                            ? "bg-muted-background dark:bg-muted-night [transition-duration:0ms]"
+                            : ""
+                        }
+                      />
+                    );
+
+                    // Wrap with DropdownTooltipTrigger if command has tooltip property.
+                    if (item.tooltip) {
+                      return (
+                        <DropdownTooltipTrigger
+                          key={item.id}
+                          description={item.tooltip.description}
+                          media={item.tooltip.media}
+                          side="right"
+                          sideOffset={8}
+                        >
+                          {menuItem}
+                        </DropdownTooltipTrigger>
+                      );
+                    }
+
+                    return menuItem;
+                  })}
+                </div>
+              </div>
+              <div
+                className={cn(
+                  "pointer-events-none absolute inset-x-0 top-0 h-10 bg-gradient-to-t",
+                  "from-transparent via-background/65 to-background opacity-0 transition-opacity duration-200",
+                  "dark:via-muted-background-night/65 dark:to-muted-background-night",
+                  showScrollFade &&
+                    scrollFadeState.hasContentAbove &&
+                    "opacity-100"
+                )}
+                aria-hidden
+              />
+              <div
+                className={cn(
+                  "pointer-events-none absolute inset-x-0 bottom-0 h-10 bg-gradient-to-b",
+                  "from-transparent via-background/65 to-background opacity-0 transition-opacity duration-200",
+                  "dark:via-muted-background-night/65 dark:to-muted-background-night",
+                  showScrollFade &&
+                    scrollFadeState.hasContentBelow &&
+                    "opacity-100"
+                )}
+                aria-hidden
+              />
+            </div>
+          )}
+        </DropdownMenuContent>
+      </DropdownMenu>
+    );
+  }
+);
 
 SlashCommandDropdown.displayName = "SlashCommandDropdown";

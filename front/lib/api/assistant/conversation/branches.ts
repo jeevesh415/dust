@@ -7,6 +7,7 @@ import { getConversation } from "@app/lib/api/assistant/conversation/fetch";
 import { batchRenderMessages } from "@app/lib/api/assistant/messages";
 import type { Authenticator } from "@app/lib/auth";
 import { DustError } from "@app/lib/error";
+import { serializeMention } from "@app/lib/mentions/format";
 import {
   AgentMCPActionModel,
   AgentMCPActionOutputItemModel,
@@ -17,9 +18,11 @@ import { ConversationBranchModel } from "@app/lib/models/agent/conversation_bran
 import { ConversationBranchResource } from "@app/lib/resources/conversation_branch_resource";
 import { ConversationResource } from "@app/lib/resources/conversation_resource";
 import { withTransaction } from "@app/lib/utils/sql_utils";
+import { GLOBAL_AGENTS_SID } from "@app/types/assistant/assistant";
 import {
   type CitationType,
   isUserMessageType,
+  type LightMessageType,
   type UserMessageContext,
 } from "@app/types/assistant/conversation";
 import type { ModelId } from "@app/types/shared/model_id";
@@ -314,7 +317,11 @@ export async function mergeConversationBranch(
     if (!renderedAgent || renderedAgent.type !== "agent_message") {
       continue;
     }
-    const contentOnly = renderedAgent.content ?? "";
+    const contentOnly = `> From ${serializeMention({
+      id: renderedAgent.configuration.sId,
+      type: "agent",
+      label: renderedAgent.configuration.name,
+    })}\n\n${renderedAgent.content ?? ""}`;
 
     const citationsAndFilesFromOutputItems =
       branchAgentMessage.agentMessageId !== null
@@ -331,8 +338,8 @@ export async function mergeConversationBranch(
       content: contentOnly,
       citationsAndFilesFromOutputItems,
       agentConfiguration: {
-        sId: branchAgentMessage.agentMessage!.agentConfigurationId,
-        version: branchAgentMessage.agentMessage!.agentConfigurationVersion,
+        sId: GLOBAL_AGENTS_SID.DUST,
+        version: 0,
       },
       skipToolsValidation: branchAgentMessage.agentMessage!.skipToolsValidation,
     });
@@ -373,13 +380,13 @@ export async function closeConversationBranch(
   }
 ): Promise<
   Result<
-    { closedBranchId: number },
+    { closedBranchId: number; conversationDeleted: boolean },
     DustError<CloseConversationBranchErrorCode>
   >
 > {
   const owner = auth.getNonNullableWorkspace();
 
-  return withTransaction(async (t) => {
+  const closeRes = await withTransaction(async (t) => {
     const effectiveTransaction = transaction ?? t;
 
     const conversation = await ConversationResource.fetchById(
@@ -423,6 +430,98 @@ export async function closeConversationBranch(
       }
     );
 
-    return new Ok({ closedBranchId: branch.id });
+    return new Ok({
+      branch,
+    });
   }, transaction);
+
+  if (closeRes.isErr()) {
+    return closeRes;
+  }
+
+  // If the branch sat on an internal anchor user message (origin
+  // "branch_anchor"), the conversation has nothing user-visible left, so
+  // delete it.
+  const previousOrigin =
+    await closeRes.value.branch.getPreviousUserMessageOrigin(auth);
+  const branchSitsOnAnchor = previousOrigin === "branch_anchor";
+
+  if (!branchSitsOnAnchor) {
+    return new Ok({
+      closedBranchId: closeRes.value.branch.id,
+      conversationDeleted: false,
+    });
+  }
+
+  const conversation = await ConversationResource.fetchById(
+    auth,
+    conversationId
+  );
+  if (!conversation) {
+    return new Err(
+      new DustError("conversation_not_found", "Conversation not found.")
+    );
+  }
+  await conversation.updateVisibilityToDeleted(auth);
+
+  return new Ok({
+    closedBranchId: closeRes.value.branch.id,
+    conversationDeleted: true,
+  });
+}
+
+export type RenderedOpenBranch = {
+  branchId: string;
+  messages: LightMessageType[];
+};
+
+export async function getMostRecentOpenBranchForConversation(
+  auth: Authenticator,
+  {
+    conversationId,
+  }: {
+    conversationId: string;
+  }
+): Promise<
+  Result<
+    RenderedOpenBranch | null,
+    DustError<"conversation_not_found" | "internal_error">
+  >
+> {
+  const conversation = await ConversationResource.fetchById(
+    auth,
+    conversationId
+  );
+  if (!conversation) {
+    return new Err(
+      new DustError("conversation_not_found", "Conversation not found.")
+    );
+  }
+
+  const openBranch =
+    await ConversationBranchResource.findMostRecentOpenBranchForUser(
+      auth,
+      conversation.id
+    );
+
+  if (!openBranch) {
+    return new Ok(null);
+  }
+
+  const branchMessages = await openBranch.fetchAllMessages(auth);
+
+  const renderedRes = await batchRenderMessages(
+    auth,
+    conversation,
+    branchMessages,
+    "light"
+  );
+  if (renderedRes.isErr()) {
+    return new Err(new DustError("internal_error", renderedRes.error.message));
+  }
+
+  return new Ok({
+    branchId: openBranch.sId,
+    messages: renderedRes.value,
+  });
 }

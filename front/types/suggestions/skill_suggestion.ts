@@ -1,3 +1,4 @@
+import { INSTRUCTIONS_ROOT_TARGET_BLOCK_ID } from "@app/types/suggestions/agent_suggestion";
 import { z } from "zod";
 
 export const SKILL_SUGGESTION_STATES = [
@@ -36,21 +37,17 @@ export const SKILL_SUGGESTION_KINDS = ["edit"] as const;
 export type SkillSuggestionKind = (typeof SKILL_SUGGESTION_KINDS)[number];
 
 export const SkillInstructionEditItemSchema = z.object({
-  old_string: z
+  targetBlockId: z
     .string()
-    .min(1)
-    .describe("Exact text to find in the current skill instructions."),
-  new_string: z
-    .string()
-    .describe("Replacement text. Empty string deletes the matched span."),
-  expected_occurrences: z
-    .number()
-    .int()
-    .min(1)
-    .default(1)
     .describe(
-      "How many times old_string is expected to appear. Validated before applying."
+      `The data-block-id of the block to replace. Use "${INSTRUCTIONS_ROOT_TARGET_BLOCK_ID}" for full rewrites.`
     ),
+  content: z
+    .string()
+    .describe(
+      "The full content to replace the block with, including the wrapping tag. Must be a single-line string."
+    ),
+  type: z.literal("replace").describe("The type of modification to perform."),
 });
 
 export type SkillInstructionEditItemType = z.infer<
@@ -64,24 +61,40 @@ export const SkillToolEditItemSchema = z.object({
 
 export type SkillToolEditItemType = z.infer<typeof SkillToolEditItemSchema>;
 
+export const SkillAgentFacingDescriptionEditSchema = z.object({
+  content: z
+    .string()
+    .min(1)
+    .describe(
+      "The full new agent-facing description that will replace the current one."
+    ),
+});
+
+export type SkillAgentFacingDescriptionEditType = z.infer<
+  typeof SkillAgentFacingDescriptionEditSchema
+>;
+
 export const SkillEditSuggestionSchema = z
   .object({
     instructionEdits: z
       .array(SkillInstructionEditItemSchema)
       .optional()
-      .describe(
-        "Sequential search-and-replace edits to the skill instructions."
-      ),
+      .describe("Block-targeted edits to the skill instructions."),
     toolEdits: z
       .array(SkillToolEditItemSchema)
       .optional()
       .describe("Tools to add or remove from the skill."),
+    agentFacingDescriptionEdit:
+      SkillAgentFacingDescriptionEditSchema.optional().describe(
+        "Replacement for the skill's agent-facing description."
+      ),
   })
   .refine(
     (d) =>
       (d.instructionEdits && d.instructionEdits.length > 0) ||
-      (d.toolEdits && d.toolEdits.length > 0),
-    "At least one of instructionEdits or toolEdits must be provided."
+      (d.toolEdits && d.toolEdits.length > 0) ||
+      d.agentFacingDescriptionEdit !== undefined,
+    "At least one of instructionEdits, toolEdits, or agentFacingDescriptionEdit must be provided."
   );
 
 export type SkillEditSuggestionType = z.infer<typeof SkillEditSuggestionSchema>;
@@ -105,15 +118,29 @@ export function parseSkillSuggestionData(data: unknown): SkillSuggestionData {
   return SkillSuggestionDataSchema.parse(data);
 }
 
+const SkillSuggestionUpdatedBySchema = z.object({
+  sId: z.string(),
+  fullName: z.string(),
+  email: z.string(),
+});
+
+export type SkillSuggestionUpdatedBy = z.infer<
+  typeof SkillSuggestionUpdatedBySchema
+>;
+
 const BaseSkillSuggestionSchema = z.object({
   sId: z.string(),
   createdAt: z.number(),
   updatedAt: z.number(),
   skillConfigurationId: z.string(),
   analysis: z.string().nullable(),
+  title: z.string().nullable(),
   state: z.enum(SKILL_SUGGESTION_STATES),
   source: z.enum(SKILL_SUGGESTION_SOURCES),
-  sourceConversationId: z.string().nullable(),
+  sourceConversationsCount: z.number(),
+  visibleSourceConversationIds: z.array(z.string()),
+  notificationConversationId: z.string().nullable(),
+  updatedBy: SkillSuggestionUpdatedBySchema.nullable(),
 });
 
 export const SkillSuggestionSchema = BaseSkillSuggestionSchema.and(

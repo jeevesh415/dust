@@ -1,4 +1,4 @@
-import { PublicWebsiteLogo } from "@app/components/home/LandingLayout";
+import { PublicWebsiteLogo } from "@app/components/home/PublicWebsiteLogo";
 import { AppLayoutTitle } from "@app/components/sparkle/AppLayoutTitle";
 import config from "@app/lib/api/config";
 import { TRACKING_AREAS, withTracking } from "@app/lib/tracking";
@@ -75,7 +75,7 @@ export function PublicInteractiveContentHeader({
           )}
           {user && projectUrl && (
             <Button
-              label="Go to project"
+              label="Go to Pod"
               href={projectUrl}
               variant="outline"
               // TODO(projects) this does not show the correct icon for open projects.

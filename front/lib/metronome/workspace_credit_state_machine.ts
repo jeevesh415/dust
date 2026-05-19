@@ -1,0 +1,221 @@
+import {
+  clearWorkspacePoolDepleted,
+  setWorkspacePoolDepleted,
+} from "@app/lib/metronome/user_block";
+import type { WorkspaceResource } from "@app/lib/resources/workspace_resource";
+import { invalidateCacheAfterCommit } from "@app/lib/utils/cache";
+import logger from "@app/logger/logger";
+import type { WorkspacePoolCreditState } from "@app/types/credits";
+import type { Result } from "@app/types/shared/result";
+import { Err, Ok } from "@app/types/shared/result";
+import { assertNever } from "@app/types/shared/utils/assert_never";
+import type { Transaction } from "sequelize";
+
+export type WorkspaceCreditContext = {
+  workspaceId: string;
+  paygEnabled: boolean;
+};
+
+export type WorkspaceCreditEvent =
+  /** Workspace pool commit balance reached zero. */
+  | { type: "pool_exhausted" }
+  /** Workspace-level PAYG cap reached. */
+  | { type: "payg_cap_reached" }
+  /**
+   * A new commit segment became spendable: either a billing-cycle renewal
+   * of the recurring pool commit, or an admin top-up. From the workspace state
+   * machine's point of view these are indistinguishable and both bring the
+   * pool back online.
+   */
+  | { type: "credits_added" }
+  /**
+   * PAYG was turned off by an operator. Workspaces in `overage` were
+   * surviving on PAYG: with PAYG gone they have nothing left to spend, so
+   * they must move to `depleted`. `active` workspaces are unaffected — the
+   * pool will route correctly on the next `pool_exhausted`.
+   */
+  | { type: "payg_disabled" }
+  /**
+   * PAYG was turned on (or its cap raised) by an operator. Workspaces in
+   * `depleted` that were blocked for lack of PAYG can now spend against it,
+   * so they move to `overage`. `active` and `overage` workspaces are
+   * unaffected.
+   */
+  | { type: "payg_enabled" };
+
+type WorkspaceCreditTransition = {
+  from: WorkspacePoolCreditState | WorkspacePoolCreditState[];
+  event: WorkspaceCreditEvent["type"];
+  guard?: (ctx: WorkspaceCreditContext) => boolean;
+  to: WorkspacePoolCreditState;
+};
+
+function syncWorkspacePoolCacheForState(
+  state: WorkspacePoolCreditState,
+  ctx: WorkspaceCreditContext,
+  transaction: Transaction | undefined
+): void {
+  switch (state) {
+    case "active":
+    case "overage":
+      invalidateCacheAfterCommit(transaction, () =>
+        clearWorkspacePoolDepleted(ctx.workspaceId)
+      );
+      return;
+
+    case "depleted":
+      invalidateCacheAfterCommit(transaction, () =>
+        setWorkspacePoolDepleted(ctx.workspaceId)
+      );
+      return;
+
+    default:
+      assertNever(state);
+  }
+}
+
+const TRANSITIONS: WorkspaceCreditTransition[] = [
+  // active -> ...
+  {
+    from: "active",
+    event: "pool_exhausted",
+    guard: (ctx) => ctx.paygEnabled,
+    to: "overage",
+  },
+  {
+    from: "active",
+    event: "pool_exhausted",
+    guard: (ctx) => !ctx.paygEnabled,
+    to: "depleted",
+  },
+  {
+    from: "active",
+    event: "credits_added",
+    to: "active",
+  },
+  {
+    from: "active",
+    event: "payg_enabled",
+    to: "active",
+  },
+  {
+    from: "active",
+    event: "payg_disabled",
+    to: "active",
+  },
+
+  // overage -> ...
+  {
+    from: "overage",
+    event: "pool_exhausted",
+    guard: (ctx) => ctx.paygEnabled,
+    to: "overage",
+  },
+  {
+    from: "overage",
+    event: "payg_cap_reached",
+    to: "depleted",
+  },
+  // A new commit segment starting (admin top-up or billing-cycle renewal of
+  // the recurring pool commit) while in PAYG mode brings the pool back online
+  // no need to keep spending against PAYG
+  {
+    from: "overage",
+    event: "credits_added",
+    to: "active",
+  },
+  {
+    from: "overage",
+    event: "payg_disabled",
+    to: "depleted",
+  },
+  {
+    from: "overage",
+    event: "payg_enabled",
+    to: "overage",
+  },
+
+  // depleted -> ...
+  {
+    from: "depleted",
+    event: "pool_exhausted",
+    guard: (ctx) => !ctx.paygEnabled,
+    to: "depleted",
+  },
+  {
+    from: "depleted",
+    event: "payg_cap_reached",
+    to: "depleted",
+  },
+  {
+    from: "depleted",
+    event: "credits_added",
+    to: "active",
+  },
+  {
+    from: "depleted",
+    event: "payg_enabled",
+    to: "overage",
+  },
+  {
+    from: "depleted",
+    event: "payg_disabled",
+    to: "depleted",
+  },
+];
+
+function findTransition(
+  current: WorkspacePoolCreditState,
+  event: WorkspaceCreditEvent,
+  ctx: WorkspaceCreditContext
+): WorkspaceCreditTransition | undefined {
+  return TRANSITIONS.find((t) => {
+    const fromMatch = Array.isArray(t.from)
+      ? t.from.includes(current)
+      : t.from === current;
+    return fromMatch && t.event === event.type && (!t.guard || t.guard(ctx));
+  });
+}
+
+export async function transitionWorkspaceCreditState(
+  workspace: WorkspaceResource,
+  event: WorkspaceCreditEvent,
+  ctx: WorkspaceCreditContext,
+  { transaction }: { transaction?: Transaction } = {}
+): Promise<Result<WorkspacePoolCreditState, Error>> {
+  const currentState = workspace.poolCreditState;
+  const match = findTransition(currentState, event, ctx);
+
+  if (!match) {
+    logger.warn(
+      {
+        workspaceId: ctx.workspaceId,
+        currentState,
+        event,
+      },
+      "[WorkspaceCreditStateMachine] No matching transition: skipping"
+    );
+    return new Err(
+      new Error(
+        `[WorkspaceCreditStateMachine] Illegal transition: ${currentState} + ${event.type}`
+      )
+    );
+  }
+
+  if (currentState !== match.to) {
+    await workspace.updatePoolCreditState(match.to, transaction);
+  }
+  syncWorkspacePoolCacheForState(match.to, ctx, transaction);
+  logger.info(
+    {
+      workspaceId: ctx.workspaceId,
+      fromState: currentState,
+      toState: match.to,
+      eventType: event.type,
+      wasStateChanged: currentState !== match.to,
+    },
+    "[WorkspaceCreditStateMachine] Transition applied"
+  );
+
+  return new Ok(match.to);
+}

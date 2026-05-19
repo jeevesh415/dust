@@ -4,13 +4,20 @@ import { Authenticator } from "@app/lib/auth";
 import type { SessionWithUser } from "@app/lib/iam/provider";
 import { ConversationResource } from "@app/lib/resources/conversation_resource";
 import { apiError } from "@app/logger/withlogging";
-import type { ConversationWithoutContentType } from "@app/types/assistant/conversation";
+import type {
+  ConversationVisibility,
+  ConversationWithoutContentType,
+} from "@app/types/assistant/conversation";
 import type { WithAPIErrorResponse } from "@app/types/error";
 import { isString } from "@app/types/shared/utils/general";
 import type { NextApiRequest, NextApiResponse } from "next";
 
+export type PokeListConversationItem = ConversationWithoutContentType & {
+  visibility?: ConversationVisibility;
+};
+
 export type PokeListConversations = {
-  conversations: ConversationWithoutContentType[];
+  conversations: PokeListConversationItem[];
 };
 
 async function handler(
@@ -23,8 +30,7 @@ async function handler(
     req.query.wId as string
   );
 
-  const { agentId, triggerId, reinforcedAgentId, reinforcedSkillId } =
-    req.query;
+  const { agentId, triggerId, reinforcedSkillId } = req.query;
 
   if (!auth.isDustSuperUser()) {
     return apiError(req, res, {
@@ -38,7 +44,7 @@ async function handler(
 
   switch (req.method) {
     case "GET":
-      let conversations: ConversationWithoutContentType[];
+      let conversations: PokeListConversationItem[];
 
       if (isString(triggerId)) {
         // Get conversations for this trigger
@@ -46,12 +52,6 @@ async function handler(
           auth,
           triggerId
         );
-      } else if (isString(reinforcedAgentId)) {
-        conversations =
-          await ConversationResource.listReinforcementConversations(
-            auth,
-            reinforcedAgentId
-          );
       } else if (isString(reinforcedSkillId)) {
         const oneWeekAgo = new Date();
         oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
@@ -70,7 +70,8 @@ async function handler(
             {
               agentConfigurationId: agentId,
               cutoffDate: new Date(), // Current time to get all conversations.
-            }
+            },
+            { includeDeleted: true }
           );
 
         conversations = conversationResources.map((c) => {
@@ -92,6 +93,7 @@ async function handler(
             spaceId: c.space?.sId ?? null,
             metadata: c.metadata,
             branchId: null,
+            isRunningAgentLoop: c.isRunningAgentLoop,
           };
         });
 
@@ -103,7 +105,7 @@ async function handler(
           api_error: {
             type: "invalid_request_error",
             message:
-              "Either agent ID, reinforcedAgent ID, reinforcedSkill ID or trigger ID is required.",
+              "Either agent ID, reinforcedSkill ID or trigger ID is required.",
           },
         });
       }

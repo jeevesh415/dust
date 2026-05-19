@@ -1,16 +1,15 @@
 // biome-ignore-all lint/plugin/noRawSql: test file uses raw SQL for setup and verification
 import { loadAllModels } from "@app/admin/db";
+import type { LightMCPToolConfigurationType } from "@app/lib/actions/mcp";
 import { Authenticator } from "@app/lib/auth";
+import { AgentMCPActionModel } from "@app/lib/models/agent/actions/mcp";
 import {
   AgentMessageModel,
   ConversationModel,
+  ConversationParticipantModel,
   MessageModel,
   UserMessageModel,
 } from "@app/lib/models/agent/conversation";
-import {
-  getReinforcementMetadata,
-  REINFORCEMENT_METADATA_KEYS,
-} from "@app/lib/reinforced_agent/types";
 import { getReinforcedSkillsMetadata } from "@app/lib/reinforcement/types";
 import { ConversationBranchResource } from "@app/lib/resources/conversation_branch_resource";
 import { ConversationForkResource } from "@app/lib/resources/conversation_fork_resource";
@@ -25,9 +24,13 @@ import { SpaceResource } from "@app/lib/resources/space_resource";
 import { frontSequelize } from "@app/lib/resources/storage";
 import { generateRandomModelSId } from "@app/lib/resources/string_ids_server";
 import type { UserResource } from "@app/lib/resources/user_resource";
+import { WorkspaceResource } from "@app/lib/resources/workspace_resource";
+import { launchIndexConversationEsWorkflow } from "@app/temporal/es_indexation/client";
 import { AgentConfigurationFactory } from "@app/tests/utils/AgentConfigurationFactory";
 import { ConversationFactory } from "@app/tests/utils/ConversationFactory";
+import { FeatureFlagFactory } from "@app/tests/utils/FeatureFlagFactory";
 import { createResourceTest } from "@app/tests/utils/generic_resource_tests";
+import { KeyFactory } from "@app/tests/utils/KeyFactory";
 import { MembershipFactory } from "@app/tests/utils/MembershipFactory";
 import { RemoteMCPServerFactory } from "@app/tests/utils/RemoteMCPServerFactory";
 import { SpaceFactory } from "@app/tests/utils/SpaceFactory";
@@ -135,7 +138,7 @@ describe("ConversationResource", () => {
       expect(fetched.length).toBe(0);
     });
 
-    it("should preload forkedFrom on forked child conversations", async () => {
+    it("should include forkingData on forked child conversations when requested", async () => {
       const { workspace, authenticator: auth } = await createResourceTest({
         role: "admin",
       });
@@ -148,6 +151,16 @@ describe("ConversationResource", () => {
         agentConfigurationId: agent.sId,
         messagesCreatedAt: [new Date("2026-01-01T00:00:00.000Z")],
       });
+      const parentConversationTitle = "Quarterly Review Data";
+      await ConversationModel.update(
+        { title: parentConversationTitle },
+        {
+          where: {
+            id: parentConversation.id,
+            workspaceId: workspace.id,
+          },
+        }
+      );
       const childConversation = await ConversationFactory.create(auth, {
         agentConfigurationId: agent.sId,
         messagesCreatedAt: [],
@@ -182,15 +195,22 @@ describe("ConversationResource", () => {
       });
 
       const [fetchedChildConversation] =
-        await ConversationResource.fetchByModelIds(auth, [
-          childConversation.id,
-        ]);
+        await ConversationResource.fetchByModelIds(
+          auth,
+          [childConversation.id],
+          {
+            includeForkingData: true,
+          }
+        );
 
-      expect(fetchedChildConversation.toJSON().forkedFrom).toEqual({
-        parentConversationId: parentConversation.sId,
-        sourceMessageId: sourceMessage.sId,
-        branchedAt: branchedAt.getTime(),
-        user: auth.getNonNullableUser().toJSON(),
+      expect(fetchedChildConversation.toJSON().forkingData).toEqual({
+        forkedFrom: {
+          parentConversationId: parentConversation.sId,
+          parentConversationTitle,
+          sourceMessageId: sourceMessage.sId,
+          branchedAt: branchedAt.getTime(),
+          user: auth.getNonNullableUser().toJSON(),
+        },
       });
 
       const childConversationWithoutContent =
@@ -201,16 +221,33 @@ describe("ConversationResource", () => {
       expect(childConversationWithoutContent.isOk()).toBe(true);
 
       if (childConversationWithoutContent.isOk()) {
-        expect(childConversationWithoutContent.value.forkedFrom).toEqual({
-          parentConversationId: parentConversation.sId,
-          sourceMessageId: sourceMessage.sId,
-          branchedAt: branchedAt.getTime(),
-          user: auth.getNonNullableUser().toJSON(),
+        expect(
+          childConversationWithoutContent.value.forkingData
+        ).toBeUndefined();
+      }
+
+      const childConversationWithForkingData =
+        await ConversationResource.fetchConversationWithoutContent(
+          auth,
+          childConversation.sId,
+          { includeForkingData: true }
+        );
+      expect(childConversationWithForkingData.isOk()).toBe(true);
+
+      if (childConversationWithForkingData.isOk()) {
+        expect(childConversationWithForkingData.value.forkingData).toEqual({
+          forkedFrom: {
+            parentConversationId: parentConversation.sId,
+            parentConversationTitle,
+            sourceMessageId: sourceMessage.sId,
+            branchedAt: branchedAt.getTime(),
+            user: auth.getNonNullableUser().toJSON(),
+          },
         });
       }
     });
 
-    it("should expose forkedFrom even when the parent conversation is unreadable", async () => {
+    it("should expose forkedFrom title even when the parent conversation is unreadable", async () => {
       const {
         workspace,
         authenticator: adminAuth,
@@ -243,6 +280,16 @@ describe("ConversationResource", () => {
         requestedSpaceIds: [restrictedSpace.id],
         spaceId: restrictedSpace.id,
       });
+      const parentConversationTitle = "Restricted parent conversation";
+      const updateTitleRes = await ConversationResource.updateTitle(
+        adminAuth,
+        parentConversation.sId,
+        parentConversationTitle
+      );
+      assert(
+        updateTitleRes.isOk(),
+        "Failed to update parent conversation title"
+      );
       const childConversation = await ConversationFactory.create(userAuth, {
         agentConfigurationId: agent.sId,
         messagesCreatedAt: [],
@@ -282,15 +329,19 @@ describe("ConversationResource", () => {
 
       const fetchedChildConversation = await ConversationResource.fetchById(
         userAuth,
-        childConversation.sId
+        childConversation.sId,
+        { includeForkingData: true }
       );
       assert(fetchedChildConversation, "Child conversation not found");
 
-      expect(fetchedChildConversation.toJSON().forkedFrom).toEqual({
-        parentConversationId: parentConversation.sId,
-        sourceMessageId: sourceMessage.sId,
-        branchedAt: branchedAt.getTime(),
-        user: adminAuth.getNonNullableUser().toJSON(),
+      expect(fetchedChildConversation.toJSON().forkingData).toEqual({
+        forkedFrom: {
+          parentConversationId: parentConversation.sId,
+          parentConversationTitle,
+          sourceMessageId: sourceMessage.sId,
+          branchedAt: branchedAt.getTime(),
+          user: adminAuth.getNonNullableUser().toJSON(),
+        },
       });
     });
   });
@@ -466,106 +517,85 @@ describe("destroyConversation", () => {
     ).toBe(30);
     expect(Math.max(...agentMessageDestroyCounts)).toBeLessThan(30);
   });
-});
 
-describe("listReinforcementConversations", () => {
-  let auth: Authenticator;
-  let anotherAuth: Authenticator;
-
-  beforeEach(async () => {
-    const workspace = await WorkspaceFactory.basic();
-    const user = await UserFactory.basic();
-    await MembershipFactory.associate(workspace, user, { role: "admin" });
-    auth = await Authenticator.fromUserIdAndWorkspaceId(
-      user.sId,
-      workspace.sId
-    );
-
-    const anotherWorkspace = await WorkspaceFactory.basic();
-    const anotherUser = await UserFactory.basic();
-    await MembershipFactory.associate(anotherWorkspace, anotherUser, {
-      role: "admin",
+  it("should delete MCP actions with a missing step content link", async () => {
+    const conversationType = await ConversationFactory.create(auth, {
+      agentConfigurationId,
+      messagesCreatedAt: [new Date()],
     });
-    anotherAuth = await Authenticator.fromUserIdAndWorkspaceId(
-      anotherUser.sId,
-      anotherWorkspace.sId
-    );
-  });
-
-  it("should return only conversations with reinforcedAgent metadata for the given agent", async () => {
-    // Create reinforcement conversation for agent-1.
-    const reinforcedConvo1 = await ConversationResource.makeNew(
+    const conversation = await ConversationResource.fetchById(
       auth,
-      {
-        sId: generateRandomModelSId(),
-        title: "Reinforcement for agent-1",
-        visibility: "test",
-        requestedSpaceIds: [],
-        metadata: getReinforcementMetadata(
-          "reinforced_agent_analyze_conversation",
-          "agent-1"
-        ),
+      conversationType.sId
+    );
+    if (!conversation) {
+      throw new Error("Conversation should exist");
+    }
+
+    const agentMessage = (
+      await MessageModel.findAll({
+        where: {
+          conversationId: conversation.id,
+          workspaceId: auth.getNonNullableWorkspace().id,
+        },
+      })
+    ).find((message) => message.agentMessageId !== null);
+    if (!agentMessage?.agentMessageId) {
+      throw new Error("Agent message should exist");
+    }
+    const agentMessageId = agentMessage.agentMessageId;
+
+    const toolConfiguration: LightMCPToolConfigurationType = {
+      id: 1,
+      sId: generateRandomModelSId(),
+      type: "mcp_configuration",
+      name: "test_tool",
+      dataSources: null,
+      tables: null,
+      childAgentId: null,
+      timeFrame: null,
+      jsonSchema: null,
+      additionalConfiguration: {},
+      mcpServerViewId: "test-server-view",
+      dustAppConfiguration: null,
+      secretName: null,
+      dustProject: null,
+      internalMCPServerId: null,
+      availability: "auto",
+      permission: "low",
+      toolServerId: "test-server",
+      retryPolicy: "no_retry",
+      originalName: "test_tool",
+      mcpServerName: "test_server",
+    };
+
+    await AgentMCPActionModel.create({
+      workspaceId: auth.getNonNullableWorkspace().id,
+      agentMessageId,
+      mcpServerConfigurationId: generateRandomModelSId(),
+      status: "succeeded",
+      citationsAllocated: 0,
+      augmentedInputs: {},
+      toolConfiguration,
+      stepContext: {
+        citationsCount: 0,
+        citationsOffset: 0,
+        resumeState: null,
+        retrievalTopK: 10,
+        websearchResultCount: 5,
       },
-      null
-    );
-
-    // Create reinforcement conversation for agent-2 (should be excluded).
-    await ConversationResource.makeNew(
-      auth,
-      {
-        sId: generateRandomModelSId(),
-        title: "Reinforcement for agent-2",
-        visibility: "test",
-        requestedSpaceIds: [],
-        metadata: getReinforcementMetadata(
-          "reinforced_agent_aggregate_suggestions",
-          "agent-2"
-        ),
-      },
-      null
-    );
-
-    // Create a regular (non-reinforcement) conversation (should be excluded).
-    await ConversationResource.makeNew(
-      auth,
-      {
-        sId: generateRandomModelSId(),
-        title: "Regular conversation",
-        visibility: "unlisted",
-        requestedSpaceIds: [],
-        metadata: {},
-      },
-      null
-    );
-
-    // Create reinforcement conversation in another workspace (should be excluded).
-    await ConversationResource.makeNew(
-      anotherAuth,
-      {
-        sId: generateRandomModelSId(),
-        title: "Other workspace reinforcement",
-        visibility: "test",
-        requestedSpaceIds: [],
-        metadata: getReinforcementMetadata(
-          "reinforced_agent_analyze_conversation",
-          "agent-1"
-        ),
-      },
-      null
-    );
-
-    const results = await ConversationResource.listReinforcementConversations(
-      auth,
-      "agent-1"
-    );
-
-    expect(results).toHaveLength(1);
-    expect(results[0].sId).toBe(reinforcedConvo1.sId);
-    expect(results[0].title).toBe("Reinforcement for agent-1");
-    expect(results[0].metadata).toMatchObject({
-      [REINFORCEMENT_METADATA_KEYS.reinforcedAgent]: true,
-      [REINFORCEMENT_METADATA_KEYS.reinforcedAgentConfigurationId]: "agent-1",
     });
+
+    const result = await destroyConversation(auth, { conversation });
+
+    expect(result.isOk()).toBe(true);
+    await expect(
+      AgentMCPActionModel.count({
+        where: {
+          agentMessageId,
+          workspaceId: auth.getNonNullableWorkspace().id,
+        },
+      })
+    ).resolves.toBe(0);
   });
 });
 
@@ -678,9 +708,9 @@ describe("listSkillReinforcementConversations", () => {
       );
 
     expect(results).toHaveLength(2);
-    const resultSIds = results.map((r) => r.sId).sort();
-    const expectedSIds = [aggregationConvo.sId, analysisConvo.sId].sort();
-    expect(resultSIds).toEqual(expectedSIds);
+    const resultIds = results.map((r) => r.sId).sort();
+    const expectedIds = [aggregationConvo.sId, analysisConvo.sId].sort();
+    expect(resultIds).toEqual(expectedIds);
   });
 
   it("should filter conversations by after date when provided", async () => {
@@ -1068,6 +1098,9 @@ describe("baseFetchWithAuthorization with space-based permissions", () => {
   let agents: LightAgentConfigurationType[];
   let globalSpace: SpaceResource;
   let restrictedSpace: SpaceResource;
+  let globalGroup: Awaited<
+    ReturnType<typeof createResourceTest>
+  >["globalGroup"];
   let conversations: {
     accessible: string[];
     restricted: string[];
@@ -1077,11 +1110,13 @@ describe("baseFetchWithAuthorization with space-based permissions", () => {
     const {
       authenticator,
       globalSpace: gs,
+      globalGroup: gg,
       user,
       workspace: w,
     } = await createResourceTest({
       role: "admin",
     });
+    globalGroup = gg;
 
     workspace = w;
     globalSpace = gs;
@@ -1256,7 +1291,7 @@ describe("baseFetchWithAuthorization with space-based permissions", () => {
     );
 
     assert(conversationResource, "Conversation resource not found");
-    await conversationResource.updateVisibilityToDeleted();
+    await conversationResource.updateVisibilityToDeleted(adminAuth);
 
     // Without includeDeleted, should not be visible
     const withoutDeleted = await ConversationResource.listAll(adminAuth);
@@ -1396,6 +1431,344 @@ describe("baseFetchWithAuthorization with space-based permissions", () => {
     allConversations = await ConversationResource.listAll(auth);
     conversationIds = allConversations.map((c) => c.sId);
     expect(conversationIds).not.toContain(tempSpaceConvo.sId);
+  });
+
+  it("should bypass participant restriction for internal auth when private conversation URLs are private by default", async () => {
+    const updateResult = await WorkspaceResource.updateMetadata(workspace.id, {
+      privateConversationUrlsByDefault: true,
+    });
+    assert(updateResult.isOk(), "Failed to enable private conversation URLs");
+
+    const refreshedAdminAuth = await Authenticator.fromUserIdAndWorkspaceId(
+      adminAuth.getNonNullableUser().sId,
+      workspace.sId
+    );
+    expect(refreshedAdminAuth.authMethod()).toBe("internal");
+
+    const participantRequiredConversation = await ConversationFactory.create(
+      refreshedAdminAuth,
+      {
+        agentConfigurationId: agents[0].sId,
+        requestedSpaceIds: [globalSpace.id],
+        messagesCreatedAt: [dateFromDaysAgo(2)],
+      }
+    );
+
+    const internalAdminConversations =
+      await ConversationResource.listAll(refreshedAdminAuth);
+    expect(internalAdminConversations.map((c) => c.sId)).toContain(
+      participantRequiredConversation.sId
+    );
+  });
+
+  it.each([
+    ["session"],
+    ["oauth"],
+    ["sandbox_token"],
+  ] as const)("should require participation for %s auth when private conversation URLs are private by default", async (authMethod) => {
+    const updateResult = await WorkspaceResource.updateMetadata(workspace.id, {
+      privateConversationUrlsByDefault: true,
+    });
+    assert(updateResult.isOk(), "Failed to enable private conversation URLs");
+
+    const refreshedAdminAuth = await Authenticator.fromUserIdAndWorkspaceId(
+      adminAuth.getNonNullableUser().sId,
+      workspace.sId
+    );
+    const refreshedUserAuth = await Authenticator.fromUserIdAndWorkspaceId(
+      userAuth.getNonNullableUser().sId,
+      workspace.sId
+    );
+
+    const participantRequiredConversation = await ConversationFactory.create(
+      refreshedAdminAuth,
+      {
+        agentConfigurationId: agents[0].sId,
+        requestedSpaceIds: [globalSpace.id],
+        messagesCreatedAt: [dateFromDaysAgo(2)],
+      }
+    );
+
+    const sessionUser = refreshedUserAuth.getNonNullableUser();
+    assert(
+      sessionUser.workOSUserId,
+      "Expected regular user to have a WorkOS user ID"
+    );
+    const userSessionAuth = await Authenticator.fromSession(
+      {
+        type: "workos",
+        sessionId: "test-session-id-user",
+        user: {
+          workOSUserId: sessionUser.workOSUserId,
+          email: sessionUser.email ?? "user@dust.tt",
+          email_verified: true,
+          name: sessionUser.username ?? "user",
+          nickname: sessionUser.username ?? "user",
+        },
+        authenticationMethod: "GoogleOAuth",
+        isSSO: false,
+        workspaceId: workspace.sId,
+        organizationId: workspace.workOSOrganizationId ?? undefined,
+        region: "us-central1",
+      },
+      workspace.sId
+    );
+
+    const userSandboxAuthRes = await Authenticator.fromSandboxToken(
+      {
+        wId: workspace.sId,
+        cId: participantRequiredConversation.sId,
+        uId: sessionUser.sId,
+        aId: agents[0].sId,
+        mId: "test-message-id-user",
+        sbId: "test-sandbox-id-user",
+        execId: "test-exec-id-user",
+        actionId: "test-action-id",
+      },
+      workspace.sId
+    );
+    assert(
+      userSandboxAuthRes.isOk(),
+      "Failed to create sandbox authenticator for regular user"
+    );
+
+    const userAuthForMethod =
+      authMethod === "sandbox_token"
+        ? userSandboxAuthRes.value
+        : userSessionAuth;
+    if (authMethod === "oauth") {
+      vi.spyOn(userAuthForMethod, "authMethod").mockReturnValue("oauth");
+    }
+    expect(userAuthForMethod.authMethod()).toBe(authMethod);
+
+    const nonParticipantUserConversations =
+      await ConversationResource.listAll(userAuthForMethod);
+    expect(nonParticipantUserConversations.map((c) => c.sId)).not.toContain(
+      participantRequiredConversation.sId
+    );
+
+    await ConversationResource.upsertParticipation(userAuthForMethod, {
+      conversation: participantRequiredConversation,
+      action: "posted",
+      user: userAuthForMethod.getNonNullableUser().toJSON(),
+      lastReadAt: null,
+    });
+
+    const participantUserConversations =
+      await ConversationResource.listAll(userAuthForMethod);
+    expect(participantUserConversations.map((c) => c.sId)).toContain(
+      participantRequiredConversation.sId
+    );
+
+    const sessionAdminUser = refreshedAdminAuth.getNonNullableUser();
+    assert(
+      sessionAdminUser.workOSUserId,
+      "Expected admin user to have a WorkOS user ID"
+    );
+    const adminSessionAuth = await Authenticator.fromSession(
+      {
+        type: "workos",
+        sessionId: "test-session-id-admin",
+        user: {
+          workOSUserId: sessionAdminUser.workOSUserId,
+          email: sessionAdminUser.email ?? "admin@dust.tt",
+          email_verified: true,
+          name: sessionAdminUser.username ?? "admin",
+          nickname: sessionAdminUser.username ?? "admin",
+        },
+        authenticationMethod: "GoogleOAuth",
+        isSSO: false,
+        workspaceId: workspace.sId,
+        organizationId: workspace.workOSOrganizationId ?? undefined,
+        region: "us-central1",
+      },
+      workspace.sId
+    );
+
+    const adminSandboxAuthRes = await Authenticator.fromSandboxToken(
+      {
+        wId: workspace.sId,
+        cId: participantRequiredConversation.sId,
+        uId: sessionAdminUser.sId,
+        aId: agents[0].sId,
+        mId: "test-message-id-admin",
+        sbId: "test-sandbox-id-admin",
+        execId: "test-exec-id-admin",
+        actionId: "test-action-id",
+      },
+      workspace.sId
+    );
+    assert(
+      adminSandboxAuthRes.isOk(),
+      "Failed to create sandbox authenticator for admin user"
+    );
+
+    const adminAuthForMethod =
+      authMethod === "sandbox_token"
+        ? adminSandboxAuthRes.value
+        : adminSessionAuth;
+    if (authMethod === "oauth") {
+      vi.spyOn(adminAuthForMethod, "authMethod").mockReturnValue("oauth");
+    }
+    expect(adminAuthForMethod.authMethod()).toBe(authMethod);
+
+    const nonParticipantAdminConversations =
+      await ConversationResource.listAll(adminAuthForMethod);
+    expect(nonParticipantAdminConversations.map((c) => c.sId)).not.toContain(
+      participantRequiredConversation.sId
+    );
+  });
+
+  it("should allow API key auth to fetch a conversation it created when private URLs are enabled by default", async () => {
+    const updateResult = await WorkspaceResource.updateMetadata(workspace.id, {
+      privateConversationUrlsByDefault: true,
+    });
+    assert(updateResult.isOk(), "Failed to enable private conversation URLs");
+
+    const apiKey = await KeyFactory.regular(globalGroup);
+    const { workspaceAuth: apiKeyAuth } = await Authenticator.fromKey(
+      apiKey,
+      workspace.sId
+    );
+
+    const conversation = await ConversationFactory.create(apiKeyAuth, {
+      agentConfigurationId: agents[0].sId,
+      messagesCreatedAt: [dateFromDaysAgo(2)],
+    });
+
+    // API key has no user so no participant record is created, but it should
+    // still be able to fetch the conversation it created via space permissions.
+    const fetched = await ConversationResource.fetchById(
+      apiKeyAuth,
+      conversation.sId
+    );
+    expect(fetched).not.toBeNull();
+    expect(fetched?.sId).toBe(conversation.sId);
+  });
+
+  it("should keep project conversations accessible for oauth auth when private conversation URLs are private by default", async () => {
+    const updateResult = await WorkspaceResource.updateMetadata(workspace.id, {
+      privateConversationUrlsByDefault: true,
+    });
+    assert(updateResult.isOk(), "Failed to enable private conversation URLs");
+
+    const refreshedAdminAuth = await Authenticator.fromUserIdAndWorkspaceId(
+      adminAuth.getNonNullableUser().sId,
+      workspace.sId
+    );
+    const refreshedUserAuth = await Authenticator.fromUserIdAndWorkspaceId(
+      userAuth.getNonNullableUser().sId,
+      workspace.sId
+    );
+
+    const projectSpace = await SpaceFactory.project(
+      workspace,
+      refreshedAdminAuth.getNonNullableUser().id
+    );
+    const addMemberResult = await projectSpace.addMembers(refreshedAdminAuth, {
+      userIds: [
+        refreshedAdminAuth.getNonNullableUser().sId,
+        refreshedUserAuth.getNonNullableUser().sId,
+      ],
+    });
+    assert(addMemberResult.isOk(), "Failed to add users to project space");
+
+    const refreshedProjectAdminAuth =
+      await Authenticator.fromUserIdAndWorkspaceId(
+        refreshedAdminAuth.getNonNullableUser().sId,
+        workspace.sId
+      );
+    const refreshedProjectReaderAuth =
+      await Authenticator.fromUserIdAndWorkspaceId(
+        refreshedUserAuth.getNonNullableUser().sId,
+        workspace.sId
+      );
+    vi.spyOn(refreshedProjectReaderAuth, "authMethod").mockReturnValue("oauth");
+
+    const projectConversation = await ConversationFactory.create(
+      refreshedProjectAdminAuth,
+      {
+        agentConfigurationId: agents[0].sId,
+        requestedSpaceIds: [projectSpace.id],
+        spaceId: projectSpace.id,
+        messagesCreatedAt: [dateFromDaysAgo(2)],
+      }
+    );
+
+    const oauthConversations = await ConversationResource.listAll(
+      refreshedProjectReaderAuth
+    );
+    expect(oauthConversations.map((c) => c.sId)).toContain(
+      projectConversation.sId
+    );
+  });
+
+  it("should keep sub-conversations accessible for session auth when private conversation URLs are private by default", async () => {
+    const updateResult = await WorkspaceResource.updateMetadata(workspace.id, {
+      privateConversationUrlsByDefault: true,
+    });
+    assert(updateResult.isOk(), "Failed to enable private conversation URLs");
+
+    const refreshedAdminAuth = await Authenticator.fromUserIdAndWorkspaceId(
+      adminAuth.getNonNullableUser().sId,
+      workspace.sId
+    );
+    const refreshedUserAuth = await Authenticator.fromUserIdAndWorkspaceId(
+      userAuth.getNonNullableUser().sId,
+      workspace.sId
+    );
+    const sessionUser = refreshedUserAuth.getNonNullableUser();
+    assert(
+      sessionUser.workOSUserId,
+      "Expected regular user to have a WorkOS user ID"
+    );
+
+    const userSessionAuth = await Authenticator.fromSession(
+      {
+        type: "workos",
+        sessionId: "test-session-id-subconversation",
+        user: {
+          workOSUserId: sessionUser.workOSUserId,
+          email: sessionUser.email ?? "user@dust.tt",
+          email_verified: true,
+          name: sessionUser.username ?? "user",
+          nickname: sessionUser.username ?? "user",
+        },
+        authenticationMethod: "GoogleOAuth",
+        isSSO: false,
+        workspaceId: workspace.sId,
+        organizationId: workspace.workOSOrganizationId ?? undefined,
+        region: "us-central1",
+      },
+      workspace.sId
+    );
+
+    const subConversation = await ConversationFactory.create(
+      refreshedAdminAuth,
+      {
+        agentConfigurationId: agents[0].sId,
+        requestedSpaceIds: [globalSpace.id],
+        messagesCreatedAt: [dateFromDaysAgo(2)],
+      }
+    );
+
+    await ConversationModel.update(
+      {
+        depth: 1,
+      },
+      {
+        where: {
+          workspaceId: workspace.id,
+          sId: subConversation.sId,
+        },
+      }
+    );
+
+    const sessionConversations =
+      await ConversationResource.listAll(userSessionAuth);
+    expect(sessionConversations.map((c) => c.sId)).toContain(
+      subConversation.sId
+    );
   });
 });
 
@@ -2516,6 +2889,7 @@ describe("Space Handling", () => {
         {
           title: "Test conversation with space",
           sId: generateRandomModelSId(),
+          spaceId: space.id,
           requestedSpaceIds: [],
         },
         space
@@ -2577,6 +2951,7 @@ describe("Space Handling", () => {
         {
           title: "Test conversation",
           sId: generateRandomModelSId(),
+          spaceId: space.id,
           requestedSpaceIds: [],
         },
         space
@@ -2613,6 +2988,7 @@ describe("Space Handling", () => {
         {
           title: "Test conversation",
           sId: generateRandomModelSId(),
+          spaceId: space.id,
           requestedSpaceIds: [],
         },
         space
@@ -2654,17 +3030,23 @@ describe("Space Handling", () => {
         workspace.sId
       );
 
-      // Create a conversation with space but don't provide the space
-      const testConversation = await ConversationResource.makeNew(
+      const conversation = await ConversationModel.create({
+        workspaceId: workspace.id,
+        title: "Test conversation",
+        sId: generateRandomModelSId(),
+        spaceId: globalSpace.id,
+        requestedSpaceIds: [globalSpace.id],
+      });
+
+      const [testConversation] = await ConversationResource.fetchByModelIds(
         auth,
-        {
-          title: "Test conversation",
-          sId: generateRandomModelSId(),
-          spaceId: globalSpace.id,
-          requestedSpaceIds: [],
-        },
-        null
+        [conversation.id]
       );
+
+      expect(testConversation).toBeDefined();
+      if (!testConversation) {
+        return;
+      }
 
       expect(() => {
         return testConversation.space;
@@ -2698,6 +3080,7 @@ describe("Space Handling", () => {
         {
           title: "Test conversation",
           sId: generateRandomModelSId(),
+          spaceId: space.id,
           requestedSpaceIds: [],
         },
         space
@@ -2762,6 +3145,7 @@ describe("Space Handling", () => {
         {
           title: "Test conversation",
           sId: generateRandomModelSId(),
+          spaceId: mainSpace.id,
           requestedSpaceIds: [additionalSpace.id],
         },
         mainSpace
@@ -2807,6 +3191,7 @@ describe("Space Handling", () => {
           {
             title: "Test conversation with access",
             sId: generateRandomModelSId(),
+            spaceId: space.id,
             requestedSpaceIds: [],
           },
           space
@@ -2841,6 +3226,7 @@ describe("Space Handling", () => {
           {
             title: "Test conversation without access",
             sId: generateRandomModelSId(),
+            spaceId: restrictedSpace.id,
             requestedSpaceIds: [],
           },
           restrictedSpace
@@ -2921,6 +3307,7 @@ describe("Space Handling", () => {
         {
           title: "Test conversation with mismatched space",
           sId: generateRandomModelSId(),
+          spaceId: spaceInWorkspace2.id,
           requestedSpaceIds: [],
         },
         spaceInWorkspace2
@@ -2954,6 +3341,7 @@ describe("Space Handling", () => {
         {
           title: "Test conversation with matching workspace",
           sId: generateRandomModelSId(),
+          spaceId: space.id,
           requestedSpaceIds: [],
         },
         space
@@ -2985,12 +3373,13 @@ describe("Space Handling", () => {
       );
 
       // Try to create a conversation - should fail before creating the object
-      const testSId = generateRandomModelSId();
+      const testId = generateRandomModelSId();
       const attempt = ConversationResource.makeNew(
         userAuth,
         {
           title: "Should not be created",
-          sId: testSId,
+          sId: testId,
+          spaceId: restrictedSpace.id,
           requestedSpaceIds: [],
         },
         restrictedSpace
@@ -3004,7 +3393,7 @@ describe("Space Handling", () => {
       // (the conversation should not exist in the database)
       const fetchedConversations = await ConversationResource.listAll(userAuth);
       const foundConversation = fetchedConversations.some(
-        (c) => c.sId === testSId
+        (c) => c.sId === testId
       );
       expect(foundConversation).toBe(false);
     });
@@ -3028,14 +3417,15 @@ describe("Space Handling", () => {
         workspace.sId
       );
 
-      const testSId = generateRandomModelSId();
+      const testId = generateRandomModelSId();
 
       // Attempt should fail at validation, not at creation
       const attempt = ConversationResource.makeNew(
         otherUserAuth,
         {
           title: "Should not be created",
-          sId: testSId,
+          sId: testId,
+          spaceId: restrictedSpace.id,
           requestedSpaceIds: [],
         },
         restrictedSpace
@@ -3049,7 +3439,7 @@ describe("Space Handling", () => {
       const fetchedConversations =
         await ConversationResource.listAll(otherUserAuth);
       const foundConversation = fetchedConversations.some(
-        (c) => c.sId === testSId
+        (c) => c.sId === testId
       );
       expect(foundConversation).toBe(false);
     });
@@ -3224,7 +3614,7 @@ describe("Space Handling", () => {
         { includeDeleted: false }
       );
       assert(conversationResource, "Conversation resource not found");
-      await conversationResource.updateVisibilityToDeleted();
+      await conversationResource.updateVisibilityToDeleted(adminAuth);
 
       const result = await ConversationResource.canAccess(
         userAuth,
@@ -3349,6 +3739,245 @@ describe("Space Handling", () => {
         emptySpaceConvo.sId
       );
 
+      expect(result).toBe("allowed");
+    });
+
+    it("should keep space conversations accessible to non-participants when private conversation URLs are private by default", async () => {
+      const updateResult = await WorkspaceResource.updateMetadata(
+        workspace.id,
+        {
+          privateConversationUrlsByDefault: true,
+        }
+      );
+      assert(updateResult.isOk(), "Failed to enable private conversation URLs");
+
+      const refreshedUserAuth = await Authenticator.fromUserIdAndWorkspaceId(
+        userAuth.getNonNullableUser().sId,
+        workspace.sId
+      );
+
+      const result = await ConversationResource.canAccess(
+        refreshedUserAuth,
+        conversations.accessible
+      );
+
+      expect(result).toBe("allowed");
+    });
+
+    it("should return 'allowed' for non-participants when URL access mode is workspace_members", async () => {
+      const updateResult = await WorkspaceResource.updateMetadata(
+        workspace.id,
+        {
+          privateConversationUrlsByDefault: true,
+        }
+      );
+      assert(updateResult.isOk(), "Failed to enable private conversation URLs");
+
+      await ConversationModel.update(
+        {
+          metadata: {
+            urlAccessMode: "workspace_members",
+          },
+        },
+        {
+          where: {
+            workspaceId: workspace.id,
+            sId: conversations.accessible,
+          },
+        }
+      );
+
+      const refreshedUserAuth = await Authenticator.fromUserIdAndWorkspaceId(
+        userAuth.getNonNullableUser().sId,
+        workspace.sId
+      );
+
+      const result = await ConversationResource.canAccess(
+        refreshedUserAuth,
+        conversations.accessible
+      );
+
+      expect(result).toBe("allowed");
+    });
+
+    it("should return 'allowed' for participants when private conversation URLs are private by default", async () => {
+      const updateResult = await WorkspaceResource.updateMetadata(
+        workspace.id,
+        {
+          privateConversationUrlsByDefault: true,
+        }
+      );
+      assert(updateResult.isOk(), "Failed to enable private conversation URLs");
+
+      const refreshedUserAuth = await Authenticator.fromUserIdAndWorkspaceId(
+        userAuth.getNonNullableUser().sId,
+        workspace.sId
+      );
+      const refreshedAdminAuth = await Authenticator.fromUserIdAndWorkspaceId(
+        adminAuth.getNonNullableUser().sId,
+        workspace.sId
+      );
+
+      const conversation = await ConversationResource.fetchById(
+        refreshedAdminAuth,
+        conversations.accessible,
+        {
+          dangerouslySkipPermissionFiltering: true,
+        }
+      );
+      assert(conversation, "Conversation not found");
+
+      await ConversationResource.upsertParticipation(refreshedUserAuth, {
+        conversation: conversation.toJSON(),
+        action: "posted",
+        user: refreshedUserAuth.getNonNullableUser().toJSON(),
+        lastReadAt: null,
+      });
+
+      const result = await ConversationResource.canAccess(
+        refreshedUserAuth,
+        conversations.accessible
+      );
+
+      expect(result).toBe("allowed");
+    });
+
+    it("should keep project conversations accessible to non-participants when private conversation URLs are private by default", async () => {
+      const updateResult = await WorkspaceResource.updateMetadata(
+        workspace.id,
+        {
+          privateConversationUrlsByDefault: true,
+        }
+      );
+      assert(updateResult.isOk(), "Failed to enable private conversation URLs");
+
+      const refreshedUserAuth = await Authenticator.fromUserIdAndWorkspaceId(
+        userAuth.getNonNullableUser().sId,
+        workspace.sId
+      );
+      const refreshedAdminAuth = await Authenticator.fromUserIdAndWorkspaceId(
+        adminAuth.getNonNullableUser().sId,
+        workspace.sId
+      );
+
+      const projectSpace = await SpaceFactory.project(
+        workspace,
+        refreshedAdminAuth.getNonNullableUser().id
+      );
+      const addMemberResult = await projectSpace.addMembers(
+        refreshedAdminAuth,
+        {
+          userIds: [
+            refreshedAdminAuth.getNonNullableUser().sId,
+            refreshedUserAuth.getNonNullableUser().sId,
+          ],
+        }
+      );
+      assert(addMemberResult.isOk(), "Failed to add users to project space");
+      const projectCreatorAuth = await Authenticator.fromUserIdAndWorkspaceId(
+        refreshedAdminAuth.getNonNullableUser().sId,
+        workspace.sId
+      );
+      const projectReaderAuth = await Authenticator.fromUserIdAndWorkspaceId(
+        refreshedUserAuth.getNonNullableUser().sId,
+        workspace.sId
+      );
+
+      const projectConversation = await ConversationFactory.create(
+        projectCreatorAuth,
+        {
+          agentConfigurationId: agents[0].sId,
+          requestedSpaceIds: [projectSpace.id],
+          spaceId: projectSpace.id,
+          messagesCreatedAt: [dateFromDaysAgo(2)],
+        }
+      );
+
+      const result = await ConversationResource.canAccess(
+        projectReaderAuth,
+        projectConversation.sId
+      );
+
+      expect(result).toBe("allowed");
+    });
+
+    it("should keep space-based checks as a prerequisite when private conversation URLs are private by default", async () => {
+      const updateResult = await WorkspaceResource.updateMetadata(
+        workspace.id,
+        {
+          privateConversationUrlsByDefault: true,
+        }
+      );
+      assert(updateResult.isOk(), "Failed to enable private conversation URLs");
+
+      const refreshedUserAuth = await Authenticator.fromUserIdAndWorkspaceId(
+        userAuth.getNonNullableUser().sId,
+        workspace.sId
+      );
+
+      const result = await ConversationResource.canAccess(
+        refreshedUserAuth,
+        conversations.restricted
+      );
+
+      expect(result).toBe("conversation_access_restricted");
+    });
+
+    it("should keep space conversations accessible to admins when private conversation URLs are private by default and they are not participants", async () => {
+      const updateResult = await WorkspaceResource.updateMetadata(
+        workspace.id,
+        {
+          privateConversationUrlsByDefault: true,
+        }
+      );
+      assert(updateResult.isOk(), "Failed to enable private conversation URLs");
+
+      const refreshedAdminAuth = await Authenticator.fromUserIdAndWorkspaceId(
+        adminAuth.getNonNullableUser().sId,
+        workspace.sId
+      );
+
+      const result = await ConversationResource.canAccess(
+        refreshedAdminAuth,
+        conversations.accessible
+      );
+
+      expect(result).toBe("allowed");
+    });
+
+    it("should restore previous behavior when private conversation URLs are disabled again", async () => {
+      let updateResult = await WorkspaceResource.updateMetadata(workspace.id, {
+        privateConversationUrlsByDefault: true,
+      });
+      assert(updateResult.isOk(), "Failed to enable private conversation URLs");
+
+      let refreshedUserAuth = await Authenticator.fromUserIdAndWorkspaceId(
+        userAuth.getNonNullableUser().sId,
+        workspace.sId
+      );
+
+      let result = await ConversationResource.canAccess(
+        refreshedUserAuth,
+        conversations.accessible
+      );
+      expect(result).toBe("allowed");
+
+      updateResult = await WorkspaceResource.updateMetadata(workspace.id, {
+        privateConversationUrlsByDefault: false,
+      });
+      assert(
+        updateResult.isOk(),
+        "Failed to disable private conversation URLs"
+      );
+
+      refreshedUserAuth = await Authenticator.fromUserIdAndWorkspaceId(
+        userAuth.getNonNullableUser().sId,
+        workspace.sId
+      );
+      result = await ConversationResource.canAccess(
+        refreshedUserAuth,
+        conversations.accessible
+      );
       expect(result).toBe("allowed");
     });
   });
@@ -5172,6 +5801,70 @@ describe("markAsActionRequired", () => {
   });
 });
 
+describe("markAsReadForAuthUser", () => {
+  let auth: Authenticator;
+  let conversation: ConversationWithoutContentType;
+
+  beforeEach(async () => {
+    const workspace = await WorkspaceFactory.basic();
+    const user = await UserFactory.basic();
+    auth = await Authenticator.fromUserIdAndWorkspaceId(
+      user.sId,
+      workspace.sId
+    );
+    const [agent] = await setupTestAgents(workspace, user);
+    conversation = await ConversationFactory.create(auth, {
+      agentConfigurationId: agent.sId,
+      messagesCreatedAt: [],
+    });
+  });
+
+  it("defaults lastReadAt to now when no override is provided", async () => {
+    const before = new Date();
+    const result = await ConversationResource.markAsReadForAuthUser(auth, {
+      conversation,
+    });
+    expect(result.isOk()).toBe(true);
+    const after = new Date();
+
+    const { UserConversationReadsModel } = await import(
+      "@app/lib/models/agent/conversation"
+    );
+    const row = await UserConversationReadsModel.findOne({
+      where: {
+        conversationId: conversation.id,
+        userId: auth.getNonNullableUser().id,
+        workspaceId: auth.getNonNullableWorkspace().id,
+      },
+    });
+    assert(row);
+    expect(row.lastReadAt.getTime()).toBeGreaterThanOrEqual(before.getTime());
+    expect(row.lastReadAt.getTime()).toBeLessThanOrEqual(after.getTime());
+  });
+
+  it("persists the lastReadAt override when one is provided", async () => {
+    const explicit = new Date(Date.now() + 60_000);
+    const result = await ConversationResource.markAsReadForAuthUser(auth, {
+      conversation,
+      lastReadAt: explicit,
+    });
+    expect(result.isOk()).toBe(true);
+
+    const { UserConversationReadsModel } = await import(
+      "@app/lib/models/agent/conversation"
+    );
+    const row = await UserConversationReadsModel.findOne({
+      where: {
+        conversationId: conversation.id,
+        userId: auth.getNonNullableUser().id,
+        workspaceId: auth.getNonNullableWorkspace().id,
+      },
+    });
+    assert(row);
+    expect(row.lastReadAt.getTime()).toBe(explicit.getTime());
+  });
+});
+
 describe("ConversationResource.isConversationCreator", () => {
   let auth: Authenticator;
   let conversationId: string;
@@ -5477,9 +6170,9 @@ describe("ConversationResource.listConversationsInSpacePaginated", () => {
 
     expect(page1.conversations).toHaveLength(2);
     expect(page1.hasMore).toBe(true);
-    const page1Sids = page1.conversations.map((c) => c.sId);
-    expect(page1Sids).toContain(convo4.sId);
-    expect(page1Sids).toContain(convo3.sId);
+    const page1Ids = page1.conversations.map((c) => c.sId);
+    expect(page1Ids).toContain(convo4.sId);
+    expect(page1Ids).toContain(convo3.sId);
 
     // Second page using lastValue
     const page2 = await ConversationResource.listConversationsInSpacePaginated(
@@ -5492,12 +6185,12 @@ describe("ConversationResource.listConversationsInSpacePaginated", () => {
 
     expect(page2.conversations).toHaveLength(2);
     expect(page2.hasMore).toBe(false);
-    const page2Sids = page2.conversations.map((c) => c.sId);
-    expect(page2Sids).toContain(convo2.sId);
-    expect(page2Sids).toContain(convo1.sId);
+    const page2Ids = page2.conversations.map((c) => c.sId);
+    expect(page2Ids).toContain(convo2.sId);
+    expect(page2Ids).toContain(convo1.sId);
 
     // No overlap between pages
-    expect(page1Sids.some((sId) => page2Sids.includes(sId))).toBe(false);
+    expect(page1Ids.some((sId) => page2Ids.includes(sId))).toBe(false);
   });
 
   it("should apply updatedSince on every page when using lastValue cursor", async () => {
@@ -5542,7 +6235,7 @@ describe("ConversationResource.listConversationsInSpacePaginated", () => {
     }
 
     // Collect all conversations through pagination
-    const allSids: string[] = [];
+    const allIds: string[] = [];
     let lastValue: string | undefined;
     let iterations = 0;
     const maxIterations = 10;
@@ -5557,7 +6250,7 @@ describe("ConversationResource.listConversationsInSpacePaginated", () => {
           }
         );
 
-      allSids.push(...result.conversations.map((c) => c.sId));
+      allIds.push(...result.conversations.map((c) => c.sId));
 
       if (!result.hasMore) {
         break;
@@ -5567,9 +6260,9 @@ describe("ConversationResource.listConversationsInSpacePaginated", () => {
     }
 
     // Should have all 5 conversations
-    expect(allSids).toHaveLength(5);
+    expect(allIds).toHaveLength(5);
     for (const convo of convos) {
-      expect(allSids).toContain(convo.sId);
+      expect(allIds).toContain(convo.sId);
     }
   });
 
@@ -5682,11 +6375,144 @@ describe("ConversationResource.listConversationsInSpacePaginated", () => {
     expect(sIds).toContain(convo1.sId);
     expect(sIds).toContain(convo2.sId);
   });
+
+  it("group filter includes conversations with two participants posted or subscribed", async () => {
+    const convo = await createConvoWithUpdatedAt(1);
+    const adminUser = adminAuth.getNonNullableUser();
+
+    const otherUser = await UserFactory.basic();
+    await MembershipFactory.associate(workspace, otherUser, { role: "user" });
+    const addRes = await space.addMembers(adminAuth, {
+      userIds: [otherUser.sId],
+    });
+    assert(addRes.isOk(), "Failed to add user to space");
+
+    await ConversationParticipantModel.create({
+      workspaceId: workspace.id,
+      conversationId: convo.id,
+      userId: adminUser.id,
+      action: "posted",
+      actionRequired: false,
+    });
+    await ConversationParticipantModel.create({
+      workspaceId: workspace.id,
+      conversationId: convo.id,
+      userId: otherUser.id,
+      action: "subscribed",
+      actionRequired: false,
+    });
+
+    const result = await ConversationResource.listConversationsInSpacePaginated(
+      adminAuth,
+      {
+        spaceId: space.sId,
+        filter: "group",
+        pagination: { limit: 10 },
+      }
+    );
+
+    expect(result.conversations.map((c) => c.sId)).toContain(convo.sId);
+  });
+
+  it("group filter includes conversations with two distinct message authors when a participant row was removed", async () => {
+    const convo = await createConvoWithUpdatedAt(1);
+    const adminUser = adminAuth.getNonNullableUser();
+
+    const otherUser = await UserFactory.basic();
+    await MembershipFactory.associate(workspace, otherUser, { role: "user" });
+    const addRes = await space.addMembers(adminAuth, {
+      userIds: [otherUser.sId],
+    });
+    assert(addRes.isOk(), "Failed to add user to space");
+
+    await ConversationParticipantModel.create({
+      workspaceId: workspace.id,
+      conversationId: convo.id,
+      userId: adminUser.id,
+      action: "posted",
+      actionRequired: false,
+    });
+    await ConversationParticipantModel.create({
+      workspaceId: workspace.id,
+      conversationId: convo.id,
+      userId: otherUser.id,
+      action: "posted",
+      actionRequired: false,
+    });
+
+    const otherAuth = await Authenticator.fromUserIdAndWorkspaceId(
+      otherUser.sId,
+      workspace.sId
+    );
+    await ConversationFactory.createUserMessageWithRank({
+      auth: otherAuth,
+      workspace,
+      conversationId: convo.id,
+      rank: 2,
+      content: "Second user message",
+    });
+
+    await ConversationParticipantModel.destroy({
+      where: {
+        workspaceId: workspace.id,
+        conversationId: convo.id,
+        userId: otherUser.id,
+      },
+    });
+
+    const result = await ConversationResource.listConversationsInSpacePaginated(
+      adminAuth,
+      {
+        spaceId: space.sId,
+        filter: "group",
+        pagination: { limit: 10 },
+      }
+    );
+
+    expect(result.conversations.map((c) => c.sId)).toContain(convo.sId);
+  });
+
+  it("getDistinctUserCountsByConversationIds counts distinct user message authors", async () => {
+    expect(
+      (
+        await ConversationResource.getDistinctUserCountsByConversationIds(
+          workspace.id,
+          []
+        )
+      ).size
+    ).toBe(0);
+
+    const convo = await createConvoWithUpdatedAt(1);
+
+    const otherUser = await UserFactory.basic();
+    await MembershipFactory.associate(workspace, otherUser, { role: "user" });
+
+    const otherAuth = await Authenticator.fromUserIdAndWorkspaceId(
+      otherUser.sId,
+      workspace.sId
+    );
+    await ConversationFactory.createUserMessageWithRank({
+      auth: otherAuth,
+      workspace,
+      conversationId: convo.id,
+      rank: 2,
+      content: "Second user",
+    });
+
+    const counts =
+      await ConversationResource.getDistinctUserCountsByConversationIds(
+        workspace.id,
+        [convo.id]
+      );
+
+    expect(counts.get(convo.id)).toBe(2);
+  });
 });
 
 const KNOWN_CONVERSATION_RELATED_MODELS = [
   "agent_message_skills",
   "agent_message_feedback",
+  "agent_step_content_tool_execution",
   "agent_suggestion",
   "conversation_branch",
   "conversation_fork",
@@ -5697,8 +6523,14 @@ const KNOWN_CONVERSATION_RELATED_MODELS = [
   "message",
   "project_todo_conversation",
   "sandbox",
+  // skill_suggestion.notificationConversationId is ON DELETE SET NULL, so no
+  // explicit cleanup is needed in destroyConversation — the DB clears it.
   "skill_suggestion",
+  // self_improving_skills_usage.conversationId is ON DELETE SET NULL, so no
+  // explicit cleanup is needed in destroyConversation — the DB clears it.
+  "self_improving_skills_usage",
   "user_conversation_reads",
+  "wake_up",
 ];
 
 const KNOWN_MESSAGE_RELATED_MODELS = [
@@ -5837,5 +6669,709 @@ describe("ConversationResource cleanup on delete", () => {
       // Verify they match exactly.
       expect(modelsWithMessageFK).toEqual(knownModels);
     });
+  });
+
+  describe("fetchSpaceRequirementSourceData", () => {
+    it("returns distinct agent configuration ids from agent messages", async () => {
+      const workspace = await WorkspaceFactory.basic();
+      const user = await UserFactory.basic();
+      await MembershipFactory.associate(workspace, user, { role: "admin" });
+
+      const auth = await Authenticator.fromUserIdAndWorkspaceId(
+        user.sId,
+        workspace.sId
+      );
+
+      const agent1 = await AgentConfigurationFactory.createTestAgent(auth, {
+        name: "Agent 1",
+        description: "Agent 1 Description",
+      });
+      const agent2 = await AgentConfigurationFactory.createTestAgent(auth, {
+        name: "Agent 2",
+        description: "Agent 2 Description",
+      });
+
+      const conversation = await ConversationFactory.create(auth, {
+        agentConfigurationId: agent1.sId,
+        messagesCreatedAt: [],
+      });
+
+      const conversationResource = await ConversationResource.fetchById(
+        auth,
+        conversation.sId
+      );
+      assert(conversationResource, "Conversation not found");
+
+      // Add agent messages from two different agents (including a duplicate).
+      await ConversationFactory.createAgentMessageWithRank({
+        workspace,
+        conversationId: conversationResource.id,
+        rank: 1,
+        agentConfigurationId: agent1.sId,
+      });
+      await ConversationFactory.createAgentMessageWithRank({
+        workspace,
+        conversationId: conversationResource.id,
+        rank: 3,
+        agentConfigurationId: agent2.sId,
+      });
+      // Duplicate agent1 message — should be deduplicated.
+      await ConversationFactory.createAgentMessageWithRank({
+        workspace,
+        conversationId: conversationResource.id,
+        rank: 5,
+        agentConfigurationId: agent1.sId,
+      });
+
+      const { agentConfigurationIds, contentFragmentDatasourceViewIds } =
+        await conversationResource.fetchAgentConfigurationAndContentFragmentIds(
+          auth
+        );
+
+      // Should return exactly 2 distinct agent configuration ids.
+      expect(agentConfigurationIds).toHaveLength(2);
+      expect(agentConfigurationIds).toContain(agent1.sId);
+      expect(agentConfigurationIds).toContain(agent2.sId);
+
+      // No content fragments, so should be empty.
+      expect(contentFragmentDatasourceViewIds).toHaveLength(0);
+    });
+
+    it("returns empty arrays when conversation has no agent or content fragment messages", async () => {
+      const workspace = await WorkspaceFactory.basic();
+      const user = await UserFactory.basic();
+      await MembershipFactory.associate(workspace, user, { role: "admin" });
+
+      const auth = await Authenticator.fromUserIdAndWorkspaceId(
+        user.sId,
+        workspace.sId
+      );
+
+      const agent = await AgentConfigurationFactory.createTestAgent(auth, {
+        name: "Agent",
+        description: "Agent Description",
+      });
+
+      // Create conversation with no messages (empty messagesCreatedAt).
+      const conversation = await ConversationFactory.create(auth, {
+        agentConfigurationId: agent.sId,
+        messagesCreatedAt: [],
+      });
+
+      const conversationResource = await ConversationResource.fetchById(
+        auth,
+        conversation.sId
+      );
+      assert(conversationResource, "Conversation not found");
+
+      const { agentConfigurationIds, contentFragmentDatasourceViewIds } =
+        await conversationResource.fetchAgentConfigurationAndContentFragmentIds(
+          auth
+        );
+
+      expect(agentConfigurationIds).toHaveLength(0);
+      expect(contentFragmentDatasourceViewIds).toHaveLength(0);
+    });
+  });
+
+  describe("ES indexation", () => {
+    const mockWorkflow = () => vi.mocked(launchIndexConversationEsWorkflow);
+
+    it("triggers workflow on makeNew when FF is enabled", async () => {
+      const { workspace, authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      await FeatureFlagFactory.basic(auth, "conversation_search_indexing");
+      mockWorkflow().mockClear();
+
+      const resource = await ConversationResource.makeNew(
+        auth,
+        {
+          sId: generateRandomModelSId(),
+          title: null,
+          visibility: "unlisted",
+          requestedSpaceIds: [],
+        },
+        null
+      );
+
+      expect(mockWorkflow()).toHaveBeenCalledTimes(1);
+      expect(mockWorkflow()).toHaveBeenCalledWith({
+        conversationId: resource.sId,
+        workspaceId: workspace.sId,
+      });
+    });
+
+    it("does not trigger workflow on makeNew when FF is disabled", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      mockWorkflow().mockClear();
+
+      await ConversationResource.makeNew(
+        auth,
+        {
+          sId: generateRandomModelSId(),
+          title: null,
+          visibility: "unlisted",
+          requestedSpaceIds: [],
+        },
+        null
+      );
+
+      expect(mockWorkflow()).not.toHaveBeenCalled();
+    });
+
+    it("triggers workflow on updateTitle when FF is enabled", async () => {
+      const { workspace, authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const agent = await AgentConfigurationFactory.createTestAgent(auth, {
+        name: "Agent",
+        description: "Agent",
+      });
+      const conversation = await ConversationFactory.create(auth, {
+        agentConfigurationId: agent.sId,
+        messagesCreatedAt: [],
+      });
+
+      await FeatureFlagFactory.basic(auth, "conversation_search_indexing");
+      mockWorkflow().mockClear();
+
+      await ConversationResource.updateTitle(
+        auth,
+        conversation.sId,
+        "New Title"
+      );
+
+      expect(mockWorkflow()).toHaveBeenCalledTimes(1);
+      expect(mockWorkflow()).toHaveBeenCalledWith({
+        conversationId: conversation.sId,
+        workspaceId: workspace.sId,
+      });
+    });
+
+    it("does not trigger workflow on markAsReadForAuthUser (volatile state not in ES)", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const agent = await AgentConfigurationFactory.createTestAgent(auth, {
+        name: "Agent",
+        description: "Agent",
+      });
+      const conversation = await ConversationFactory.create(auth, {
+        agentConfigurationId: agent.sId,
+        messagesCreatedAt: [],
+      });
+
+      await FeatureFlagFactory.basic(auth, "conversation_search_indexing");
+      mockWorkflow().mockClear();
+
+      await ConversationResource.markAsReadForAuthUser(auth, { conversation });
+
+      expect(mockWorkflow()).not.toHaveBeenCalled();
+    });
+
+    it("triggers workflow on updateVisibilityToDeleted when FF is enabled", async () => {
+      const { workspace, authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const agent = await AgentConfigurationFactory.createTestAgent(auth, {
+        name: "Agent",
+        description: "Agent",
+      });
+      const conversation = await ConversationFactory.create(auth, {
+        agentConfigurationId: agent.sId,
+        messagesCreatedAt: [],
+      });
+      const resource = await ConversationResource.fetchById(
+        auth,
+        conversation.sId
+      );
+      if (!resource) {
+        throw new Error("Conversation not found");
+      }
+
+      await FeatureFlagFactory.basic(auth, "conversation_search_indexing");
+      mockWorkflow().mockClear();
+
+      await resource.updateVisibilityToDeleted(auth);
+
+      expect(mockWorkflow()).toHaveBeenCalledTimes(1);
+      expect(mockWorkflow()).toHaveBeenCalledWith({
+        conversationId: conversation.sId,
+        workspaceId: workspace.sId,
+      });
+    });
+
+    it("triggers workflow on updateVisibilityToUnlisted when FF is enabled", async () => {
+      const { workspace, authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const agent = await AgentConfigurationFactory.createTestAgent(auth, {
+        name: "Agent",
+        description: "Agent",
+      });
+      const conversation = await ConversationFactory.create(auth, {
+        agentConfigurationId: agent.sId,
+        messagesCreatedAt: [],
+      });
+      const resource = await ConversationResource.fetchById(
+        auth,
+        conversation.sId
+      );
+      if (!resource) {
+        throw new Error("Conversation not found");
+      }
+
+      await FeatureFlagFactory.basic(auth, "conversation_search_indexing");
+      mockWorkflow().mockClear();
+
+      await resource.updateVisibilityToUnlisted(auth);
+
+      expect(mockWorkflow()).toHaveBeenCalledTimes(1);
+      expect(mockWorkflow()).toHaveBeenCalledWith({
+        conversationId: conversation.sId,
+        workspaceId: workspace.sId,
+      });
+    });
+
+    it("triggers workflow on delete when FF is enabled", async () => {
+      const { workspace, authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const agent = await AgentConfigurationFactory.createTestAgent(auth, {
+        name: "Agent",
+        description: "Agent",
+      });
+      const conversation = await ConversationFactory.create(auth, {
+        agentConfigurationId: agent.sId,
+        messagesCreatedAt: [],
+      });
+      const resource = await ConversationResource.fetchById(
+        auth,
+        conversation.sId
+      );
+      if (!resource) {
+        throw new Error("Conversation not found");
+      }
+
+      await FeatureFlagFactory.basic(auth, "conversation_search_indexing");
+      mockWorkflow().mockClear();
+
+      await resource.delete(auth);
+
+      expect(mockWorkflow()).toHaveBeenCalledTimes(1);
+      expect(mockWorkflow()).toHaveBeenCalledWith({
+        conversationId: conversation.sId,
+        workspaceId: workspace.sId,
+      });
+    });
+
+    it("triggers workflow on upsertParticipation when a new participant is added", async () => {
+      const { workspace, authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const agent = await AgentConfigurationFactory.createTestAgent(auth, {
+        name: "Agent",
+        description: "Agent",
+      });
+      const conversation = await ConversationFactory.create(auth, {
+        agentConfigurationId: agent.sId,
+        messagesCreatedAt: [],
+      });
+
+      const otherUser = await UserFactory.basic();
+      await MembershipFactory.associate(workspace, otherUser, { role: "user" });
+      const otherAuth = await Authenticator.fromUserIdAndWorkspaceId(
+        otherUser.sId,
+        workspace.sId
+      );
+
+      await FeatureFlagFactory.basic(auth, "conversation_search_indexing");
+      mockWorkflow().mockClear();
+
+      await ConversationResource.upsertParticipation(otherAuth, {
+        conversation,
+        action: "posted",
+        user: otherAuth.getNonNullableUser().toJSON(),
+      });
+
+      expect(mockWorkflow()).toHaveBeenCalledTimes(1);
+      expect(mockWorkflow()).toHaveBeenCalledWith({
+        conversationId: conversation.sId,
+        workspaceId: workspace.sId,
+      });
+    });
+
+    it("does not trigger workflow on upsertParticipation with subscribed action on existing participant", async () => {
+      const { authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const agent = await AgentConfigurationFactory.createTestAgent(auth, {
+        name: "Agent",
+        description: "Agent",
+      });
+      const conversation = await ConversationFactory.create(auth, {
+        agentConfigurationId: agent.sId,
+        messagesCreatedAt: [],
+      });
+
+      // Add auth user as a participant (FF is still disabled so no workflow call).
+      await ConversationResource.upsertParticipation(auth, {
+        conversation,
+        action: "posted",
+        user: auth.getNonNullableUser().toJSON(),
+      });
+
+      await FeatureFlagFactory.basic(auth, "conversation_search_indexing");
+      mockWorkflow().mockClear();
+
+      // "subscribed" on an existing participant → status "none" → no workflow trigger.
+      await ConversationResource.upsertParticipation(auth, {
+        conversation,
+        action: "subscribed",
+        user: auth.getNonNullableUser().toJSON(),
+      });
+
+      expect(mockWorkflow()).not.toHaveBeenCalled();
+    });
+
+    it("triggers workflow on markAsActionRequired when FF is enabled", async () => {
+      const { workspace, authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const agent = await AgentConfigurationFactory.createTestAgent(auth, {
+        name: "Agent",
+        description: "Agent",
+      });
+      const conversation = await ConversationFactory.create(auth, {
+        agentConfigurationId: agent.sId,
+        messagesCreatedAt: [],
+      });
+
+      // Add auth user as participant first (FF disabled → no workflow call).
+      await ConversationResource.upsertParticipation(auth, {
+        conversation,
+        action: "posted",
+        user: auth.getNonNullableUser().toJSON(),
+      });
+
+      await FeatureFlagFactory.basic(auth, "conversation_search_indexing");
+      mockWorkflow().mockClear();
+
+      await ConversationResource.markAsActionRequired(auth, { conversation });
+
+      expect(mockWorkflow()).toHaveBeenCalledTimes(1);
+      expect(mockWorkflow()).toHaveBeenCalledWith({
+        conversationId: conversation.sId,
+        workspaceId: workspace.sId,
+      });
+    });
+
+    it("triggers workflow on clearActionRequired when FF is enabled", async () => {
+      const { workspace, authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const agent = await AgentConfigurationFactory.createTestAgent(auth, {
+        name: "Agent",
+        description: "Agent",
+      });
+      const conversation = await ConversationFactory.create(auth, {
+        agentConfigurationId: agent.sId,
+        messagesCreatedAt: [],
+      });
+
+      await FeatureFlagFactory.basic(auth, "conversation_search_indexing");
+      mockWorkflow().mockClear();
+
+      await ConversationResource.clearActionRequired(auth, conversation.sId);
+
+      expect(mockWorkflow()).toHaveBeenCalledTimes(1);
+      expect(mockWorkflow()).toHaveBeenCalledWith({
+        conversationId: conversation.sId,
+        workspaceId: workspace.sId,
+      });
+    });
+
+    it("triggers workflow for each conversation on batchMarkAsReadAndClearActionRequired when FF is enabled", async () => {
+      const { workspace, authenticator: auth } = await createResourceTest({
+        role: "admin",
+      });
+
+      const agent = await AgentConfigurationFactory.createTestAgent(auth, {
+        name: "Agent",
+        description: "Agent",
+      });
+      const [conv1, conv2] = await Promise.all([
+        ConversationFactory.create(auth, {
+          agentConfigurationId: agent.sId,
+          messagesCreatedAt: [],
+        }),
+        ConversationFactory.create(auth, {
+          agentConfigurationId: agent.sId,
+          messagesCreatedAt: [],
+        }),
+      ]);
+
+      await FeatureFlagFactory.basic(auth, "conversation_search_indexing");
+      mockWorkflow().mockClear();
+
+      await ConversationResource.batchMarkAsReadAndClearActionRequired(auth, [
+        conv1.sId,
+        conv2.sId,
+      ]);
+
+      expect(mockWorkflow()).toHaveBeenCalledTimes(2);
+      expect(mockWorkflow()).toHaveBeenCalledWith({
+        conversationId: conv1.sId,
+        workspaceId: workspace.sId,
+      });
+      expect(mockWorkflow()).toHaveBeenCalledWith({
+        conversationId: conv2.sId,
+        workspaceId: workspace.sId,
+      });
+    });
+  });
+});
+
+describe("filterVisibleConversations", () => {
+  let adminAuth: Authenticator;
+  let userAuth: Authenticator;
+  let workspace: LightWorkspaceType;
+  let globalSpace: SpaceResource;
+  let agents: LightAgentConfigurationType[];
+
+  beforeEach(async () => {
+    const {
+      authenticator,
+      globalSpace: gs,
+      user: adminUser,
+      workspace: w,
+    } = await createResourceTest({ role: "admin" });
+
+    workspace = w;
+    globalSpace = gs;
+    adminAuth = authenticator;
+
+    const regularUser = await UserFactory.basic();
+    await MembershipFactory.associate(workspace, regularUser, { role: "user" });
+    userAuth = await Authenticator.fromUserIdAndWorkspaceId(
+      regularUser.sId,
+      workspace.sId
+    );
+
+    agents = await setupTestAgents(workspace, adminUser);
+  });
+
+  it("returns the user's own conversation as visible", async () => {
+    const conversation = await ConversationFactory.create(userAuth, {
+      agentConfigurationId: agents[0].sId,
+      messagesCreatedAt: [dateFromDaysAgo(1)],
+    });
+
+    // The creator must be a participant for the conversation to be visible.
+    await ConversationResource.upsertParticipation(userAuth, {
+      conversation,
+      action: "posted",
+      user: userAuth.getNonNullableUser().toJSON(),
+    });
+
+    const resource = await ConversationResource.fetchById(
+      userAuth,
+      conversation.sId
+    );
+    assert(resource);
+
+    const visible = await ConversationResource.filterVisibleConversations(
+      userAuth,
+      [resource]
+    );
+
+    expect(visible).toHaveLength(1);
+    expect(visible[0].sId).toBe(conversation.sId);
+  });
+
+  it("does not return another user's private conversation even if canAccess is true", async () => {
+    // Admin creates a private conversation referencing the global space.
+    const conversation = await ConversationFactory.create(adminAuth, {
+      agentConfigurationId: agents[0].sId,
+      requestedSpaceIds: [globalSpace.id],
+      messagesCreatedAt: [dateFromDaysAgo(1)],
+    });
+
+    // Verify the regular user can access it (via global space permissions).
+    const accessResult = await ConversationResource.canAccess(
+      userAuth,
+      conversation.sId
+    );
+    expect(accessResult).toBe("allowed");
+
+    // But filterVisibleConversations should NOT include it.
+    const resource = await ConversationResource.fetchById(
+      adminAuth,
+      conversation.sId
+    );
+    assert(resource);
+
+    const visible = await ConversationResource.filterVisibleConversations(
+      userAuth,
+      [resource]
+    );
+
+    expect(visible).toHaveLength(0);
+  });
+
+  it("returns another user's conversation when added as participant", async () => {
+    const conversation = await ConversationFactory.create(adminAuth, {
+      agentConfigurationId: agents[0].sId,
+      messagesCreatedAt: [dateFromDaysAgo(1)],
+    });
+
+    // Add regular user as participant.
+    await ConversationResource.upsertParticipation(userAuth, {
+      conversation,
+      action: "posted",
+      user: userAuth.getNonNullableUser().toJSON(),
+    });
+
+    const resource = await ConversationResource.fetchById(
+      adminAuth,
+      conversation.sId
+    );
+    assert(resource);
+
+    const visible = await ConversationResource.filterVisibleConversations(
+      userAuth,
+      [resource]
+    );
+
+    expect(visible).toHaveLength(1);
+    expect(visible[0].sId).toBe(conversation.sId);
+  });
+
+  it("does not return a conversation in a space the user cannot access", async () => {
+    // Create a restricted space only the admin belongs to.
+    const restrictedSpace = await SpaceFactory.regular(workspace);
+    const res = await restrictedSpace.addMembers(adminAuth, {
+      userIds: [adminAuth.getNonNullableUser().sId],
+    });
+    assert(res.isOk());
+
+    // Refresh admin auth after space membership change.
+    adminAuth = await Authenticator.fromUserIdAndWorkspaceId(
+      adminAuth.getNonNullableUser().sId,
+      workspace.sId
+    );
+
+    const conversation = await ConversationFactory.create(adminAuth, {
+      agentConfigurationId: agents[0].sId,
+      requestedSpaceIds: [restrictedSpace.id],
+      messagesCreatedAt: [dateFromDaysAgo(1)],
+    });
+
+    const resource = await ConversationResource.fetchById(
+      adminAuth,
+      conversation.sId
+    );
+    assert(resource);
+
+    const visible = await ConversationResource.filterVisibleConversations(
+      userAuth,
+      [resource]
+    );
+
+    expect(visible).toHaveLength(0);
+  });
+
+  it("returns another user's conversation in a project where user is member", async () => {
+    const projectSpace = await SpaceFactory.project(workspace);
+    // Add both users to the project space.
+    const addAdmin = await projectSpace.addMembers(adminAuth, {
+      userIds: [adminAuth.getNonNullableUser().sId],
+    });
+    assert(addAdmin.isOk());
+
+    const addUser = await projectSpace.addMembers(adminAuth, {
+      userIds: [userAuth.getNonNullableUser().sId],
+    });
+    assert(addUser.isOk());
+
+    // Refresh user auth after space membership change.
+    userAuth = await Authenticator.fromUserIdAndWorkspaceId(
+      userAuth.getNonNullableUser().sId,
+      workspace.sId
+    );
+
+    // Admin creates a conversation in the project space.
+    adminAuth = await Authenticator.fromUserIdAndWorkspaceId(
+      adminAuth.getNonNullableUser().sId,
+      workspace.sId
+    );
+    const conversation = await ConversationFactory.create(adminAuth, {
+      agentConfigurationId: agents[0].sId,
+      spaceId: projectSpace.id,
+      requestedSpaceIds: [projectSpace.id],
+      messagesCreatedAt: [dateFromDaysAgo(1)],
+    });
+
+    const resource = await ConversationResource.fetchById(
+      adminAuth,
+      conversation.sId
+    );
+    assert(resource);
+
+    const visible = await ConversationResource.filterVisibleConversations(
+      userAuth,
+      [resource]
+    );
+
+    expect(visible).toHaveLength(1);
+    expect(visible[0].sId).toBe(conversation.sId);
+  });
+
+  it("does not return another user's conversation in a project where user is not a member", async () => {
+    const projectSpace = await SpaceFactory.project(workspace);
+    // Only add admin to the project space, not the regular user.
+    const addAdmin = await projectSpace.addMembers(adminAuth, {
+      userIds: [adminAuth.getNonNullableUser().sId],
+    });
+    assert(addAdmin.isOk());
+
+    adminAuth = await Authenticator.fromUserIdAndWorkspaceId(
+      adminAuth.getNonNullableUser().sId,
+      workspace.sId
+    );
+
+    const conversation = await ConversationFactory.create(adminAuth, {
+      agentConfigurationId: agents[0].sId,
+      spaceId: projectSpace.id,
+      requestedSpaceIds: [projectSpace.id],
+      messagesCreatedAt: [dateFromDaysAgo(1)],
+    });
+
+    const resource = await ConversationResource.fetchById(
+      adminAuth,
+      conversation.sId
+    );
+    assert(resource);
+
+    const visible = await ConversationResource.filterVisibleConversations(
+      userAuth,
+      [resource]
+    );
+
+    expect(visible).toHaveLength(0);
   });
 });

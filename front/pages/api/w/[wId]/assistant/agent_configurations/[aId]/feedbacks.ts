@@ -1,4 +1,5 @@
 /** @ignoreswagger */
+// @migration-status: MIGRATED_TO_HONO
 import { getAgentConfiguration } from "@app/lib/api/assistant/configuration/agent";
 import { apiErrorForConversation } from "@app/lib/api/assistant/conversation/helper";
 import {
@@ -56,7 +57,7 @@ async function handler(
   switch (req.method) {
     case "GET":
       // asc id is equivalent to desc createdAt
-      const paginationRes = getPaginationParams(req, {
+      const paginationRes = getPaginationParams(req.query, {
         defaultLimit: 50,
         defaultOrderColumn: "id",
         defaultOrderDirection: "asc",

@@ -87,7 +87,7 @@
  */
 import {
   softDeleteAgentMessage,
-  softDeleteUserMessage,
+  softDeleteUserMessageAndReplies,
 } from "@app/lib/api/assistant/conversation";
 import { getConversation } from "@app/lib/api/assistant/conversation/fetch";
 import { batchRenderMessages } from "@app/lib/api/assistant/messages";
@@ -162,7 +162,6 @@ async function handler(
   }
 
   const messageRes = await conversation.getMessageById(auth, mId);
-
   if (messageRes.isErr()) {
     return apiError(req, res, {
       status_code: 404,
@@ -267,7 +266,7 @@ async function handler(
       const renderedMessage = renderRes.value[0];
 
       if (isUserMessageType(renderedMessage)) {
-        const deleteResult = await softDeleteUserMessage(auth, {
+        const deleteResult = await softDeleteUserMessageAndReplies(auth, {
           message: renderedMessage,
           conversation: fullConversation,
         });

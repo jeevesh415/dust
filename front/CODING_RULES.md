@@ -266,6 +266,165 @@ endpoint handlers.
 
 The Type interface is not to be used in the backend.
 
+### [BACK16] Keep API handlers thin — business logic belongs in `lib/api/*`
+
+API handlers (under `pages/api/`) should be limited to:
+
+- Authentication and authorization checks
+- HTTP method dispatch
+- Request payload and query parameter validation (use `zod` per [GEN13])
+- A single call into the business layer (typically `lib/api/*`) to perform the work
+- Mapping the business layer result to an HTTP response
+
+Non-trivial business logic must live in `lib/api/*` (or the appropriate Resource), not in the
+handler. This keeps handlers consistent and short, and lets the underlying logic be reused
+from other contexts (other handlers, Temporal activities, scripts, tests).
+
+Signs that logic belongs in the business layer rather than the handler:
+
+- Multiple sequential database reads/writes that form a coherent operation
+- Conditional branching based on resource state
+- Fan-out/fan-in over collections
+- Coordination across multiple Resources or external services
+- Anything you would want to test independently of the HTTP layer
+
+Trivial transformations directly tied to the HTTP shape (assembling a response body from a
+single resource fetch, flattening a serialized result) may stay in the handler.
+
+**Extraction must not drag HTTP concerns into `lib/api/*`.** Per [BACK18], the business layer
+returns domain results — `Result<T, DomainError>`, plain values, or thrown domain errors. It
+must not return `APIErrorWithStatusCode`, hard-code HTTP status numbers, call `apiError(...)`,
+throw HTTP-shaped errors, or otherwise encode response semantics. The handler is the only
+place that maps domain outcomes to status codes and error envelopes.
+
+If a handler is long but the length comes from HTTP error mapping interleaved with the work
+(many `if (...) return apiError(req, res, { status_code: 4xx, ... })` branches whose conditions
+are inseparable from each step), **leave it in the handler**. Extracting it would either leak
+HTTP into the business layer or invent a synthetic domain enum just to deduplicate — both
+worse than a long-but-honest handler. A 100-line handler that reads top-to-bottom is fine. A
+50-line `lib/api/*` function that returns `Result<T, { status_code: number; ... }>` is not.
+
+The right extractions are ones where the domain operation has a meaningful identity on its
+own (would be called from a Temporal activity, a script, or a second handler). The wrong ones
+are "reduce handler line count" extractions that end up modeling HTTP shapes in the lib.
+
+Reviewer: If you detect a handler with non-trivial business logic, request the author to extract
+it into a `lib/api/*` function (creating one if needed). The handler should ideally read as:
+authorize → validate → call business function → respond. But if the extraction would force
+HTTP status codes or `APIErrorWithStatusCode` into the lib, push back and keep the logic in
+the handler instead.
+
+### [BACK17] Keep migrated Next and Hono handlers in sync during migration
+
+Hono routes mirror the Next path 1:1: `front/pages/api/<path>.ts` corresponds
+to `front-api/routes/<path>.ts`. Any Next handler that has been migrated to
+Hono must carry a migration marker at the top of the file:
+
+```
+// @migration-status: MIGRATED_TO_HONO
+```
+
+The Hono counterpart is inferred from the file path — no marker is needed on
+the Hono side.
+
+If you modify either side of a migrated pair, you must update the other side
+as well. DangerJS enforces this: if a PR modifies one side without the other,
+the check fails.
+
+If a change is intentionally one-sided (e.g. deleting the Next handler, or
+cleanup that only applies to one framework), add the `skip-migration-check`
+label to the PR.
+
+When migrating a new handler, add the marker to the Next file immediately,
+and place the Hono file at the mirrored path under `front-api/routes/`.
+
+A Next handler typically dispatches by method inside a single `switch
+(req.method)` block, with shared work above the switch running once per
+request. The Hono mirror registers one `app.<verb>(...)` per method, so
+naively translating would duplicate the pre-switch work across each method.
+When the shared work is more than a few lines, factor it out in the Hono
+file.
+
+Reviewer: If a PR touches a file that is part of a migrated pair (a Next file
+carrying `@migration-status: MIGRATED_TO_HONO` paired with a Hono file at the
+same path under `front-api/routes/`), verify the counterpart is also updated
+in the same PR.
+
+### [BACK18] Business-layer code must not return HTTP error envelopes
+
+Functions in `lib/api/*` (and other shared business-logic modules) must
+not return `APIErrorWithStatusCode` or anything else that bakes in an HTTP
+status code. HTTP is a transport concern of the handler layer.
+
+The reason: a `lib/api/*` function may be called from many places — Next
+handlers, Hono handlers, Temporal activities, scripts, tests. The status
+code only makes sense at the transport boundary. Putting it in the
+business layer either forces non-HTTP callers to invent fake status codes,
+or (more commonly) leaks one transport's response shape into code that
+should be transport-agnostic.
+
+When a business function needs to signal failure, return a domain error —
+typically `Result<T, SomeDomainError>` where `SomeDomainError` is a class
+or discriminated union of the actual failure conditions. Handlers map the
+domain error to whatever HTTP shape they need.
+
+Example:
+
+```ts
+// BAD — business layer encoding HTTP status codes
+export async function getThing(
+  auth: Authenticator,
+  id: string
+): Promise<Result<Thing, APIErrorWithStatusCode>> {
+  if (!found) {
+    return new Err({
+      status_code: 404,
+      api_error: { type: "thing_not_found", message: "Not found." },
+    });
+  }
+  // ...
+}
+
+// GOOD — domain error, handler maps to HTTP
+export class ThingError extends Error {
+  constructor(readonly type: "not_found" | "unauthorized") {
+    super(type);
+  }
+}
+
+export async function getThing(
+  auth: Authenticator,
+  id: string
+): Promise<Result<Thing, ThingError>> {
+  if (!found) {
+    return new Err(new ThingError("not_found"));
+  }
+  // ...
+}
+
+// Handler does the mapping:
+const result = await getThing(auth, id);
+if (result.isErr()) {
+  switch (result.error.type) {
+    case "not_found": return apiError(req, res, { status_code: 404, ... });
+    case "unauthorized": return apiError(req, res, { status_code: 403, ... });
+  }
+}
+```
+
+**Pragmatic exception:** if the error model is genuinely HTTP-flavored
+(status + error type are tied to HTTP semantics with no underlying domain
+distinction worth modeling), it's better to keep the logic in the handler
+than to invent a synthetic domain enum. A 50-line handler with HTTP
+responses inline is fine; duplicating it across Next and Hono is the
+expected cost of the migration. The wrong move is to extract a lib helper
+that returns `Result<T, APIErrorWithStatusCode>` just to deduplicate —
+that hides the HTTP coupling instead of removing it.
+
+Reviewer: If you see a `lib/api/*` function returning `APIErrorWithStatusCode`,
+require the author to either (a) introduce a domain error type, or (b) move
+the logic back into the handlers and accept the duplication.
+
 ## AUDIT LOGGING
 
 ### [AUDIT1] Every state-changing operation on a security-sensitive resource MUST emit an audit log event
@@ -285,7 +444,7 @@ The Type interface is not to be used in the backend.
 - A JSON schema file at `front/admin/audit_log_schemas/<action>.json`
 - The action string added to the `AuditAction` union type in `front/lib/api/audit/workos_audit.ts`
 - A `void emitAuditLogEvent(...)` or `void emitAuditLogEventDirect(...)` call at the mutation site
-- See `runbooks/NEW_AUDIT_EVENT.md` for the step-by-step checklist
+- See the `dust-audit-log-event` skill for the step-by-step checklist
 
 ### [AUDIT4] Place the emit call AFTER the mutation succeeds, not before
 
@@ -312,6 +471,15 @@ The Type interface is not to be used in the backend.
 - Resource is singular, lowercase: `user`, `api_key`, `membership`, `scim`
 - Verb is past tense or descriptive: `created`, `revoked`, `role_updated`, `login_failed`
 - Consistency matters: check existing `AuditAction` values before inventing new names
+
+### [AUDIT9] Audit log schema metadata keys must be snake_case
+
+- Keys in the `metadata` object of `front/admin/audit_log_schemas/<action>.json` must be
+  snake_case (e.g. `agent_name`, not `agentName`)
+- The same applies to keys passed to the `metadata` field of `emitAuditLogEvent` /
+  `emitAuditLogEventDirect` call sites — they must match the schema declaration
+- Enforced by `npm -w front run lint:audit-log-schemas` (runs in CI and as a lefthook
+  pre-commit hook scoped to `front/admin/audit_log_schemas/**/*.json`)
 
 ## MCP
 

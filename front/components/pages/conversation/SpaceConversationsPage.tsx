@@ -1,24 +1,30 @@
 import { SpaceAboutTab } from "@app/components/assistant/conversation/space/about/SpaceAboutTab";
+import type { TaskOwnerFilter } from "@app/components/assistant/conversation/space/conversations/project_tasks/projectTasksListScope";
 import { SpaceConversationsTab } from "@app/components/assistant/conversation/space/conversations/SpaceConversationsTab";
 import { ManageUsersPanel } from "@app/components/assistant/conversation/space/ManageUsersPanel";
 import { ProjectHeaderActions } from "@app/components/assistant/conversation/space/ProjectHeaderActions";
 import { SpaceAlphaTab } from "@app/components/assistant/conversation/space/SpaceAlphaTab";
 import { SpaceKnowledgeTab } from "@app/components/assistant/conversation/space/SpaceKnowledgeTab";
-import { SpaceTodoTab } from "@app/components/assistant/conversation/space/SpaceTodoTab";
+import { SpaceTasksTab } from "@app/components/assistant/conversation/space/SpaceTasksTab";
+
 import { useSpaceConversations } from "@app/hooks/conversations";
+import type { SpaceConversationListFilter } from "@app/hooks/conversations/useSpaceConversations";
 import { useActiveSpaceId } from "@app/hooks/useActiveSpaceId";
 import { useCreateConversationWithMessage } from "@app/hooks/useCreateConversationWithMessage";
 import { useSendNotification } from "@app/hooks/useNotification";
-import { getLightAgentMessageFromAgentMessage } from "@app/lib/api/assistant/citations";
+import { useScopedUIPreferences } from "@app/hooks/useScopedUIPreferences";
 import {
-  useAuth,
-  useFeatureFlags,
-  useWorkspace,
-} from "@app/lib/auth/AuthContext";
+  DEFAULT_SPACE_PROJECT_UI_PREFERENCES,
+  type SpaceProjectTab,
+  useSpaceProjectTabs,
+} from "@app/hooks/useSpaceProjectTabs";
+import { getLightAgentMessageFromAgentMessage } from "@app/lib/api/assistant/citations";
+import { useAuth, useWorkspace } from "@app/lib/auth/AuthContext";
 import { useClientType } from "@app/lib/context/clientType";
 import type { DustError } from "@app/lib/error";
 import { useAppRouter } from "@app/lib/platform";
 import { useSpaceInfo, useSystemSpace } from "@app/lib/swr/spaces";
+import { useIsMobile } from "@app/lib/swr/useIsMobile";
 import { getConversationRoute } from "@app/lib/utils/router";
 import type { LightConversationType } from "@app/types/assistant/conversation";
 import {
@@ -32,10 +38,10 @@ import type { Result } from "@app/types/shared/result";
 import { Err, Ok } from "@app/types/shared/result";
 import { removeNulls } from "@app/types/shared/utils/general";
 import {
-  BookOpenIcon,
   ChatBubbleLeftRightIcon,
+  CheckIcon,
   Cog6ToothIcon,
-  ListCheckIcon,
+  FolderIcon,
   Spinner,
   Tabs,
   TabsContent,
@@ -43,14 +49,11 @@ import {
   TabsTrigger,
   TestTubeIcon,
 } from "@dust-tt/sparkle";
-import React, { useCallback, useRef, useState } from "react";
-
-type SpaceTab = "conversations" | "knowledge" | "settings" | "todo";
+import { useCallback, useState } from "react";
 
 export function SpaceConversationsPage() {
   const owner = useWorkspace();
   const { user } = useAuth();
-  const { hasFeature } = useFeatureFlags();
   const clientType = useClientType();
   const router = useAppRouter();
   const spaceId = useActiveSpaceId();
@@ -72,94 +75,61 @@ export function SpaceConversationsPage() {
     user,
   });
 
+  const { value: projectUIPreferences, setValue: setProjectUIPreferences } =
+    useScopedUIPreferences({
+      scope: "projectUI",
+      resourceId: spaceId,
+      defaultValue: DEFAULT_SPACE_PROJECT_UI_PREFERENCES,
+    });
+  const isSingleMemberProject = !!spaceInfo && spaceInfo.members.length === 1;
+  const conversationFilter: SpaceConversationListFilter = isSingleMemberProject
+    ? "all"
+    : projectUIPreferences.conversationsFilter;
+
   const {
     conversations,
     isConversationsLoading,
     mutateConversations,
     hasMore,
+    isEmpty: isSpaceEmpty,
     loadMore,
     isLoadingMore,
   } = useSpaceConversations({
     workspaceId: owner.sId,
     spaceId: spaceId,
+    filter: conversationFilter,
   });
 
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [_planLimitReached, setPlanLimitReached] = useState(false);
   const [isInvitePanelOpen, setIsInvitePanelOpen] = useState(false);
+  const compactProjectTabs = useIsMobile();
 
-  // Parse and validate the current tab from URL hash
-  const getCurrentTabFromHash = useCallback((): SpaceTab => {
-    if (typeof window === "undefined") {
-      return "conversations";
-    }
-    const hash = window.location.hash.slice(1); // Remove the # prefix
-    // Backward compatibility: treat "context" as "knowledge"
-    if (hash === "context") {
-      return "knowledge";
-    }
-    if (
-      hash === "knowledge" ||
-      hash === "settings" ||
-      hash === "conversations" ||
-      hash === "todo"
-    ) {
-      return hash;
-    }
-    return "conversations";
-  }, []);
+  const { currentTab, handleTabChange } = useSpaceProjectTabs({
+    spaceId,
+    projectUIPreferences,
+    setProjectUIPreferences,
+  });
 
-  const [currentTab, setCurrentTab] = useState<SpaceTab>(getCurrentTabFromHash);
+  const handleConversationFilterChange = useCallback(
+    (filter: SpaceConversationListFilter) => {
+      setProjectUIPreferences({
+        ...projectUIPreferences,
+        conversationsFilter: filter,
+      });
+    },
+    [projectUIPreferences, setProjectUIPreferences]
+  );
 
-  // Sync current tab with URL hash
-  // biome-ignore lint/correctness/useExhaustiveDependencies: ignored using `--suppress`
-  React.useEffect(() => {
-    const updateTabFromHash = () => {
-      const newTab = getCurrentTabFromHash();
-      setCurrentTab(newTab);
-
-      // Ensure URL has a hash
-      if (!window.location.hash) {
-        window.history.replaceState(
-          null,
-          "",
-          `${window.location.pathname}${window.location.search}#${newTab}`
-        );
-      }
-    };
-
-    // Update on mount
-    updateTabFromHash();
-
-    // Listen for hash changes
-    window.addEventListener("hashchange", updateTabFromHash);
-    return () => window.removeEventListener("hashchange", updateTabFromHash);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // Only run on mount and cleanup on unmount
-
-  // Reset tab to conversations when navigating to a different project.
-  const prevSpaceIdRef = useRef(spaceId);
-  React.useEffect(() => {
-    if (prevSpaceIdRef.current !== spaceId) {
-      prevSpaceIdRef.current = spaceId;
-      setCurrentTab("conversations");
-      window.history.replaceState(
-        null,
-        "",
-        `${window.location.pathname}${window.location.search}#conversations`
-      );
-    }
-  }, [spaceId]);
-
-  const handleTabChange = useCallback((tab: SpaceTab) => {
-    // Use replaceState to avoid adding to browser history for each tab switch
-    window.history.replaceState(
-      null,
-      "",
-      `${window.location.pathname}${window.location.search}#${tab}`
-    );
-    setCurrentTab(tab);
-  }, []);
+  const handleTaskOwnerFilterChange = useCallback(
+    (tasksOwnerFilter: TaskOwnerFilter) => {
+      setProjectUIPreferences({
+        ...projectUIPreferences,
+        tasksOwnerFilter,
+      });
+    },
+    [projectUIPreferences, setProjectUIPreferences]
+  );
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: ignored using `--suppress`
   const handleConversationCreation = useCallback(
@@ -245,6 +215,7 @@ export function SpaceConversationsPage() {
                   conversations: [lightConversation],
                   hasMore: false,
                   lastValue: null,
+                  isEmpty: false,
                 },
               ];
             }
@@ -311,6 +282,9 @@ export function SpaceConversationsPage() {
           loadMore={loadMore}
           isLoadingMore={isLoadingMore}
           spaceInfo={spaceInfo}
+          isSpaceEmpty={isSpaceEmpty}
+          conversationFilter={conversationFilter}
+          onConversationFilterChange={handleConversationFilterChange}
           onSubmit={handleConversationCreation}
           onOpenMembersPanel={() => setIsInvitePanelOpen(true)}
         />
@@ -319,27 +293,32 @@ export function SpaceConversationsPage() {
   }
 
   return (
-    <div className="flex h-full w-full flex-col">
+    <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden">
       <Tabs
         value={currentTab}
-        onValueChange={(value) => handleTabChange(value as SpaceTab)}
-        className="flex min-h-0 flex-1 flex-col pt-3"
+        onValueChange={(value) => handleTabChange(value as SpaceProjectTab)}
+        className="flex min-h-0 flex-1 flex-col overflow-hidden pt-3"
       >
-        <div className="flex items-start justify-between border-b border-separator pl-14 pr-6 lg:px-6 dark:border-separator-night">
+        <div className="flex shrink-0 items-start justify-between border-b border-separator pl-14 pr-6 lg:px-6 dark:border-separator-night">
           <TabsList border={false}>
             <TabsTrigger
               value="conversations"
-              label="Conversations"
+              label={compactProjectTabs ? undefined : "Conversations"}
+              tooltip={compactProjectTabs ? "Conversations" : undefined}
               icon={ChatBubbleLeftRightIcon}
             />
             <TabsTrigger
-              value="knowledge"
-              label="Knowledge"
-              icon={BookOpenIcon}
+              value="tasks"
+              label={compactProjectTabs ? undefined : "Tasks"}
+              tooltip={compactProjectTabs ? "Tasks" : undefined}
+              icon={CheckIcon}
             />
-            {hasFeature("project_todo") && (
-              <TabsTrigger value="todo" label="Todo" icon={ListCheckIcon} />
-            )}
+            <TabsTrigger
+              value="files"
+              label={compactProjectTabs ? undefined : "Files"}
+              tooltip={compactProjectTabs ? "Files" : undefined}
+              icon={FolderIcon}
+            />
             <TabsTrigger
               value="settings"
               icon={Cog6ToothIcon}
@@ -347,7 +326,8 @@ export function SpaceConversationsPage() {
             />
             <TabsTrigger
               value="alpha"
-              label="Alpha"
+              label={compactProjectTabs ? undefined : "Alpha"}
+              tooltip={compactProjectTabs ? "Alpha" : undefined}
               icon={TestTubeIcon}
               variant="warning-secondary"
             />
@@ -377,13 +357,25 @@ export function SpaceConversationsPage() {
             loadMore={loadMore}
             isLoadingMore={isLoadingMore}
             spaceInfo={spaceInfo}
+            isSpaceEmpty={isSpaceEmpty}
+            conversationFilter={conversationFilter}
+            onConversationFilterChange={handleConversationFilterChange}
             onSubmit={handleConversationCreation}
             onOpenMembersPanel={() => setIsInvitePanelOpen(true)}
           />
         </TabsContent>
 
-        <TabsContent value="knowledge">
+        <TabsContent value="files">
           <SpaceKnowledgeTab owner={owner} space={spaceInfo} />
+        </TabsContent>
+
+        <TabsContent value="tasks">
+          <SpaceTasksTab
+            owner={owner}
+            spaceInfo={spaceInfo}
+            taskOwnerFilter={projectUIPreferences.tasksOwnerFilter}
+            onTaskOwnerFilterChange={handleTaskOwnerFilterChange}
+          />
         </TabsContent>
 
         <TabsContent value="settings">
@@ -394,17 +386,6 @@ export function SpaceConversationsPage() {
             onOpenMembersPanel={() => setIsInvitePanelOpen(true)}
           />
         </TabsContent>
-
-        {hasFeature("project_todo") && (
-          <TabsContent value="todo">
-            <SpaceTodoTab
-              key={spaceId}
-              owner={owner}
-              spaceInfo={spaceInfo}
-              hasConversations={conversations.length > 0}
-            />
-          </TabsContent>
-        )}
 
         <TabsContent value="alpha">
           <SpaceAlphaTab key={spaceId} />

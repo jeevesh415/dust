@@ -1,6 +1,9 @@
+import type { AwuPoolSummaryResponseBody } from "@app/lib/api/credits/awu_pool_summary";
+import type { SeatPlanResponseBody } from "@app/lib/api/credits/seat_plan";
 import { clientFetch } from "@app/lib/egress/client";
 import { emptyArray, useFetcher, useSWRWithDefaults } from "@app/lib/swr/swr";
 import type { GetCreditPurchaseInfoResponseBody } from "@app/pages/api/w/[wId]/credits/purchase";
+import type { GetAwuPurchaseInfoResponseBody } from "@app/pages/api/w/[wId]/subscriptions/awu-purchase";
 import type {
   GetCreditsResponseBody,
   PendingCreditData,
@@ -198,5 +201,113 @@ export function useCreditPurchaseInfo({
     isCreditPurchaseInfoLoading: !error && !data && !disabled,
     isCreditPurchaseInfoValidating: isValidating,
     isCreditPurchaseInfoError: error,
+  };
+}
+
+const awuPostPurchaseRefreshState = new Map<string, number>();
+const awuPostPurchaseRefreshListeners = new Set<() => void>();
+
+function getAwuPostPurchaseRefreshCount(workspaceId: string): number {
+  return awuPostPurchaseRefreshState.get(workspaceId) ?? Infinity;
+}
+
+function incrementAwuPostPurchaseRefreshCount(workspaceId: string): void {
+  const current = awuPostPurchaseRefreshState.get(workspaceId) ?? Infinity;
+  if (current < 5) {
+    awuPostPurchaseRefreshState.set(workspaceId, current + 1);
+    awuPostPurchaseRefreshListeners.forEach((listener) => listener());
+  }
+}
+
+export function resetAwuPostPurchaseRefreshCount(workspaceId: string): void {
+  awuPostPurchaseRefreshState.set(workspaceId, 0);
+  awuPostPurchaseRefreshListeners.forEach((listener) => listener());
+}
+
+export function useAwuPoolSummary({
+  workspaceId,
+  disabled,
+}: {
+  workspaceId: string;
+  disabled?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const awuFetcher: Fetcher<AwuPoolSummaryResponseBody> = fetcher;
+
+  const { data, error, isValidating, mutate } = useSWRWithDefaults(
+    `/api/w/${workspaceId}/credits/awu-pool-summary`,
+    awuFetcher,
+    {
+      disabled,
+      refreshInterval: () => {
+        const count = getAwuPostPurchaseRefreshCount(workspaceId);
+        if (count < 5) {
+          incrementAwuPostPurchaseRefreshCount(workspaceId);
+          return 5000;
+        }
+        return 0;
+      },
+    }
+  );
+
+  return {
+    totalCredits: data?.totalCredits ?? 0,
+    consumedByUsersCredits: data?.consumedByUsersCredits ?? 0,
+    consumedByProgrammaticCredits: data?.consumedByProgrammaticCredits ?? 0,
+    resetDate: data?.resetDate ?? "",
+    isAwuPoolSummaryLoading: !error && !data && !disabled,
+    isAwuPoolSummaryError: error,
+    isAwuPoolSummaryValidating: isValidating,
+    mutateAwuPoolSummary: mutate,
+  };
+}
+
+export function useAwuPurchaseInfo({
+  workspaceId,
+  disabled,
+}: {
+  workspaceId: string;
+  disabled?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const awuPurchaseInfoFetcher: Fetcher<GetAwuPurchaseInfoResponseBody> =
+    fetcher;
+
+  const { data, error, isValidating, mutate } = useSWRWithDefaults(
+    `/api/w/${workspaceId}/subscriptions/awu-purchase`,
+    awuPurchaseInfoFetcher,
+    { disabled }
+  );
+
+  return {
+    awuPurchaseInfo: data ?? null,
+    isAwuPurchaseInfoLoading: !error && !data && !disabled,
+    isAwuPurchaseInfoValidating: isValidating,
+    isAwuPurchaseInfoError: error,
+    mutateAwuPurchaseInfo: mutate,
+  };
+}
+
+export function useSeatPlan({
+  workspaceId,
+  disabled,
+}: {
+  workspaceId: string;
+  disabled?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const seatPlanFetcher: Fetcher<SeatPlanResponseBody> = fetcher;
+
+  const { data, error } = useSWRWithDefaults(
+    `/api/w/${workspaceId}/seats/plan`,
+    seatPlanFetcher,
+    { disabled }
+  );
+
+  return {
+    proSeatInfo: data?.pro ?? null,
+    maxSeatInfo: data?.max ?? null,
+    isSeatPlanLoading: !error && !data && !disabled,
+    isSeatPlanError: error,
   };
 }

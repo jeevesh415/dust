@@ -35,13 +35,22 @@ import type {
   GetProjectMetadataResponseBody,
   PatchProjectMetadataResponseBody,
 } from "@app/pages/api/w/[wId]/spaces/[spaceId]/project_metadata";
+import type {
+  GetUserProjectNotificationPreferenceResponseBody,
+  PatchUserProjectNotificationPreferenceResponseBody,
+} from "@app/pages/api/w/[wId]/spaces/[spaceId]/project_notification_preferences";
+import type { PostUserProjectStarResponseBody } from "@app/pages/api/w/[wId]/spaces/[spaceId]/star";
 import type { SpacesLookupResponseBody } from "@app/pages/api/w/[wId]/spaces/projects-lookup";
 import type { PatchProjectMetadataBodyType } from "@app/types/api/internal/spaces";
 import type { DataSourceViewCategoryWithoutApps } from "@app/types/api/public/spaces";
 import type { ContentNodesViewType } from "@app/types/connectors/content_nodes";
 import type { SearchWarningCode } from "@app/types/core/core_api";
-import { MIN_SEARCH_QUERY_SIZE } from "@app/types/core/core_api";
+import { MIN_SEARCH_QUERY_SIZE } from "@app/types/core/utils";
 import type { DataSourceViewType } from "@app/types/data_source_view";
+import type {
+  NotificationCondition,
+  UserProjectNotificationPreference,
+} from "@app/types/notification_preferences";
 import type { ProjectMetadataType } from "@app/types/project_metadata";
 import { isString } from "@app/types/shared/utils/general";
 import type { ProjectType, SpaceKind, SpaceType } from "@app/types/space";
@@ -1011,7 +1020,7 @@ export function useUpdateProjectMetadata({
       const errorData = await getErrorFromResponse(res);
       sendNotification({
         type: "error",
-        title: "Error updating project metadata",
+        title: "Error updating Pod metadata",
         description: `Error: ${errorData.message}`,
       });
       return null;
@@ -1024,9 +1033,13 @@ export function useUpdateProjectMetadata({
     const title =
       updates.archive !== undefined
         ? updates.archive
-          ? "Project archived"
-          : "Project unarchived"
-        : "Project updated";
+          ? "Pod archived"
+          : "Pod unarchived"
+        : updates.todoGenerationEnabled !== undefined
+          ? updates.todoGenerationEnabled
+            ? "Automatic task suggestions turned on"
+            : "Automatic task suggestions turned off"
+          : "Pod updated";
 
     sendNotification({
       type: "success",
@@ -1035,6 +1048,87 @@ export function useUpdateProjectMetadata({
 
     const response: PatchProjectMetadataResponseBody = await res.json();
     return response.projectMetadata;
+  };
+}
+
+export function useProjectNotificationPreference({
+  workspaceId,
+  spaceId,
+  disabled = false,
+}: {
+  workspaceId: string;
+  spaceId: string | null;
+  disabled?: boolean;
+}) {
+  const { fetcher } = useFetcher();
+  const projectMetadataFetcher: Fetcher<GetUserProjectNotificationPreferenceResponseBody> =
+    fetcher;
+
+  const { data, error, mutate } = useSWRWithDefaults(
+    `/api/w/${workspaceId}/spaces/${spaceId}/project_notification_preferences`,
+    projectMetadataFetcher,
+    { disabled: disabled || spaceId === null }
+  );
+
+  return {
+    projectNotificationPreference:
+      data?.userProjectNotificationPreference ?? null,
+    isProjectNotificationPreferenceLoading: !error && !data && !disabled,
+    mutateProjectNotificationPreference: mutate,
+  };
+}
+
+export function useUpdateProjectNotificationPreference({
+  workspaceId,
+  spaceId,
+}: {
+  workspaceId: string;
+  spaceId: string | null;
+}) {
+  const sendNotification = useSendNotification();
+  const { mutateProjectNotificationPreference } =
+    useProjectNotificationPreference({
+      workspaceId,
+      spaceId,
+      disabled: true,
+    });
+
+  return async (
+    preference: NotificationCondition
+  ): Promise<UserProjectNotificationPreference | null> => {
+    if (!spaceId) {
+      return null;
+    }
+    const url = `/api/w/${workspaceId}/spaces/${spaceId}/project_notification_preferences`;
+
+    const res = await clientFetch(url, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        preference,
+      }),
+    });
+
+    if (!res.ok) {
+      const errorData = await getErrorFromResponse(res);
+      sendNotification({
+        type: "error",
+        title: "Error updating Pod notification preference",
+        description: `Error: ${errorData.message}`,
+      });
+      return null;
+    }
+
+    void mutateProjectNotificationPreference();
+
+    sendNotification({
+      type: "success",
+      title: "Pod notification preference updated",
+    });
+
+    const response: PatchUserProjectNotificationPreferenceResponseBody =
+      await res.json();
+    return response.userProjectNotificationPreference;
   };
 }
 
@@ -1071,15 +1165,15 @@ export function useLeaveProject({
       void mutateSpaceSummary();
       sendNotification({
         type: "success",
-        title: `${userName} left project ${spaceName}`,
-        description: "You have successfully left the project.",
+        title: `${userName} left Pod ${spaceName}`,
+        description: "You have successfully left the Pod.",
       });
       return true;
     } else {
       const errorData = await getErrorFromResponse(res);
       sendNotification({
         type: "error",
-        title: "Could not leave project",
+        title: "Could not leave Pod",
         description: `Error: ${errorData.message}`,
       });
       return false;
@@ -1122,7 +1216,7 @@ export function useJoinProject({
       void mutateSpaceSummary();
       sendNotification({
         type: "success",
-        title: `${userName} joined project ${spaceName}`,
+        title: `${userName} joined Pod ${spaceName}`,
         description: "You can now participate in conversations.",
       });
       return true;
@@ -1130,7 +1224,7 @@ export function useJoinProject({
       const errorData = await getErrorFromResponse(res);
       sendNotification({
         type: "error",
-        title: "Could not join project",
+        title: "Could not join Pod",
         description: `Error: ${errorData.message}`,
       });
       return false;
@@ -1138,4 +1232,71 @@ export function useJoinProject({
   };
 
   return doJoin;
+}
+
+export function useStarProject({
+  workspaceId,
+  spaceId,
+}: {
+  workspaceId: string;
+  spaceId: string | null;
+}) {
+  const sendNotification = useSendNotification();
+  const { mutate: mutateSpaceSummary } = useSpaceConversationsSummary({
+    workspaceId,
+    options: { disabled: true },
+  });
+
+  return useCallback(
+    async (
+      isStarred: boolean
+    ): Promise<PostUserProjectStarResponseBody | null> => {
+      if (!spaceId) {
+        return null;
+      }
+
+      const res = await clientFetch(
+        `/api/w/${workspaceId}/spaces/${spaceId}/star`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ starred: isStarred }),
+        }
+      );
+
+      if (!res.ok) {
+        const errorData = await getErrorFromResponse(res);
+        sendNotification({
+          type: "error",
+          title: isStarred
+            ? "Error starring project"
+            : "Error unstarring project",
+          description: `Error: ${errorData.message}`,
+        });
+        return null;
+      }
+
+      const response: PostUserProjectStarResponseBody = await res.json();
+
+      void mutateSpaceSummary((data) => {
+        if (!data) {
+          return data;
+        }
+        return {
+          ...data,
+          summary: data.summary.map((entry) =>
+            entry.space.sId === spaceId
+              ? {
+                  ...entry,
+                  space: { ...entry.space, isStarred: response.isStarred },
+                }
+              : entry
+          ),
+        };
+      }, false);
+
+      return response;
+    },
+    [workspaceId, spaceId, mutateSpaceSummary, sendNotification]
+  );
 }

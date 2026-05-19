@@ -5,9 +5,12 @@ import type { LLM } from "@app/lib/api/llm/llm";
 import type { LLMEvent } from "@app/lib/api/llm/types/events";
 import type { LLMStreamParameters } from "@app/lib/api/llm/types/options";
 import { getLlmCredentials } from "@app/lib/api/provider_credentials";
-import { getSkillInstructionEditsValidationError } from "@app/lib/api/skills/apply_skill_instruction_edits";
 import { getLargeWhitelistedModel } from "@app/lib/assistant";
 import type { Authenticator } from "@app/lib/auth";
+import {
+  hasSuggestionSelfConflict,
+  pruneConflictingSkillEditSuggestions,
+} from "@app/lib/reinforcement/skill_suggestion_pruning";
 import {
   ALL_TOOLS,
   DESCRIBE_MCP_TOOL_NAME,
@@ -29,6 +32,7 @@ import { SkillSuggestionResource } from "@app/lib/resources/skill_suggestion_res
 import logger from "@app/logger/logger";
 import { assertNever } from "@app/types/shared/utils/assert_never";
 import { normalizeError } from "@app/types/shared/utils/error_utils";
+import { isString } from "@app/types/shared/utils/general";
 import type { SkillSuggestionSource } from "@app/types/suggestions/skill_suggestion";
 import type { JSONSchema7 as JSONSchema } from "json-schema";
 import { z } from "zod";
@@ -53,6 +57,24 @@ const REINFORCED_SKILLS_TOOL_DEFINITIONS: Record<
       mcpId: z.string().describe("The sId of the MCP server to describe"),
     },
   },
+  search_knowledge: {
+    description:
+      "Search workspace knowledge sources to discover relevant data nodes.",
+    schema: {
+      query: z
+        .string()
+        .describe("Natural language query describing the knowledge needed."),
+      topK: z
+        .number()
+        .int()
+        .positive()
+        .max(10)
+        .optional()
+        .describe(
+          "Maximum number of document hits to retrieve per data source (default: 5, only applies when query is provided)"
+        ),
+    },
+  },
   edit_skill: {
     description:
       "Suggest edits to a skill's instructions and/or configured tools.",
@@ -61,30 +83,22 @@ const REINFORCED_SKILLS_TOOL_DEFINITIONS: Record<
       instructionEdits: z
         .array(
           z.object({
-            old_string: z
-              .string()
-              .min(1)
-              .describe(
-                "Exact text to find in the current skill instructions."
-              ),
-            new_string: z
+            targetBlockId: z
               .string()
               .describe(
-                "Replacement text. Empty string deletes the matched span."
+                'The data-block-id of the block to replace. Use "instructions-root" to replace all instructions.'
               ),
-            expected_occurrences: z
-              .number()
-              .int()
-              .min(1)
-              .default(1)
+            content: z
+              .string()
               .describe(
-                "How many times old_string is expected to appear. Used to validate the edit is still applicable."
+                "Full HTML replacement content for the block, including its wrapping tag. Must be a single-line string with no literal newlines."
               ),
+            type: z.literal("replace"),
           })
         )
         .optional()
         .describe(
-          "Sequential search-and-replace operations applied to the skill instructions."
+          "Block-targeted edits to the skill instructions. Each item targets one block by its data-block-id."
         ),
       toolEdits: z
         .array(
@@ -99,18 +113,76 @@ const REINFORCED_SKILLS_TOOL_DEFINITIONS: Record<
         )
         .optional()
         .describe("Tools to add or remove from the skill."),
+      agentFacingDescriptionEdit: z
+        .object({
+          content: z
+            .string()
+            .min(1)
+            .describe(
+              "The full new agent-facing description (replaces the current one)."
+            ),
+        })
+        .optional()
+        .describe(
+          "Replacement for the skill's agent-facing description. Should typically be its own suggestion, not bundled with instruction or tool edits."
+        ),
       analysis: z
         .string()
         .optional()
         .describe("Why this change improves the skill"),
+      title: z
+        .string()
+        .max(25)
+        .optional()
+        .describe(
+          "A short, action-oriented user-facing title for this suggestion (MUST be at most 25 characters). " +
+            "Only set this when producing final aggregated suggestions; leave unset for synthetic suggestions."
+        ),
+    },
+  },
+  reject_suggestion: {
+    description:
+      "Reject source suggestions that are very bad quality, not actionable, or too similar to already declined suggestions. " +
+      "Use this tool in parallel with edit_skill calls — both are terminal and no further calls will be made after." +
+      "Do not use to ingore minor suggestions.",
+    schema: {
+      sourceSuggestionIds: z
+        .array(z.string())
+        .min(1)
+        .describe(
+          "The sIds of the source suggestions to reject. Must include at least one suggestion sId."
+        ),
     },
   },
 };
 
-export function buildReinforcedSkillsSpecifications(): AgentActionSpecification[] {
-  return ALL_TOOLS.map((toolName) => {
+const AGGREGATION_EXTRA_FIELDS: z.ZodRawShape = {
+  sourceSuggestionIds: z
+    .array(z.string())
+    .min(1)
+    .describe(
+      "The sIds of the source suggestions this suggestion is based on. " +
+        "Must include at least one suggestion sId."
+    ),
+};
+
+export function buildReinforcedSkillsSpecifications(
+  operationType: ReinforcedSkillsOperationType
+): AgentActionSpecification[] {
+  const isAggregation = operationType === "reinforcement_aggregate_suggestions";
+
+  return ALL_TOOLS.filter((toolName) => {
+    // reject_suggestion is only available during aggregation.
+    if (toolName === "reject_suggestion") {
+      return isAggregation;
+    }
+    return true;
+  }).map((toolName) => {
     const meta = REINFORCED_SKILLS_TOOL_DEFINITIONS[toolName];
-    const schema = z.object(meta.schema);
+    const schema =
+      toolName === "edit_skill" && isAggregation
+        ? z.object({ ...meta.schema, ...AGGREGATION_EXTRA_FIELDS })
+        : z.object(meta.schema);
     return {
       name: toolName,
       description: meta.description,
@@ -184,13 +256,16 @@ export function reinforcedSkillsConversationTitle(
 /**
  * Build LLMStreamParameters for a reinforced skills prompt.
  */
-export function buildReinforcedSkillsLLMParams({
-  systemPrompt,
-  userMessage,
-}: {
-  systemPrompt: string;
-  userMessage: string;
-}): LLMStreamParameters {
+export function buildReinforcedSkillsLLMParams(
+  {
+    systemPrompt,
+    userMessage,
+  }: {
+    systemPrompt: string;
+    userMessage: string;
+  },
+  operationType: ReinforcedSkillsOperationType
+): LLMStreamParameters {
   return {
     conversation: {
       messages: [
@@ -202,7 +277,7 @@ export function buildReinforcedSkillsLLMParams({
       ],
     },
     prompt: systemPrompt,
-    specifications: buildReinforcedSkillsSpecifications(),
+    specifications: buildReinforcedSkillsSpecifications(operationType),
   };
 }
 
@@ -223,7 +298,7 @@ export async function createReinforcedSkillsConversation(
     skillIds: string[];
   }
 ): Promise<string> {
-  const llmParams = buildReinforcedSkillsLLMParams(prompt);
+  const llmParams = buildReinforcedSkillsLLMParams(prompt, operationType);
   const { conversation: llmConversation, ...llmParamsWithoutConversation } =
     llmParams;
   const writeResult = await writeBatchUserMessages(auth, {
@@ -249,6 +324,7 @@ export async function getReinforcedSkillsLLM(
   if (!owner) {
     return null;
   }
+
   const model = getLargeWhitelistedModel(auth);
   if (!model) {
     return null;
@@ -277,6 +353,7 @@ export async function processSkillReinforcedEvents({
   operationType,
   contextId,
   conversation,
+  eligibleSkillIds,
 }: {
   auth: Authenticator;
   events: LLMEvent[];
@@ -284,6 +361,7 @@ export async function processSkillReinforcedEvents({
   operationType: ReinforcedSkillsOperationType;
   contextId: string;
   conversation?: ConversationResource;
+  eligibleSkillIds: string[];
 }): Promise<ProcessReinforcedSkillsEventsResult> {
   const errorEvents = events.filter((e) => e.type === "error");
   if (errorEvents.length > 0) {
@@ -297,6 +375,8 @@ export async function processSkillReinforcedEvents({
     );
     return {
       suggestionsCreated: 0,
+      suggestionsRejected: 0,
+      approvedSourceSuggestionIds: [],
       successfulToolCalls: [],
       failedToolCalls: [],
     };
@@ -313,12 +393,16 @@ export async function processSkillReinforcedEvents({
     );
     return {
       suggestionsCreated: 0,
+      suggestionsRejected: 0,
+      approvedSourceSuggestionIds: [],
       successfulToolCalls: [],
       failedToolCalls: [],
     };
   }
 
   let totalCreated = 0;
+  let totalRejected = 0;
+  const approvedSourceSuggestionIds: string[] = [];
   const successfulToolCalls: TerminalToolCallSuccess[] = [];
   const failedToolCalls: TerminalToolCallFailure[] = [];
 
@@ -333,29 +417,53 @@ export async function processSkillReinforcedEvents({
       operationType,
       contextId,
       conversation,
+      eligibleSkillIds,
     });
-    totalCreated += result.suggestionsCreated;
-    if (result.error) {
-      failedToolCalls.push({ toolCall, errorMessage: result.error });
-    } else {
-      successfulToolCalls.push({
-        toolCall,
-        message: `Successfully created ${result.suggestionsCreated} suggestion(s).`,
-      });
+    switch (result.type) {
+      case "created": {
+        totalCreated += result.suggestionsCreated;
+        // Collect sourceSuggestionIds from successful edit_skill calls.
+        const sourceIds = args.sourceSuggestionIds;
+        if (Array.isArray(sourceIds)) {
+          approvedSourceSuggestionIds.push(...sourceIds.filter(isString));
+        }
+        successfulToolCalls.push({
+          toolCall,
+          message: `Successfully created ${result.suggestionsCreated} suggestion(s).`,
+        });
+        break;
+      }
+      case "rejected":
+        totalRejected += result.suggestionsRejected;
+        successfulToolCalls.push({
+          toolCall,
+          message: `Successfully rejected ${result.suggestionsRejected} suggestion(s).`,
+        });
+        break;
+      case "error":
+        failedToolCalls.push({
+          toolCall,
+          errorMessage: result.errorMessage,
+        });
+        break;
+      default:
+        assertNever(result);
     }
   }
 
   return {
     suggestionsCreated: totalCreated,
+    suggestionsRejected: totalRejected,
+    approvedSourceSuggestionIds,
     successfulToolCalls,
     failedToolCalls,
   };
 }
 
-interface ToolCallResult {
-  suggestionsCreated: number;
-  error?: string;
-}
+type ToolCallResult =
+  | { type: "created"; suggestionsCreated: number }
+  | { type: "rejected"; suggestionsRejected: number }
+  | { type: "error"; errorMessage: string };
 
 async function createSkillSuggestionsFromToolCall({
   auth,
@@ -365,6 +473,7 @@ async function createSkillSuggestionsFromToolCall({
   operationType,
   contextId,
   conversation,
+  eligibleSkillIds,
 }: {
   auth: Authenticator;
   toolName: string;
@@ -373,17 +482,20 @@ async function createSkillSuggestionsFromToolCall({
   operationType: ReinforcedSkillsOperationType;
   contextId: string;
   conversation?: ConversationResource;
+  eligibleSkillIds: string[];
 }): Promise<ToolCallResult> {
   switch (toolName) {
     case "edit_skill": {
       const parsed = TOOL_SCHEMAS.edit_skill.safeParse(actionArguments);
       if (!parsed.success) {
-        const errorMessage = `Invalid arguments for ${toolName}: ${parsed.error.message}`;
         logger.warn(
           { contextId, toolName, error: parsed.error },
           `ReinforcedSkills: invalid LLM response shape for ${operationType}`
         );
-        return { suggestionsCreated: 0, error: errorMessage };
+        return {
+          type: "error",
+          errorMessage: `Invalid arguments for ${toolName}: ${parsed.error.message}`,
+        };
       }
 
       const skill = await SkillResource.fetchById(auth, parsed.data.skillId);
@@ -392,72 +504,143 @@ async function createSkillSuggestionsFromToolCall({
           { skillId: parsed.data.skillId, contextId },
           "ReinforcedSkills: skill not found for edit_skill"
         );
-        return { suggestionsCreated: 0, error: "Skill not found" };
+        return { type: "error", errorMessage: "Skill not found" };
+      }
+
+      if (!eligibleSkillIds.includes(parsed.data.skillId)) {
+        logger.warn(
+          { skillId: parsed.data.skillId, contextId },
+          "ReinforcedSkills: skill is not eligible for reinforcement suggestions"
+        );
+        return {
+          type: "error",
+          errorMessage: `Skill ${parsed.data.skillId} is not eligible for reinforcement suggestions`,
+        };
       }
 
       const hasInstructionEdits =
         (parsed.data.instructionEdits?.length ?? 0) > 0;
       const hasToolEdits = (parsed.data.toolEdits?.length ?? 0) > 0;
-      if (!hasInstructionEdits && !hasToolEdits) {
+      const hasAgentFacingDescriptionEdit =
+        parsed.data.agentFacingDescriptionEdit !== undefined;
+      if (
+        !hasInstructionEdits &&
+        !hasToolEdits &&
+        !hasAgentFacingDescriptionEdit
+      ) {
         return {
-          suggestionsCreated: 0,
-          error:
-            "edit_skill requires at least one instruction edit or tool edit.",
+          type: "error",
+          errorMessage:
+            "edit_skill requires at least one instruction edit, tool edit, or description edit.",
+        };
+      }
+
+      if (hasInstructionEdits && !skill.instructionsHtml) {
+        return {
+          type: "error",
+          errorMessage:
+            "edit_skill with instructionEdits requires the skill to have instructionsHtml.",
         };
       }
 
       if (
-        parsed.data.instructionEdits &&
-        parsed.data.instructionEdits.length > 0
-      ) {
-        const currentInstructions = skill.instructions ?? "";
-        const validationError = getSkillInstructionEditsValidationError(
-          currentInstructions,
-          parsed.data.instructionEdits
-        );
-        if (validationError) {
-          logger.warn(
-            { skillId: parsed.data.skillId, contextId, validationError },
-            "ReinforcedSkills: invalid instruction edits"
-          );
-          return { suggestionsCreated: 0, error: validationError };
-        }
-      }
-
-      // Mark any existing pending edit suggestions for this skill as outdated.
-      // This is not strictly necessary, but it is unclear if we want to allow multiple pending edit suggestions for the same skill.
-      const existingPending =
-        await SkillSuggestionResource.listBySkillConfigurationId(
-          auth,
-          skill.sId,
+        hasSuggestionSelfConflict(
           {
-            states: ["pending"],
-            kind: "edit",
-            sources: ["reinforcement", "synthetic"],
-          }
-        );
-      if (existingPending.length > 0) {
-        await SkillSuggestionResource.bulkUpdateState(
-          auth,
-          existingPending,
-          "outdated"
-        );
+            instructionEdits: parsed.data.instructionEdits,
+            toolEdits: parsed.data.toolEdits,
+            agentFacingDescriptionEdit: parsed.data.agentFacingDescriptionEdit,
+          },
+          skill.instructionsHtml
+        )
+      ) {
+        return {
+          type: "error",
+          errorMessage:
+            "Suggestion has conflicting edits (overlapping block targets or duplicate tool IDs).",
+        };
       }
 
-      await SkillSuggestionResource.createSuggestionForSkill(auth, skill, {
-        kind: "edit",
-        suggestion: {
-          instructionEdits: parsed.data.instructionEdits,
-          toolEdits: parsed.data.toolEdits,
-        },
-        analysis: parsed.data.analysis ?? null,
-        state: "pending",
-        source,
-        sourceConversationId: conversation?.id ?? null,
-        groupId: null,
-      });
+      // Build sourceConversationIds:
+      // - For synthetic suggestions: use the current conversation's model ID.
+      // - For reinforcement suggestions: resolve sourceSuggestionIds to conversation model IDs.
+      let sourceConversationIds: number[] | null = null;
+      if (
+        source === "reinforcement" &&
+        parsed.data.sourceSuggestionIds &&
+        parsed.data.sourceSuggestionIds.length > 0
+      ) {
+        const sourceSuggestions = await SkillSuggestionResource.fetchByIds(
+          auth,
+          parsed.data.sourceSuggestionIds
+        );
+        const ids = sourceSuggestions.flatMap(
+          (s) => s.sourceConversationIds ?? []
+        );
+        sourceConversationIds = ids.length > 0 ? [...new Set(ids)] : null;
+      } else if (conversation) {
+        sourceConversationIds = [conversation.id];
+      }
 
-      return { suggestionsCreated: 1 };
+      const newSuggestion =
+        await SkillSuggestionResource.createSuggestionForSkill(auth, skill, {
+          kind: "edit",
+          suggestion: {
+            instructionEdits: parsed.data.instructionEdits,
+            toolEdits: parsed.data.toolEdits,
+            agentFacingDescriptionEdit: parsed.data.agentFacingDescriptionEdit,
+          },
+          analysis: parsed.data.analysis ?? null,
+          title: parsed.data.title ?? null,
+          state: "pending",
+          source,
+          sourceConversationIds,
+        });
+
+      await pruneConflictingSkillEditSuggestions(auth, skill, newSuggestion);
+
+      return { type: "created", suggestionsCreated: 1 };
+    }
+
+    case "reject_suggestion": {
+      const parsed = TOOL_SCHEMAS.reject_suggestion.safeParse(actionArguments);
+      if (!parsed.success) {
+        logger.warn(
+          { contextId, toolName, error: parsed.error },
+          `ReinforcedSkills: invalid LLM response shape for ${operationType}`
+        );
+        return {
+          type: "error",
+          errorMessage: `Invalid arguments for ${toolName}: ${parsed.error.message}`,
+        };
+      }
+
+      const suggestions = await SkillSuggestionResource.fetchByIds(
+        auth,
+        parsed.data.sourceSuggestionIds
+      );
+
+      if (suggestions.length === 0) {
+        return {
+          type: "error",
+          errorMessage: `No suggestions found for sourceSuggestionIds: ${parsed.data.sourceSuggestionIds.join(", ")}`,
+        };
+      }
+
+      await SkillSuggestionResource.bulkUpdateState(
+        auth,
+        suggestions,
+        "rejected"
+      );
+
+      logger.info(
+        {
+          contextId,
+          rejectedCount: suggestions.length,
+        },
+        `ReinforcedSkills: rejected ${suggestions.length} suggestion(s) via reject_suggestion`
+      );
+
+      return { type: "rejected", suggestionsRejected: suggestions.length };
     }
 
     default:
@@ -465,6 +648,9 @@ async function createSkillSuggestionsFromToolCall({
         { contextId, toolName },
         `ReinforcedSkills: unexpected tool name for ${operationType}`
       );
-      return { suggestionsCreated: 0 };
+      return {
+        type: "error",
+        errorMessage: `Unexpected tool name: ${toolName}`,
+      };
   }
 }

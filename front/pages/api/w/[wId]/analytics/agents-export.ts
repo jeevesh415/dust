@@ -1,3 +1,5 @@
+// @migration-status: MIGRATED_TO_HONO
+
 /** @ignoreswagger */
 import { DEFAULT_PERIOD_DAYS } from "@app/components/agent_builder/observability/constants";
 import {
@@ -53,7 +55,7 @@ async function handler(
         days: q.data.days,
       });
 
-      const result = await fetchAgentExportRows(baseQuery, owner);
+      const result = await fetchAgentExportRows(baseQuery, auth, true);
 
       if (result.isErr()) {
         return apiError(req, res, {

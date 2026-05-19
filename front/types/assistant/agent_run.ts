@@ -4,6 +4,7 @@
 import { getAgentConfiguration } from "@app/lib/api/assistant/configuration/agent";
 import { getConversation } from "@app/lib/api/assistant/conversation/fetch";
 import { PREVIOUS_INTERACTIONS_TO_PRESERVE } from "@app/lib/api/assistant/conversation_rendering";
+import { getStaticReplyForUserMessage } from "@app/lib/api/assistant/static_reply";
 import type { AuthenticatorType } from "@app/lib/auth";
 import { Authenticator } from "@app/lib/auth";
 import { ConversationResource } from "@app/lib/resources/conversation_resource";
@@ -28,37 +29,9 @@ import { Err, Ok } from "../shared/result";
 import { isGlobalAgentId } from "./assistant";
 import { ConversationError } from "./conversation";
 
-function isReinforcedAgentNotificationMetadata(
-  value: unknown
-): value is { agentName: string; agentConfigurationId: string } {
-  if (typeof value !== "object" || value === null) {
-    return false;
-  }
-  return (
-    "agentName" in value &&
-    typeof value.agentName === "string" &&
-    "agentConfigurationId" in value &&
-    typeof value.agentConfigurationId === "string"
-  );
-}
-
-function isReinforcedSkillNotificationMetadata(
-  value: unknown
-): value is { skillName: string; skillId: string } {
-  if (typeof value !== "object" || value === null) {
-    return false;
-  }
-  return (
-    "skillName" in value &&
-    typeof value.skillName === "string" &&
-    "skillId" in value &&
-    typeof value.skillId === "string"
-  );
-}
-
 /**
- * Error types for getAgentLoopData that indicate soft-deleted resources.
- * These are safe to ignore in callers since the resource was intentionally deleted.
+ * Error types for getAgentLoopData that indicate deleted or unavailable resources.
+ * These are safe to ignore in callers since retrying won't make the data available.
  */
 export const AGENT_LOOP_DATA_SOFT_DELETE_ERROR_TYPES = [
   "conversation_deleted",
@@ -245,13 +218,13 @@ export async function getAgentLoopDataWithAuth(
         error instanceof ConversationError &&
         error.type === "conversation_not_found"
       ) {
-        // Check if the conversation was soft-deleted.
+        // Check if the conversation was deleted or is no longer readable.
         const conv = await ConversationResource.fetchById(
           auth,
           conversationId,
           { includeDeleted: true }
         );
-        if (conv?.visibility === "deleted") {
+        if (!conv || conv.visibility === "deleted") {
           return new Err(new AgentLoopDataError("conversation_deleted"));
         }
       }
@@ -268,15 +241,16 @@ export async function getAgentLoopDataWithAuth(
       conversationBranchId,
       PREVIOUS_INTERACTIONS_TO_PRESERVE + 1 // X previous + the last one
     );
+
     if (conversationRes.isErr()) {
       if (conversationRes.error.type === "conversation_not_found") {
-        // Check if the conversation was soft-deleted.
+        // Check if the conversation was deleted or is no longer readable.
         const conv = await ConversationResource.fetchById(
           auth,
           conversationId,
           { includeDeleted: true }
         );
-        if (conv?.visibility === "deleted") {
+        if (!conv || conv.visibility === "deleted") {
           return new Err(new AgentLoopDataError("conversation_deleted"));
         }
       }
@@ -335,28 +309,12 @@ export async function getAgentLoopDataWithAuth(
 
   const agentId = agentMessage.configuration.sId;
 
-  const reinforcedMeta = conversation.metadata?.reinforcedAgentNotification;
-  const reinforcedAgentNotification = isReinforcedAgentNotificationMetadata(
-    reinforcedMeta
-  )
-    ? reinforcedMeta
-    : undefined;
-
-  const reinforcedSkillMeta =
-    conversation.metadata?.reinforcedSkillNotification;
-  const reinforcedSkillNotification = isReinforcedSkillNotificationMetadata(
-    reinforcedSkillMeta
-  )
-    ? reinforcedSkillMeta
-    : undefined;
-
   const globalAgentContext: GlobalAgentContext = {
     userMessageRank: userMessage.rank,
     sidekickIsNewAgentFromScratch:
       conversation.metadata?.sidekickIsNewAgentFromScratch === true ||
       undefined,
-    reinforcedAgentNotification,
-    reinforcedSkillNotification,
+    staticReply: getStaticReplyForUserMessage({ conversation, userMessage }),
   };
 
   // As the agent configuration is never supposed to change during a loop, we can cache it for a long time.

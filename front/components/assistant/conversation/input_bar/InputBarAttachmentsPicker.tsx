@@ -1,4 +1,4 @@
-import { getSingularFileCategoryLabelForContentType } from "@app/components/assistant/conversation/files_panel/utils";
+import { getSingularFileCategoryLabelForContentType } from "@app/components/file_explorer/utils";
 import { InfiniteScroll } from "@app/components/InfiniteScroll";
 import { NodePathTooltip } from "@app/components/NodePathTooltip";
 import { getIcon } from "@app/components/resources/resources_icons";
@@ -23,7 +23,7 @@ import type {
 } from "@app/lib/search/tools/types";
 import { useUnifiedSearch } from "@app/lib/swr/search";
 import { useSpaces } from "@app/lib/swr/spaces";
-import { MIN_SEARCH_QUERY_SIZE } from "@app/types/core/core_api";
+import { MIN_SEARCH_QUERY_SIZE } from "@app/types/core/utils";
 import type { DataSourceType } from "@app/types/data_source";
 import type { DataSourceViewContentNode } from "@app/types/data_source_view";
 import type { FileUseCaseMetadata } from "@app/types/files";
@@ -243,7 +243,7 @@ const ProjectFileItem = ({
   const fileKind = getSingularFileCategoryLabelForContentType(item.contentType);
   const description = projectName
     ? `${fileKind} in "${projectName}" knowledge`
-    : `${fileKind} in project knowledge`;
+    : `${fileKind} in Pod knowledge`;
   return (
     <DropdownMenuCheckboxItem
       label={item.title}
@@ -499,7 +499,7 @@ export const InputBarAttachmentsPicker = ({
         value: key,
         label:
           key === PROJECT_FILTER_KEY
-            ? "Projects"
+            ? "Pods"
             : getDisplayNameForDataSource(r.dataSource, true),
       });
     }
@@ -515,7 +515,7 @@ export const InputBarAttachmentsPicker = ({
     if (projectFilesWithResults.length > 0) {
       options.set(PROJECT_FILTER_KEY, {
         value: PROJECT_FILTER_KEY,
-        label: "Projects",
+        label: "Pods",
       });
     }
 
@@ -668,6 +668,7 @@ export const InputBarAttachmentsPicker = ({
                 <LoadingBlock
                   // LoadingBlock defaults to dark:bg-muted-background-night, same as the menu
                   // surface, so skeletons read as invisible; match menu row hover contrast.
+                  // biome-ignore lint/plugin/noCssImportant: legacy [GEN12] — needs cleanup
                   className="h-7 w-20 bg-muted-background dark:!bg-muted-night p-2 mt-2"
                 />
               )}
@@ -682,6 +683,7 @@ export const InputBarAttachmentsPicker = ({
                       key={i}
                       // LoadingBlock defaults to dark:bg-muted-background-night, same as the menu
                       // surface, so skeletons read as invisible; match menu row hover contrast.
+                      // biome-ignore lint/plugin/noCssImportant: legacy [GEN12] — needs cleanup
                       className="h-11 w-full bg-muted-background dark:border-border-night dark:!bg-muted-night"
                     />
                   )

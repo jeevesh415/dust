@@ -5,6 +5,7 @@ import { ConfigurableToolInputJSONSchemas } from "@app/lib/actions/mcp_internal_
 import type { MCPServerViewType } from "@app/lib/api/mcp";
 import {
   ensurePathExists,
+  followInternalRef,
   hasNoRequiredProperties,
   jsonSchemaHasRequiredDustToolInput,
   setValueAtPath,
@@ -126,6 +127,54 @@ describe("JSON Schema Utilities", () => {
           newKey: "new-value",
         },
       });
+    });
+  });
+
+  describe("followInternalRef", () => {
+    it("follows #/definitions/ refs", () => {
+      const schema: JSONSchema = {
+        type: "object",
+        definitions: {
+          Note: {
+            type: "object",
+            properties: { text: { type: "string" } },
+          },
+        },
+      };
+
+      expect(followInternalRef(schema, "#/definitions/Note")).toEqual({
+        type: "object",
+        properties: { text: { type: "string" } },
+      });
+    });
+
+    it("follows #/$defs/ refs", () => {
+      const schema: JSONSchema = {
+        type: "object",
+        $defs: {
+          Note: {
+            type: "object",
+            properties: { text: { type: "string" } },
+          },
+        },
+      };
+
+      expect(followInternalRef(schema, "#/$defs/Note")).toEqual({
+        type: "object",
+        properties: { text: { type: "string" } },
+      });
+    });
+
+    it("returns null for external refs", () => {
+      const schema: JSONSchema = { type: "object" };
+      expect(
+        followInternalRef(schema, "https://example.com/schema")
+      ).toBeNull();
+    });
+
+    it("returns null when path does not exist", () => {
+      const schema: JSONSchema = { type: "object" };
+      expect(followInternalRef(schema, "#/definitions/Missing")).toBeNull();
     });
   });
 
@@ -617,7 +666,7 @@ describe("jsonSchemaHasRequiredDustToolInput", () => {
       type: "object",
       properties: {
         message: { type: "string" },
-        dustProject: {
+        dustPod: {
           type: "object",
           properties: {
             uri: { type: "string" },
@@ -635,7 +684,7 @@ describe("jsonSchemaHasRequiredDustToolInput", () => {
     const schema: JSONSchema = {
       type: "object",
       properties: {
-        dustProject: {
+        dustPod: {
           type: "object",
           properties: {
             uri: { type: "string" },
@@ -644,7 +693,7 @@ describe("jsonSchemaHasRequiredDustToolInput", () => {
           required: ["uri", "mimeType"],
         },
       },
-      required: ["dustProject"],
+      required: ["dustPod"],
     };
     expect(jsonSchemaHasRequiredDustToolInput(schema, true)).toBe(true);
   });
@@ -656,7 +705,7 @@ describe("jsonSchemaHasRequiredDustToolInput", () => {
         wrapper: {
           type: "object",
           properties: {
-            dustProject: {
+            dustPod: {
               type: "object",
               properties: {
                 uri: { type: "string" },
@@ -667,7 +716,7 @@ describe("jsonSchemaHasRequiredDustToolInput", () => {
               required: ["uri", "mimeType"],
             },
           },
-          required: ["dustProject"],
+          required: ["dustPod"],
         },
       },
       required: [],
@@ -852,7 +901,7 @@ describe("jsonSchemaHasRequiredDustToolInput", () => {
   it("accepts object-like schema without explicit type: object when properties carry Dust", () => {
     const schema = {
       properties: {
-        dustProject: {
+        dustPod: {
           type: "object",
           properties: {
             uri: { type: "string" },
@@ -861,7 +910,7 @@ describe("jsonSchemaHasRequiredDustToolInput", () => {
           required: ["uri", "mimeType"],
         },
       },
-      required: ["dustProject"],
+      required: ["dustPod"],
     };
     expect(jsonSchemaHasRequiredDustToolInput(schema, true)).toBe(true);
   });

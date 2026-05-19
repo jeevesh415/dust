@@ -79,12 +79,17 @@ export async function fetchMCPServerActionConfigurations(
     },
   ];
 
+  const uniqueMcpServerViewIds = Array.from(
+    new Set(mcpServerConfigurations.map((r) => r.mcpServerViewId))
+  );
+
   const [
     allDustApps,
     allDataSourceConfigurations,
     allTablesConfigurations,
     allChildAgentConfigurations,
     allProjectConfigurations,
+    allMcpServerViews,
   ] = await Promise.all([
     AppResource.fetchByIds(
       auth,
@@ -116,7 +121,12 @@ export async function fetchMCPServerActionConfigurations(
         },
       ],
     }),
+    MCPServerViewResource.fetchByModelIds(auth, uniqueMcpServerViewIds),
   ]);
+
+  const mcpServerViewsById = new Map(
+    allMcpServerViews.map((view) => [view.id, view])
+  );
 
   const actionsByConfigurationId = new Map<
     ModelId,
@@ -140,16 +150,14 @@ export async function fetchMCPServerActionConfigurations(
 
     const dustApp = allDustApps.filter((app) => app.sId === config.appId)[0];
 
-    const mcpServerView = await MCPServerViewResource.fetchByModelPk(
-      auth,
-      mcpServerViewId
-    );
+    const mcpServerView = mcpServerViewsById.get(mcpServerViewId) ?? null;
     let serverName: string | null = null;
     let serverDescription: string | null = null;
     let serverIcon:
       | InternalAllowedIconType
       | CustomResourceIconType
       | undefined = undefined;
+    let serverMeta: Record<string, string> | undefined = undefined;
 
     if (!mcpServerView) {
       logger.warn(
@@ -158,11 +166,12 @@ export async function fetchMCPServerActionConfigurations(
       serverName = "Missing";
       serverDescription = "Missing";
     } else {
-      const { name, description, icon } = mcpServerView.toJSON().server;
+      const { name, description, icon, meta } = mcpServerView.toJSON().server;
 
       serverName = name;
       serverDescription = description;
       serverIcon = icon;
+      serverMeta = meta ?? undefined;
     }
     if (!actionsByConfigurationId.has(agentConfigurationId)) {
       actionsByConfigurationId.set(agentConfigurationId, []);
@@ -205,6 +214,7 @@ export async function fetchMCPServerActionConfigurations(
           childAgentConfigurations.length > 0
             ? childAgentConfigurations[0].agentConfigurationId
             : null,
+        meta: serverMeta,
         additionalConfiguration: config.additionalConfiguration,
         timeFrame: config.timeFrame,
         jsonSchema: config.jsonSchema,

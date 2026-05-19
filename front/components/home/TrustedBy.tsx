@@ -19,17 +19,15 @@ const CASE_STUDIES: Record<string, string> = {
   blueground: "/customers/customer-support-blueground",
   clay: "/customers/clay-scaling-gtme-team",
   doctolib:
-    "/customers/doctolibs-ai-adoption-playbook-from-30-person-pilot-to-company-wide-deployment",
+    "/customers/why-doctolib-made-company-wide-enterprise-ai-a-national-cause",
   fleet: "/customers/how-valentine-head-of-marketing-at-fleet-uses-dust",
   kyriba: "/customers/kyriba-accelerating-innovation-with-dust",
   malt: "/customers/malt-customer-support",
   mirakl: "/customers/why-mirakl-chose-dust-as-its-go-to-agentic-solution",
-  patch:
-    "/customers/how-patch-empowered-70-of-its-team-to-use-ai-agents-weekly",
-  payfit:
-    "/customers/less-admin-more-selling-how-dust-frees-up-payfits-sales-team-to-close-more-deals",
+  payfit: "/customers/dust-ai-payfit-efficiency",
   pennylane: "/customers/pennylane-customer-support-journey",
   persona: "/customers/how-persona-hit-80-ai-agent-adoption-with-dust",
+  profound: "/customers/profound-post-sales-team-reclaimed-1800-hours",
   qonto: "/customers/qonto-dust-ai-partnership",
   wakam:
     "/customers/how-wakam-cut-legal-contract-analysis-time-by-50-with-dust",
@@ -42,13 +40,13 @@ const CASE_STUDIES: Record<string, string> = {
 const LOGO_SETS = {
   default: {
     us: [
-      { name: "photoroom", src: "/static/landing/logos/gray/photoroom.svg" },
+      { name: "datadog", src: "/static/landing/logos/gray/datadog.svg" },
       { name: "clay", src: "/static/landing/logos/gray/clay.svg" },
       //  { name: "cursor", src: "/static/landing/logos/gray/cursor.svg" }, -- temporary
       { name: "assembled", src: "/static/landing/logos/gray/assembled.svg" },
       { name: "decagon", src: "/static/landing/logos/gray/decagon.svg" },
       { name: "kyriba", src: "/static/landing/logos/gray/kyriba.svg" },
-      { name: "patch", src: "/static/landing/logos/gray/patch.svg" },
+      { name: "evenup", src: "/static/landing/logos/gray/evenup.svg" },
       { name: "persona", src: "/static/landing/logos/gray/persona.svg" },
       { name: "1password", src: "/static/landing/logos/gray/1password.svg" },
       { name: "vanta", src: "/static/landing/logos/gray/vanta.svg" },
@@ -66,20 +64,19 @@ const LOGO_SETS = {
       { name: "malt", src: "/static/landing/logos/gray/malt.svg" },
       { name: "vanta", src: "/static/landing/logos/gray/vanta.svg" },
       { name: "payfit", src: "/static/landing/logos/gray/payfit.svg" },
-      { name: "photoroom", src: "/static/landing/logos/gray/photoroom.svg" },
+      { name: "datadog", src: "/static/landing/logos/gray/datadog.svg" },
       { name: "pennylane", src: "/static/landing/logos/gray/pennylane.svg" },
       { name: "qonto", src: "/static/landing/logos/gray/qonto.svg" },
     ],
   },
   landing: {
     us: [
-      { name: "photoroom", src: "/static/landing/logos/gray/photoroom.svg" },
+      { name: "datadog", src: "/static/landing/logos/gray/datadog.svg" },
       { name: "clay", src: "/static/landing/logos/gray/clay.svg" },
-      // { name: "cursor", src: "/static/landing/logos/gray/cursor.svg" }, -- temporary
+      { name: "cursor", src: "/static/landing/logos/gray/cursor.svg" },
       { name: "assembled", src: "/static/landing/logos/gray/assembled.svg" },
       { name: "decagon", src: "/static/landing/logos/gray/decagon.svg" },
-      { name: "laurel", src: "/static/landing/logos/gray/laurel.svg" },
-      { name: "patch", src: "/static/landing/logos/gray/patch.svg" },
+      { name: "evenup", src: "/static/landing/logos/gray/evenup.svg" },
       { name: "persona", src: "/static/landing/logos/gray/persona.svg" },
       { name: "1password", src: "/static/landing/logos/gray/1password.svg" },
       { name: "vanta", src: "/static/landing/logos/gray/vanta.svg" },
@@ -97,7 +94,7 @@ const LOGO_SETS = {
       { name: "malt", src: "/static/landing/logos/gray/malt.svg" },
       { name: "vanta", src: "/static/landing/logos/gray/vanta.svg" },
       { name: "payfit", src: "/static/landing/logos/gray/payfit.svg" },
-      { name: "photoroom", src: "/static/landing/logos/gray/photoroom.svg" },
+      { name: "datadog", src: "/static/landing/logos/gray/datadog.svg" },
       { name: "pennylane", src: "/static/landing/logos/gray/pennylane.svg" },
       { name: "qonto", src: "/static/landing/logos/gray/qonto.svg" },
     ],
@@ -245,7 +242,7 @@ export default function TrustedBy({
     >
       {showTitle && (
         <H4 className="mb-6 w-full text-center text-foreground">
-          Trusted by <span className="text-blue-500">5,000+</span> organizations
+          Trusted by <span className="text-blue-500">3,000+</span> organizations
         </H4>
       )}
 
@@ -259,7 +256,11 @@ export default function TrustedBy({
           )}
         >
           {logos.map((logo, index) => {
-            const caseStudyUrl = CASE_STUDIES[logo.name];
+            const caseStudyPath = CASE_STUDIES[logo.name];
+            const caseStudyUrl =
+              caseStudyPath && (logo.name !== "profound" || region === "us")
+                ? caseStudyPath
+                : undefined;
             return (
               <div
                 key={`${logo.name}-${index}`}

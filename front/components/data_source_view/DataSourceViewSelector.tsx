@@ -28,12 +28,13 @@ import {
   isRemoteDatabase,
   isWebsite,
 } from "@app/lib/data_sources";
+import { getDisplayTitleForDataSourceViewContentNode } from "@app/lib/providers/content_nodes_display";
 import type { UseInfiniteContentNodes } from "@app/lib/swr/data_source_views";
 import { useInfiniteDataSourceViewContentNodes } from "@app/lib/swr/data_source_views";
 import { useSpacesSearch } from "@app/lib/swr/spaces";
 import type { ContentNodesViewType } from "@app/types/connectors/content_nodes";
 import type { SearchWarningCode } from "@app/types/core/core_api";
-import { MIN_SEARCH_QUERY_SIZE } from "@app/types/core/core_api";
+import { MIN_SEARCH_QUERY_SIZE } from "@app/types/core/utils";
 import type {
   DataSourceViewContentNode,
   DataSourceViewSelectionConfiguration,
@@ -59,8 +60,8 @@ import {
   Tree,
 } from "@dust-tt/sparkle";
 import type { ContentMessageProps } from "@dust-tt/sparkle/dist/esm/components/ContentMessage";
-// biome-ignore lint/plugin/noBulkLodash: existing usage
-import _ from "lodash";
+import cloneDeep from "lodash/cloneDeep";
+import omit from "lodash/omit";
 import type { Dispatch, SetStateAction } from "react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
@@ -192,7 +193,7 @@ const updateSelection = ({
   );
 
   if (onlyAdd && exists) {
-    return _.cloneDeep(prevState);
+    return cloneDeep(prevState);
   }
 
   if (item.mimeType === DATA_SOURCE_MIME_TYPE) {
@@ -834,7 +835,7 @@ export function DataSourceViewSelector({
   const handleSelectAll = () => {
     if (hasActiveSelection) {
       setSelectionConfigurations((prevState) =>
-        _.omit(prevState, dataSourceView.sId)
+        omit(prevState, dataSourceView.sId)
       );
       selectAll.reset();
       return;
@@ -916,7 +917,7 @@ export function DataSourceViewSelector({
 
         if (updatedConfig.selectedResources.length === 0) {
           // Nothing is selected at all, remove from the list
-          return _.omit(prevState, dataSourceView.sId);
+          return omit(prevState, dataSourceView.sId);
         }
 
         // Return a new object to trigger a re-render
@@ -1025,6 +1026,11 @@ export function DataSourceViewSelector({
               )
             }
             defaultExpandedIds={defaultExpandedIds}
+            getLabel={(n) =>
+              getDisplayTitleForDataSourceViewContentNode(
+                n as DataSourceViewContentNode
+              )
+            }
             {...(selectionMode === "radio"
               ? { "data-selection-mode": "radio" }
               : {})}

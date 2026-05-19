@@ -8,6 +8,7 @@ import { padSeriesToTimeRange } from "@app/components/agent_builder/observabilit
 import { ChartContainer } from "@app/components/charts/ChartContainer";
 import type { LegendItem } from "@app/components/charts/ChartLegend";
 import { ChartTooltipCard } from "@app/components/charts/ChartTooltip";
+import { useSelectableSeries } from "@app/components/charts/useSelectableSeries";
 import { CsvDownloadButton } from "@app/components/workspace/analytics/CsvDownloadButton";
 import { useDownloadCsv } from "@app/hooks/useDownloadCsv";
 import {
@@ -16,7 +17,7 @@ import {
   useWorkspaceUsageMetrics,
 } from "@app/lib/swr/workspaces";
 import { formatShortDate } from "@app/lib/utils/timestamps";
-import { ButtonsSwitch, ButtonsSwitchList } from "@dust-tt/sparkle";
+import { ButtonsSwitch, ButtonsSwitchList, cn } from "@dust-tt/sparkle";
 import { useState } from "react";
 import {
   CartesianGrid,
@@ -156,12 +157,16 @@ function activeUsersZeroFactory(timestamp: number): ActiveUsersMetricsDatum {
 
 interface UsageMetricsTooltipProps extends TooltipContentProps<number, string> {
   displayMode: UsageDisplayMode;
+  activeKey?: string;
+  selectedKey?: string;
 }
 
 function UsageMetricsTooltip({
   active,
   payload,
   displayMode,
+  activeKey,
+  selectedKey,
 }: UsageMetricsTooltipProps) {
   if (!active || !payload || payload.length === 0) {
     return null;
@@ -180,22 +185,32 @@ function UsageMetricsTooltip({
     const title = row.date ?? formatShortDate(row.timestamp);
     const rows = [
       {
+        key: "dau",
         label: "DAU (Daily)",
         value: `${row.dau}%`,
         colorClassName: ACTIVE_USERS_PALETTE.dau,
       },
       {
+        key: "wau",
         label: "WAU (7-day)",
         value: `${row.wau}%`,
         colorClassName: ACTIVE_USERS_PALETTE.wau,
       },
       {
+        key: "mau",
         label: "MAU (28-day)",
         value: `${row.mau}%`,
         colorClassName: ACTIVE_USERS_PALETTE.mau,
       },
     ];
-    return <ChartTooltipCard title={title} rows={rows} />;
+    return (
+      <ChartTooltipCard
+        title={title}
+        rows={rows}
+        activeKey={activeKey}
+        selectedKey={selectedKey}
+      />
+    );
   }
 
   if (!isWorkspaceUsageMetricsDatum(first.payload)) {
@@ -207,18 +222,27 @@ function UsageMetricsTooltip({
 
   const rows = [
     {
+      key: "messages",
       label: "Messages",
       value: row.count.toLocaleString(),
       colorClassName: USAGE_METRICS_PALETTE.messages,
     },
     {
+      key: "conversations",
       label: "Conversations",
       value: row.conversations.toLocaleString(),
       colorClassName: USAGE_METRICS_PALETTE.conversations,
     },
   ];
 
-  return <ChartTooltipCard title={title} rows={rows} />;
+  return (
+    <ChartTooltipCard
+      title={title}
+      rows={rows}
+      activeKey={activeKey}
+      selectedKey={selectedKey}
+    />
+  );
 }
 
 interface WorkspaceUsageChartProps {
@@ -250,7 +274,16 @@ export function WorkspaceUsageChart({
     disabled: !workspaceId || displayMode !== "users",
   });
 
-  const legendItems = getLegendItemsForMode(displayMode);
+  const {
+    selectedKey,
+    activeKey,
+    isDimmed,
+    lineActiveDot,
+    decorate,
+    hoverHandlers,
+  } = useSelectableSeries();
+
+  const legendItems = decorate(getLegendItemsForMode(displayMode));
 
   const usageData = padSeriesToTimeRange<WorkspaceUsageMetricsDatum>(
     usageMetrics,
@@ -359,7 +392,12 @@ export function WorkspaceUsageChart({
         <Tooltip
           isAnimationActive={false}
           content={(props: TooltipContentProps<number, string>) => (
-            <UsageMetricsTooltip {...props} displayMode={displayMode} />
+            <UsageMetricsTooltip
+              {...props}
+              displayMode={displayMode}
+              activeKey={activeKey}
+              selectedKey={selectedKey}
+            />
           )}
           cursor={false}
           wrapperStyle={{ outline: "none", zIndex: 50 }}
@@ -377,18 +415,32 @@ export function WorkspaceUsageChart({
               strokeWidth={2}
               dataKey="count"
               name="Messages"
-              className={USAGE_METRICS_PALETTE.messages}
+              className={cn(
+                USAGE_METRICS_PALETTE.messages,
+                "transition-opacity",
+                isDimmed("messages") && "opacity-25"
+              )}
               stroke="currentColor"
               dot={false}
+              activeDot={lineActiveDot("messages")}
+              isAnimationActive={false}
+              {...hoverHandlers("messages")}
             />
             <Line
               type={getLineType(period)}
               strokeWidth={2}
               dataKey="conversations"
               name="Conversations"
-              className={USAGE_METRICS_PALETTE.conversations}
+              className={cn(
+                USAGE_METRICS_PALETTE.conversations,
+                "transition-opacity",
+                isDimmed("conversations") && "opacity-25"
+              )}
               stroke="currentColor"
               dot={false}
+              activeDot={lineActiveDot("conversations")}
+              isAnimationActive={false}
+              {...hoverHandlers("conversations")}
             />
           </>
         ) : (
@@ -398,27 +450,48 @@ export function WorkspaceUsageChart({
               strokeWidth={2}
               dataKey="dau"
               name="DAU"
-              className={ACTIVE_USERS_PALETTE.dau}
+              className={cn(
+                ACTIVE_USERS_PALETTE.dau,
+                "transition-opacity",
+                isDimmed("dau") && "opacity-25"
+              )}
               stroke="currentColor"
               dot={false}
+              activeDot={lineActiveDot("dau")}
+              isAnimationActive={false}
+              {...hoverHandlers("dau")}
             />
             <Line
               type={getLineType(period)}
               strokeWidth={2}
               dataKey="wau"
               name="WAU"
-              className={ACTIVE_USERS_PALETTE.wau}
+              className={cn(
+                ACTIVE_USERS_PALETTE.wau,
+                "transition-opacity",
+                isDimmed("wau") && "opacity-25"
+              )}
               stroke="currentColor"
               dot={false}
+              activeDot={lineActiveDot("wau")}
+              isAnimationActive={false}
+              {...hoverHandlers("wau")}
             />
             <Line
               type={getLineType(period)}
               strokeWidth={2}
               dataKey="mau"
               name="MAU"
-              className={ACTIVE_USERS_PALETTE.mau}
+              className={cn(
+                ACTIVE_USERS_PALETTE.mau,
+                "transition-opacity",
+                isDimmed("mau") && "opacity-25"
+              )}
               stroke="currentColor"
               dot={false}
+              activeDot={lineActiveDot("mau")}
+              isAnimationActive={false}
+              {...hoverHandlers("mau")}
             />
           </>
         )}

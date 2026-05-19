@@ -3,7 +3,9 @@ import { ConversationModel } from "@app/lib/models/agent/conversation";
 import { SkillConfigurationModel } from "@app/lib/models/skill";
 import { SkillSuggestionModel } from "@app/lib/models/skill/skill_suggestion";
 import { BaseResource } from "@app/lib/resources/base_resource";
+import { ConversationResource } from "@app/lib/resources/conversation_resource";
 import { SkillResource } from "@app/lib/resources/skill/skill_resource";
+import { UserModel } from "@app/lib/resources/storage/models/user";
 import type { ReadonlyAttributesType } from "@app/lib/resources/storage/types";
 import { getResourceIdFromSId, makeSId } from "@app/lib/resources/string_ids";
 import type { ResourceFindOptions } from "@app/lib/resources/types";
@@ -16,6 +18,7 @@ import type {
   SkillSuggestionSource,
   SkillSuggestionState,
   SkillSuggestionType,
+  SkillSuggestionUpdatedBy,
 } from "@app/types/suggestions/skill_suggestion";
 import { parseSkillSuggestionData } from "@app/types/suggestions/skill_suggestion";
 import type {
@@ -42,19 +45,24 @@ export class SkillSuggestionResource extends BaseResource<SkillSuggestionModel> 
 
   readonly editorsGroupId: ModelId | null;
   readonly skillConfigurationSId: string;
-  readonly sourceConversationSId: string | null;
+  readonly updatedBy: SkillSuggestionUpdatedBy | null;
+  readonly notificationConversationId: string | null;
 
+  // Populated by baseFetch after conversation access filtering.
+  visibleConversationIds: string[] = [];
   constructor(
     model: ModelStatic<SkillSuggestionModel>,
     blob: Attributes<SkillSuggestionModel>,
     editorsGroupId: ModelId | null,
     skillConfigurationSId: string,
-    sourceConversationSId: string | null
+    updatedBy: SkillSuggestionUpdatedBy | null,
+    notificationConversationId: string | null
   ) {
     super(SkillSuggestionModel, blob);
     this.editorsGroupId = editorsGroupId;
     this.skillConfigurationSId = skillConfigurationSId;
-    this.sourceConversationSId = sourceConversationSId;
+    this.updatedBy = updatedBy;
+    this.notificationConversationId = notificationConversationId;
   }
 
   /**
@@ -95,15 +103,22 @@ export class SkillSuggestionResource extends BaseResource<SkillSuggestionModel> 
       suggestion.get(),
       skill.editorGroup?.id ?? null,
       skill.sId,
+      null,
       null
     );
   }
 
   private static async baseFetch(
     auth: Authenticator,
-    options?: ResourceFindOptions<SkillSuggestionModel>
+    options?: ResourceFindOptions<SkillSuggestionModel> & {
+      dangerouslyBypassConversationsVisibilityCheck?: boolean;
+    }
   ) {
-    const { where, ...otherOptions } = options ?? {};
+    const {
+      where,
+      dangerouslyBypassConversationsVisibilityCheck,
+      ...otherOptions
+    } = options ?? {};
     const owner = auth.getNonNullableWorkspace();
 
     const suggestions = await SkillSuggestionModel.findAll({
@@ -118,8 +133,14 @@ export class SkillSuggestionResource extends BaseResource<SkillSuggestionModel> 
           required: true,
         },
         {
+          model: UserModel,
+          as: "updatedByUser",
+          required: false,
+          attributes: ["sId", "firstName", "lastName", "email"],
+        },
+        {
           model: ConversationModel,
-          as: "sourceConversation",
+          as: "notificationConversation",
           required: false,
           attributes: ["sId"],
         },
@@ -146,7 +167,7 @@ export class SkillSuggestionResource extends BaseResource<SkillSuggestionModel> 
     );
 
     // Filter suggestions to only include those for skills the user can edit.
-    return removeNulls(
+    const resources = removeNulls(
       suggestions.map((suggestion) => {
         const skillResource = skillResourceByModelId.get(
           suggestion.skillConfigurationId
@@ -154,33 +175,84 @@ export class SkillSuggestionResource extends BaseResource<SkillSuggestionModel> 
         if (!skillResource || !skillResource.canWrite(auth)) {
           return null;
         }
+        const user = suggestion.updatedByUser;
+        const updatedBy = user
+          ? {
+              sId: user.sId,
+              fullName: [user.firstName, user.lastName]
+                .filter(Boolean)
+                .join(" "),
+              email: user.email,
+            }
+          : null;
         return new this(
           SkillSuggestionModel,
           suggestion.get(),
           skillResource.editorGroup?.id ?? null,
           skillResource.sId,
-          suggestion.sourceConversation?.sId ?? null
+          updatedBy,
+          suggestion.notificationConversation?.sId ?? null
         );
       })
     );
+
+    // Enrich resources with visible source conversation IDs.
+    const allConversationModelIds = [
+      ...new Set(
+        resources.flatMap((r) => r.sourceConversationIds ?? []).map(Number)
+      ),
+    ];
+
+    if (allConversationModelIds.length > 0) {
+      const allConversations = await ConversationResource.fetchByModelIds(
+        auth,
+        allConversationModelIds
+      );
+
+      const visibleConversations = dangerouslyBypassConversationsVisibilityCheck
+        ? allConversations
+        : await ConversationResource.filterVisibleConversations(
+            auth,
+            allConversations
+          );
+
+      const visibleMap = new Map(
+        visibleConversations.map((c) => [c.id, c.sId])
+      );
+
+      for (const resource of resources) {
+        const sourceModelIds = (resource.sourceConversationIds ?? []).map(
+          Number
+        );
+        resource.visibleConversationIds = removeNulls(
+          sourceModelIds.map((id) => visibleMap.get(id))
+        );
+      }
+    }
+
+    return resources;
   }
 
   static async fetchByIds(
     auth: Authenticator,
-    ids: string[]
+    ids: string[],
+    options?: { dangerouslyBypassConversationsVisibilityCheck?: boolean }
   ): Promise<SkillSuggestionResource[]> {
     return this.baseFetch(auth, {
       where: {
         id: removeNulls(ids.map(getResourceIdFromSId)),
       },
+      dangerouslyBypassConversationsVisibilityCheck:
+        options?.dangerouslyBypassConversationsVisibilityCheck,
     });
   }
 
   static async fetchById(
     auth: Authenticator,
-    id: string
+    id: string,
+    options?: { dangerouslyBypassConversationsVisibilityCheck?: boolean }
   ): Promise<SkillSuggestionResource | null> {
-    const [suggestion] = await this.fetchByIds(auth, [id]);
+    const [suggestion] = await this.fetchByIds(auth, [id], options);
     return suggestion ?? null;
   }
 
@@ -196,6 +268,7 @@ export class SkillSuggestionResource extends BaseResource<SkillSuggestionModel> 
       sources?: SkillSuggestionSource[];
       kind?: SkillSuggestionKind;
       limit?: number;
+      dangerouslyBypassConversationsVisibilityCheck?: boolean;
     }
   ): Promise<SkillSuggestionResource[]> {
     const skillModelId = getResourceIdFromSId(skillId);
@@ -226,6 +299,8 @@ export class SkillSuggestionResource extends BaseResource<SkillSuggestionModel> 
         ["id", "DESC"],
       ],
       limit: filters?.limit,
+      dangerouslyBypassConversationsVisibilityCheck:
+        filters?.dangerouslyBypassConversationsVisibilityCheck,
     });
   }
 
@@ -240,6 +315,7 @@ export class SkillSuggestionResource extends BaseResource<SkillSuggestionModel> 
       kind?: SkillSuggestionKind;
       limit?: number;
       createdAfter?: Date;
+      dangerouslyBypassConversationsVisibilityCheck?: boolean;
     }
   ): Promise<SkillSuggestionResource[]> {
     const sourceFilter =
@@ -264,7 +340,34 @@ export class SkillSuggestionResource extends BaseResource<SkillSuggestionModel> 
         ["id", "DESC"],
       ],
       limit: filters?.limit,
+      dangerouslyBypassConversationsVisibilityCheck:
+        filters?.dangerouslyBypassConversationsVisibilityCheck,
     });
+  }
+
+  /**
+   * Sets the notification conversation on every given suggestion. Used after
+   * creating the reinforcement notification conversation to link back from each
+   * suggestion that was surfaced in it.
+   */
+  static async bulkSetNotificationConversation(
+    auth: Authenticator,
+    suggestions: SkillSuggestionResource[],
+    notificationConversationModelId: ModelId
+  ): Promise<void> {
+    if (suggestions.length === 0) {
+      return;
+    }
+
+    await this.model.update(
+      { notificationConversationModelId: notificationConversationModelId },
+      {
+        where: {
+          workspaceId: auth.getNonNullableWorkspace().id,
+          id: { [Op.in]: suggestions.map((s) => s.id) },
+        },
+      }
+    );
   }
 
   static async bulkUpdateState(
@@ -276,15 +379,23 @@ export class SkillSuggestionResource extends BaseResource<SkillSuggestionModel> 
       return;
     }
 
-    await this.model.update(
-      { state },
-      {
-        where: {
-          workspaceId: auth.getNonNullableWorkspace().id,
-          id: { [Op.in]: suggestions.map((s) => s.id) },
-        },
+    // Track the user who accepted/rejected. Do not set for "outdated"
+    // (suggestion became obsolete) or "pending" (reset).
+    const updates: { state: SkillSuggestionState; updatedByUserId?: ModelId } =
+      { state };
+    if (state === "approved" || state === "rejected") {
+      const user = auth.user();
+      if (user) {
+        updates.updatedByUserId = user.id;
       }
-    );
+    }
+
+    await this.model.update(updates, {
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+        id: { [Op.in]: suggestions.map((s) => s.id) },
+      },
+    });
   }
 
   async delete(auth: Authenticator): Promise<Result<undefined, Error>> {
@@ -397,9 +508,13 @@ export class SkillSuggestionResource extends BaseResource<SkillSuggestionModel> 
       updatedAt: this.updatedAt.getTime(),
       skillConfigurationId: this.skillConfigurationSId,
       analysis: this.analysis,
+      title: this.title,
       state: this.state,
       source: this.source,
-      sourceConversationId: this.sourceConversationSId,
+      sourceConversationsCount: this.sourceConversationIds?.length ?? 0,
+      visibleSourceConversationIds: this.visibleConversationIds,
+      notificationConversationId: this.notificationConversationId,
+      updatedBy: this.updatedBy,
       ...suggestionData,
     };
   }

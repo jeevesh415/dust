@@ -8,9 +8,16 @@ import {
   PartnerIdealPartners,
   PartnerSocialProof,
 } from "@app/components/home/PartnerHero";
+import { Button } from "@dust-tt/sparkle";
 import type { GetStaticProps } from "next";
 import { useRouter } from "next/router";
 import type { ReactElement } from "react";
+
+// Temporarily route partner sign-ups to a HubSpot-hosted form while we fix
+// tracking on the embedded PartnerForm. Flip back to true once resolved.
+const SHOW_PARTNER_FORM = false;
+const PARTNER_HUBSPOT_FORM_URL =
+  "https://share-eu1.hsforms.com/2FctvfmFxRQqllduT_JmlTA2dzwm3";
 
 export const getStaticProps: GetStaticProps = async () => {
   return {
@@ -32,7 +39,7 @@ export default function Partner() {
         description="Partner with Dust to help businesses deploy AI agents. Join our network of resellers, implementation partners, and technology partners."
         pathname={router.asPath}
       />
-      <div className="flex w-full flex-col justify-center gap-12">
+      <div className="flex w-full flex-col justify-center gap-12 pb-24">
         <PartnerHero />
         <Grid>
           <div className="col-span-12 sm:col-span-12 md:col-span-12 lg:col-span-8 lg:col-start-2 xl:col-span-8 xl:col-start-2 2xl:col-start-3">
@@ -46,7 +53,17 @@ export default function Partner() {
                 soon as we&apos;re ready to explore a partnership with you.
               </P>
             </div>
-            <PartnerForm />
+            {SHOW_PARTNER_FORM ? (
+              <PartnerForm />
+            ) : (
+              <a
+                href={PARTNER_HUBSPOT_FORM_URL}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                <Button variant="highlight" size="md" label="Register here" />
+              </a>
+            )}
           </div>
         </Grid>
         <PartnerSocialProof />

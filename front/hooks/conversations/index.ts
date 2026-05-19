@@ -7,6 +7,7 @@ export { useConversation } from "./useConversation";
 export { useConversationBranchActions } from "./useConversationBranchActions";
 export { useConversationContextUsage } from "./useConversationContextUsage";
 export { useConversationFeedbacks } from "./useConversationFeedbacks";
+export { useConversationFileContent } from "./useConversationFileContent";
 export { useConversationMarkAsRead } from "./useConversationMarkAsRead";
 export {
   useConversationMessage,
@@ -28,6 +29,8 @@ export {
   useAddDeleteConversationTool,
   useConversationTools,
 } from "./useConversationTools";
+export { useConversationUrlAccessMode } from "./useConversationUrlAccessMode";
+export { useOpenConversationBranch } from "./useOpenConversationBranch";
 export { usePostOnboardingFollowUp } from "./usePostOnboardingFollowUp";
 export { useSearchPrivateConversations } from "./useSearchPrivateConversations";
 export { useSearchProjectConversations } from "./useSearchProjectConversations";

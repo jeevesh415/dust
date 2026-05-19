@@ -26,6 +26,7 @@ import logger from "@app/logger/logger";
 import { terminateAllAgentLoopWorkflowsForConversation } from "@app/temporal/agent_loop/terminate";
 import { MODEL_PROVIDER_IDS } from "@app/types/assistant/models/providers";
 import type { EmbeddingProviderIdType } from "@app/types/assistant/models/types";
+import type { WorkspacePoolCreditState } from "@app/types/credits";
 import type { ModelId } from "@app/types/shared/model_id";
 import type { Result } from "@app/types/shared/result";
 import { Err, Ok } from "@app/types/shared/result";
@@ -63,6 +64,7 @@ type CachedWorkspaceData = {
   description: string | null;
   segmentation: WorkspaceSegmentationType | null;
   ssoEnforced: boolean;
+  regionalModelsOnly: boolean;
   workOSOrganizationId: string | null;
   whiteListedProviders: ModelProviderIdType[] | null;
   defaultEmbeddingProvider: EmbeddingProviderIdType | null;
@@ -70,6 +72,7 @@ type CachedWorkspaceData = {
   sharingPolicy: WorkspaceSharingPolicy;
   conversationsRetentionDays: number | null;
   metronomeCustomerId: string | null;
+  poolCreditState: WorkspacePoolCreditState;
   createdAt: number;
   updatedAt: number;
 };
@@ -192,6 +195,7 @@ export class WorkspaceResource extends BaseResource<WorkspaceModel> {
       description: workspace.description,
       segmentation: workspace.segmentation,
       ssoEnforced: workspace.ssoEnforced ?? false,
+      regionalModelsOnly: workspace.regionalModelsOnly,
       workOSOrganizationId: workspace.workOSOrganizationId,
       whiteListedProviders: whiteListedProviders,
       defaultEmbeddingProvider: workspace.defaultEmbeddingProvider,
@@ -199,6 +203,7 @@ export class WorkspaceResource extends BaseResource<WorkspaceModel> {
       sharingPolicy: workspace.sharingPolicy,
       conversationsRetentionDays: workspace.conversationsRetentionDays,
       metronomeCustomerId: workspace.metronomeCustomerId ?? null,
+      poolCreditState: workspace.poolCreditState,
       createdAt: workspace.createdAt.getTime(),
       updatedAt: workspace.updatedAt.getTime(),
     };
@@ -232,6 +237,7 @@ export class WorkspaceResource extends BaseResource<WorkspaceModel> {
       description: data.description,
       segmentation: data.segmentation,
       ssoEnforced: data.ssoEnforced,
+      regionalModelsOnly: data.regionalModelsOnly,
       workOSOrganizationId: data.workOSOrganizationId,
       whiteListedProviders: data.whiteListedProviders,
       defaultEmbeddingProvider: data.defaultEmbeddingProvider,
@@ -239,6 +245,7 @@ export class WorkspaceResource extends BaseResource<WorkspaceModel> {
       sharingPolicy: data.sharingPolicy,
       conversationsRetentionDays: data.conversationsRetentionDays,
       metronomeCustomerId: data.metronomeCustomerId ?? null,
+      poolCreditState: data.poolCreditState,
       createdAt: new Date(data.createdAt),
       updatedAt: new Date(data.updatedAt),
     };
@@ -311,15 +318,6 @@ export class WorkspaceResource extends BaseResource<WorkspaceModel> {
   static async fetchByName(name: string): Promise<WorkspaceResource | null> {
     const workspace = await this.model.findOne({
       where: { name },
-    });
-    return workspace ? new this(this.model, workspace.get()) : null;
-  }
-
-  static async fetchByMetronomeCustomerId(
-    metronomeCustomerId: string
-  ): Promise<WorkspaceResource | null> {
-    const workspace = await this.model.findOne({
-      where: { metronomeCustomerId },
     });
     return workspace ? new this(this.model, workspace.get()) : null;
   }
@@ -409,6 +407,15 @@ export class WorkspaceResource extends BaseResource<WorkspaceModel> {
     return result?.domainInfo.domainAutoJoinEnabled ?? false;
   }
 
+  static async fetchByMetronomeCustomerId(
+    metronomeCustomerId: string
+  ): Promise<WorkspaceResource | null> {
+    const workspace = await this.model.findOne({
+      where: { metronomeCustomerId },
+    });
+    return workspace ? new this(this.model, workspace.get()) : null;
+  }
+
   static async fetchByWorkOSOrganizationId(
     workOSOrganizationId: string
   ): Promise<WorkspaceResource | null> {
@@ -449,12 +456,20 @@ export class WorkspaceResource extends BaseResource<WorkspaceModel> {
     return this.update({ segmentation });
   }
 
+  async updatePoolCreditState(
+    poolCreditState: WorkspacePoolCreditState,
+    transaction?: Transaction
+  ): Promise<void> {
+    await this.update({ poolCreditState }, transaction);
+  }
+
   async updateWorkspaceSettings(
     updateableAttributes: Partial<
       Pick<
         CreationAttributes<WorkspaceModel>,
         | "name"
         | "ssoEnforced"
+        | "regionalModelsOnly"
         | "whiteListedProviders"
         | "defaultEmbeddingProvider"
         | "workOSOrganizationId"

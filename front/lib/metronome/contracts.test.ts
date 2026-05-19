@@ -2,21 +2,86 @@ import type { EnterprisePricingCents } from "@app/lib/metronome/contracts";
 import {
   buildEnterpriseOverrides,
   extractEnterprisePricing,
+  provisionMetronomeContract,
+  resolveCurrencyForExistingMetronomeCustomer,
 } from "@app/lib/metronome/contracts";
+import { Err, Ok } from "@app/types/shared/result";
+import type { LightWorkspaceType } from "@app/types/user";
 import type Stripe from "stripe";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
-// ---------------------------------------------------------------------------
-// Mocks
-// ---------------------------------------------------------------------------
-
-const { mockPrices } = vi.hoisted(() => {
+const {
+  mockCreateMetronomeContract,
+  mockCreateMetronomeCustomer,
+  mockFindMetronomeCustomerByAlias,
+  mockGetMetronomeContractById,
+  mockGetMetronomeCustomerStripeCustomerId,
+  mockHasContractSeatSubscription,
+  mockGetStripeCustomer,
+  mockGetStripeSubscription,
+  mockHasMauSubscriptionInContract,
+  mockListMetronomeContracts,
+  mockPrices,
+  mockScheduleMetronomeContractEnd,
+  mockSyncMauCount,
+  mockSyncSeatCount,
+} = vi.hoisted(() => {
   const mockPrices = { retrieve: vi.fn() };
-  return { mockPrices };
+
+  return {
+    mockCreateMetronomeContract: vi.fn(),
+    mockCreateMetronomeCustomer: vi.fn(),
+    mockFindMetronomeCustomerByAlias: vi.fn(),
+    mockGetMetronomeContractById: vi.fn(),
+    mockGetMetronomeCustomerStripeCustomerId: vi.fn(),
+    mockHasContractSeatSubscription: vi.fn(),
+    mockGetStripeCustomer: vi.fn(),
+    mockGetStripeSubscription: vi.fn(),
+    mockHasMauSubscriptionInContract: vi.fn(),
+    mockListMetronomeContracts: vi.fn(),
+    mockPrices,
+    mockScheduleMetronomeContractEnd: vi.fn(),
+    mockSyncMauCount: vi.fn(),
+    mockSyncSeatCount: vi.fn(),
+  };
 });
+
+vi.mock("@app/lib/metronome/client", () => ({
+  ceilToHourISO: (date: Date) => date.toISOString(),
+  floorToHourISO: (date: Date) => date.toISOString(),
+  createMetronomeContract: mockCreateMetronomeContract,
+  createMetronomeCustomer: mockCreateMetronomeCustomer,
+  epochSecondsToFloorHourISO: vi.fn(),
+  findMetronomeCustomerByAlias: mockFindMetronomeCustomerByAlias,
+  getMetronomeClient: vi.fn(),
+  getMetronomeContractById: mockGetMetronomeContractById,
+  getMetronomeCustomerStripeCustomerId:
+    mockGetMetronomeCustomerStripeCustomerId,
+  listMetronomeContracts: mockListMetronomeContracts,
+  scheduleMetronomeContractEnd: mockScheduleMetronomeContractEnd,
+}));
+
+vi.mock("@app/lib/metronome/mau_sync", async () => {
+  const actual = await vi.importActual<
+    typeof import("@app/lib/metronome/mau_sync")
+  >("@app/lib/metronome/mau_sync");
+
+  return {
+    ...actual,
+    hasMauSubscriptionInContract: mockHasMauSubscriptionInContract,
+    syncMauCount: mockSyncMauCount,
+  };
+});
+
+vi.mock("@app/lib/metronome/seats", () => ({
+  hasContractSeatSubscription: mockHasContractSeatSubscription,
+  syncSeatCount: mockSyncSeatCount,
+}));
 
 vi.mock("@app/lib/plans/stripe", () => ({
   getStripeClient: () => ({ prices: mockPrices }),
+  getStripeCustomer: mockGetStripeCustomer,
+  getStripeSubscription: mockGetStripeSubscription,
 }));
 
 vi.mock("@app/lib/metronome/constants", () => ({
@@ -43,9 +108,57 @@ const noopLogger = {
   error: vi.fn(),
 } as any;
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+const WORKSPACE = {
+  id: 42,
+  sId: "w_123",
+  name: "Workspace",
+} as LightWorkspaceType;
+
+const CONTRACT = {
+  id: "m-contract",
+  subscriptions: [],
+};
+
+beforeEach(() => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date(START_DATE));
+
+  mockPrices.retrieve.mockReset();
+
+  mockFindMetronomeCustomerByAlias.mockReset();
+  mockFindMetronomeCustomerByAlias.mockResolvedValue(new Ok("m-customer"));
+
+  mockCreateMetronomeCustomer.mockReset();
+  mockCreateMetronomeCustomer.mockResolvedValue(
+    new Ok({ metronomeCustomerId: "m-customer" })
+  );
+
+  mockCreateMetronomeContract.mockReset();
+  mockCreateMetronomeContract.mockResolvedValue(
+    new Ok({ contractId: "m-contract" })
+  );
+
+  mockScheduleMetronomeContractEnd.mockReset();
+  mockScheduleMetronomeContractEnd.mockResolvedValue(new Ok(undefined));
+
+  mockListMetronomeContracts.mockReset();
+  mockListMetronomeContracts.mockResolvedValue(new Ok([]));
+
+  mockGetMetronomeContractById.mockReset();
+  mockGetMetronomeContractById.mockResolvedValue(new Ok(CONTRACT));
+
+  mockHasContractSeatSubscription.mockReset();
+  mockHasContractSeatSubscription.mockReturnValue(true);
+
+  mockHasMauSubscriptionInContract.mockReset();
+  mockHasMauSubscriptionInContract.mockReturnValue(true);
+
+  mockSyncSeatCount.mockReset();
+  mockSyncSeatCount.mockResolvedValue(new Ok(undefined));
+
+  mockSyncMauCount.mockReset();
+  mockSyncMauCount.mockResolvedValue(new Ok(undefined));
+});
 
 function makeSubscription(
   items: Array<{
@@ -82,10 +195,6 @@ function findOverride(
       o.override_specifiers?.some((s) => s.product_id === productId)
   );
 }
-
-// ---------------------------------------------------------------------------
-// extractEnterprisePricing
-// ---------------------------------------------------------------------------
 
 describe("extractEnterprisePricing", () => {
   it("extracts FIXED pricing", async () => {
@@ -278,10 +387,6 @@ describe("extractEnterprisePricing", () => {
     expect(result).toBeUndefined();
   });
 });
-
-// ---------------------------------------------------------------------------
-// buildEnterpriseOverrides
-// ---------------------------------------------------------------------------
 
 describe("buildEnterpriseOverrides", () => {
   it("FIXED: disables all MAU and tier products", () => {
@@ -561,5 +666,302 @@ describe("buildEnterpriseOverrides", () => {
 
     expect(result.recurring_commits![0].access_amount.unit_price).toBe(325000);
     expect(result.custom_fields?.MAU_TIERS).toBe("FLOOR-101-201");
+  });
+});
+
+describe("provisionMetronomeContract", () => {
+  it("syncs seats and MAU when the contract has both subscriptions", async () => {
+    const result = await provisionMetronomeContract({
+      metronomeCustomerId: "m-customer",
+      workspace: WORKSPACE,
+      packageAlias: "legacy-pro-monthly",
+      uniquenessKey: "uniq_123",
+      startingAt: new Date(START_DATE),
+      planCode: "PRO_PLAN_SEAT_29",
+    });
+
+    expect(result.isOk()).toBe(true);
+    expect(mockGetMetronomeContractById).toHaveBeenCalledWith({
+      metronomeCustomerId: "m-customer",
+      metronomeContractId: "m-contract",
+    });
+    expect(mockHasContractSeatSubscription).toHaveBeenCalledWith(CONTRACT);
+    expect(mockHasMauSubscriptionInContract).toHaveBeenCalledWith(CONTRACT);
+    expect(mockSyncSeatCount).toHaveBeenCalledTimes(1);
+    expect(mockSyncSeatCount).toHaveBeenCalledWith({
+      metronomeCustomerId: "m-customer",
+      contractId: "m-contract",
+      workspace: WORKSPACE,
+      startingAt: START_DATE,
+      contract: CONTRACT,
+    });
+    expect(mockSyncMauCount).toHaveBeenCalledTimes(1);
+    expect(mockSyncMauCount).toHaveBeenCalledWith({
+      metronomeCustomerId: "m-customer",
+      contractId: "m-contract",
+      workspace: WORKSPACE,
+      startingAt: START_DATE,
+      contract: CONTRACT,
+    });
+  });
+
+  it("skips seat sync when the contract has no seat subscription", async () => {
+    mockHasContractSeatSubscription.mockReturnValue(false);
+
+    const result = await provisionMetronomeContract({
+      metronomeCustomerId: "m-customer",
+      workspace: WORKSPACE,
+      packageAlias: "legacy-enterprise",
+      uniquenessKey: "uniq_123",
+      startingAt: new Date(START_DATE),
+      planCode: "PRO_PLAN_SEAT_29",
+    });
+
+    expect(result.isOk()).toBe(true);
+    expect(mockSyncSeatCount).not.toHaveBeenCalled();
+    expect(mockSyncMauCount).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips MAU sync when the contract has no MAU subscription", async () => {
+    mockHasMauSubscriptionInContract.mockReturnValue(false);
+
+    const result = await provisionMetronomeContract({
+      metronomeCustomerId: "m-customer",
+      workspace: WORKSPACE,
+      packageAlias: "legacy-pro-monthly",
+      uniquenessKey: "uniq_123",
+      startingAt: new Date(START_DATE),
+      planCode: "PRO_PLAN_SEAT_29",
+    });
+
+    expect(result.isOk()).toBe(true);
+    expect(mockSyncSeatCount).toHaveBeenCalledTimes(1);
+    expect(mockSyncMauCount).not.toHaveBeenCalled();
+  });
+});
+
+describe("provisionMetronomeContract — overlap sunset", () => {
+  it("ends non-archived contracts that overlap with the new start", async () => {
+    mockListMetronomeContracts.mockResolvedValue(
+      new Ok([
+        // overlaps — starts before, no end
+        {
+          id: "overlap-1",
+          starting_at: "2026-03-01T00:00:00.000Z",
+          ending_before: null,
+          archived_at: null,
+        },
+        // starts AFTER the new start — skipped
+        {
+          id: "future",
+          starting_at: "2026-05-01T00:00:00.000Z",
+          ending_before: null,
+          archived_at: null,
+        },
+        // ended BEFORE the new start — skipped
+        {
+          id: "ended",
+          starting_at: "2026-03-01T00:00:00.000Z",
+          ending_before: "2026-03-15T00:00:00.000Z",
+          archived_at: null,
+        },
+        // archived — skipped
+        {
+          id: "archived",
+          starting_at: "2026-03-01T00:00:00.000Z",
+          ending_before: null,
+          archived_at: "2026-03-10T00:00:00.000Z",
+        },
+        // the newly-created contract — skipped by id
+        {
+          id: "m-contract",
+          starting_at: START_DATE,
+          ending_before: null,
+          archived_at: null,
+        },
+      ])
+    );
+
+    const result = await provisionMetronomeContract({
+      metronomeCustomerId: "m-customer",
+      workspace: WORKSPACE,
+      packageAlias: "legacy-pro-monthly",
+      uniquenessKey: "uniq_123",
+      startingAt: new Date(START_DATE),
+      planCode: "PRO_PLAN_SEAT_29",
+    });
+
+    expect(result.isOk()).toBe(true);
+    expect(mockScheduleMetronomeContractEnd).toHaveBeenCalledTimes(1);
+    expect(mockScheduleMetronomeContractEnd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        metronomeCustomerId: "m-customer",
+        contractId: "overlap-1",
+      })
+    );
+  });
+
+  it("returns an error when listing contracts fails", async () => {
+    mockListMetronomeContracts.mockResolvedValue(
+      new Err(new Error("list failed"))
+    );
+
+    const result = await provisionMetronomeContract({
+      metronomeCustomerId: "m-customer",
+      workspace: WORKSPACE,
+      packageAlias: "legacy-pro-monthly",
+      uniquenessKey: "uniq_123",
+      startingAt: new Date(START_DATE),
+      planCode: "PRO_PLAN_SEAT_29",
+    });
+
+    expect(result.isErr()).toBe(true);
+    if (result.isOk()) {
+      throw new Error("expected error");
+    }
+    expect(result.error.message).toContain("failed to list");
+  });
+});
+
+describe("resolveCurrencyForExistingMetronomeCustomer", () => {
+  beforeEach(() => {
+    mockGetStripeSubscription.mockReset();
+    mockGetStripeCustomer.mockReset();
+    mockGetMetronomeCustomerStripeCustomerId.mockReset();
+  });
+
+  it("uses the Stripe subscription currency on the Stripe-billed path", async () => {
+    mockGetStripeSubscription.mockResolvedValue({ currency: "eur" });
+
+    const result = await resolveCurrencyForExistingMetronomeCustomer({
+      metronomeCustomerId: "cust_1",
+      stripeSubscriptionId: "sub_1",
+    });
+
+    expect(result.isOk()).toBe(true);
+    if (result.isErr()) {
+      throw result.error;
+    }
+    expect(result.value).toBe("eur");
+    expect(mockGetMetronomeCustomerStripeCustomerId).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the Metronome-linked Stripe customer when no sub", async () => {
+    mockGetMetronomeCustomerStripeCustomerId.mockResolvedValue(
+      new Ok("cus_eu")
+    );
+    mockGetStripeCustomer.mockResolvedValue({
+      currency: "eur",
+      address: null,
+    });
+
+    const result = await resolveCurrencyForExistingMetronomeCustomer({
+      metronomeCustomerId: "cust_1",
+      stripeSubscriptionId: null,
+    });
+
+    expect(result.isOk()).toBe(true);
+    if (result.isErr()) {
+      throw result.error;
+    }
+    expect(result.value).toBe("eur");
+    expect(mockGetStripeSubscription).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the customer's address country when currency is unset", async () => {
+    mockGetMetronomeCustomerStripeCustomerId.mockResolvedValue(
+      new Ok("cus_fr")
+    );
+    mockGetStripeCustomer.mockResolvedValue({
+      currency: null,
+      address: { country: "FR" },
+    });
+
+    const result = await resolveCurrencyForExistingMetronomeCustomer({
+      metronomeCustomerId: "cust_1",
+      stripeSubscriptionId: null,
+    });
+
+    expect(result.isOk()).toBe(true);
+    if (result.isErr()) {
+      throw result.error;
+    }
+    expect(result.value).toBe("eur");
+  });
+
+  it("returns an error when no Stripe sub and Metronome has no Stripe billing config", async () => {
+    mockGetMetronomeCustomerStripeCustomerId.mockResolvedValue(new Ok(null));
+
+    const result = await resolveCurrencyForExistingMetronomeCustomer({
+      metronomeCustomerId: "cust_1",
+      stripeSubscriptionId: null,
+    });
+
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) {
+      expect(result.error.message).toContain("no Stripe billing config found");
+    }
+    expect(mockGetStripeCustomer).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the Metronome customer when getStripeSubscription returns null", async () => {
+    mockGetStripeSubscription.mockResolvedValue(null);
+    mockGetMetronomeCustomerStripeCustomerId.mockResolvedValue(
+      new Ok("cus_fr")
+    );
+    mockGetStripeCustomer.mockResolvedValue({
+      currency: null,
+      address: { country: "FR" },
+    });
+
+    const result = await resolveCurrencyForExistingMetronomeCustomer({
+      metronomeCustomerId: "cust_1",
+      stripeSubscriptionId: "sub_dead",
+    });
+
+    expect(result.isOk()).toBe(true);
+    if (result.isErr()) {
+      throw result.error;
+    }
+    expect(result.value).toBe("eur");
+    expect(mockGetMetronomeCustomerStripeCustomerId).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns an error when getMetronomeCustomerStripeCustomerId errs", async () => {
+    mockGetMetronomeCustomerStripeCustomerId.mockResolvedValue(
+      new Err(new Error("boom"))
+    );
+
+    const result = await resolveCurrencyForExistingMetronomeCustomer({
+      metronomeCustomerId: "cust_1",
+      stripeSubscriptionId: null,
+    });
+
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) {
+      expect(result.error.message).toContain(
+        "could not read Stripe billing config: boom"
+      );
+    }
+    expect(mockGetStripeCustomer).not.toHaveBeenCalled();
+  });
+
+  it("returns an error when the linked Stripe customer cannot be retrieved", async () => {
+    mockGetMetronomeCustomerStripeCustomerId.mockResolvedValue(
+      new Ok("cus_missing")
+    );
+    mockGetStripeCustomer.mockResolvedValue(null);
+
+    const result = await resolveCurrencyForExistingMetronomeCustomer({
+      metronomeCustomerId: "cust_1",
+      stripeSubscriptionId: null,
+    });
+
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) {
+      expect(result.error.message).toContain(
+        "Stripe customer cus_missing could not be retrieved"
+      );
+    }
   });
 });

@@ -1,4 +1,5 @@
 /** @ignoreswagger */
+// @migration-status: MIGRATED_TO_HONO
 import { getAgentConfiguration } from "@app/lib/api/assistant/configuration/agent";
 import { withSessionAuthenticationForWorkspace } from "@app/lib/api/auth_wrappers";
 import type { Authenticator } from "@app/lib/auth";
@@ -19,7 +20,6 @@ export const GetTriggersResponseBodySchema = z.object({
   triggers: z.array(
     FullTriggerSchema.and(
       z.object({
-        isSubscriber: z.boolean(),
         isEditor: z.boolean(),
         editorName: z.string().optional(),
       })
@@ -114,17 +114,14 @@ async function handler(
         editorUsers.map((user) => [user.id, user.fullName()])
       );
 
-      const triggersWithIsSubscriber = await Promise.all(
-        allTriggers.map(async (trigger) => ({
-          ...trigger.toJSON(),
-          isSubscriber: await trigger.isSubscriber(auth),
-          isEditor: trigger.editor === auth.getNonNullableUser().id,
-          editorName: editorNamesMap.get(trigger.editor),
-        }))
-      );
+      const triggers = allTriggers.map((trigger) => ({
+        ...trigger.toJSON(),
+        isEditor: trigger.editor === auth.getNonNullableUser().id,
+        editorName: editorNamesMap.get(trigger.editor),
+      }));
 
       return res.status(200).json({
-        triggers: triggersWithIsSubscriber,
+        triggers,
       });
     }
 

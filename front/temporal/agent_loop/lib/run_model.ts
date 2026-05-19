@@ -28,19 +28,24 @@ import {
 } from "@app/lib/api/assistant/global_agents/sidekick_context";
 import { getJITServers } from "@app/lib/api/assistant/jit_actions";
 import { listAttachments } from "@app/lib/api/assistant/jit_utils";
-import { isLegacyAgentConfiguration } from "@app/lib/api/assistant/legacy_agent";
 import { getCompletionDuration } from "@app/lib/api/assistant/messages";
 import { getSkillServers } from "@app/lib/api/assistant/skill_actions";
+import { renderEquippedSkillsUserMessage } from "@app/lib/api/assistant/skills_rendering";
+import {
+  buildAuditLogTarget,
+  emitAuditLogEventDirect,
+} from "@app/lib/api/audit/workos_audit";
 import { getLLM } from "@app/lib/api/llm";
 import type { LLMTraceContext } from "@app/lib/api/llm/traces/types";
 import {
   getByokUserFacingLLMErrorMessage,
   getUserFacingLLMErrorMessage,
+  LLM_ERROR_TYPE_TO_CATEGORY,
 } from "@app/lib/api/llm/types/errors";
 import { systemPromptToText } from "@app/lib/api/llm/types/options";
 import { DEFAULT_MCP_TOOL_RETRY_POLICY } from "@app/lib/api/mcp";
 import { getLlmCredentials } from "@app/lib/api/provider_credentials";
-import type { Authenticator } from "@app/lib/auth";
+import { type Authenticator, hasFeatureFlag } from "@app/lib/auth";
 import type { DurationRecorder } from "@app/lib/duration_recorder";
 import {
   AgentMessageContentParser,
@@ -52,6 +57,7 @@ import { AgentStepContentResource } from "@app/lib/resources/agent_step_content_
 import { ConversationResource } from "@app/lib/resources/conversation_resource";
 import { MCPServerViewResource } from "@app/lib/resources/mcp_server_view_resource";
 import { ProviderCredentialResource } from "@app/lib/resources/provider_credential_resource";
+import { constructProjectContext } from "@app/lib/resources/skill/code_defined/projects";
 import { SkillResource } from "@app/lib/resources/skill/skill_resource";
 import { SpaceResource } from "@app/lib/resources/space_resource";
 import { generateRandomModelSId } from "@app/lib/resources/string_ids_server";
@@ -79,6 +85,13 @@ import { removeNulls } from "@app/types/shared/utils/general";
 import { startActiveObservation } from "@langfuse/tracing";
 import { Context, heartbeat } from "@temporalio/activity";
 import assert from "assert";
+
+const ASK_USER_QUESTION_ALLOWED_ORIGINS: UserMessageOrigin[] = [
+  "web",
+  "slack",
+  "extension",
+  "agent_sidekick",
+];
 
 // Concatenate two content strings, ensuring at least one whitespace character
 // between them when both are non-empty. This prevents words from being glued
@@ -153,13 +166,6 @@ export async function runModel(
 
   localLogger.info("Starting multi-action loop iteration");
 
-  const isLegacyAgent = isLegacyAgentConfiguration(agentConfiguration);
-  if (isLegacyAgent && step !== 0) {
-    localLogger.warn("Legacy agent only supports step 0.");
-    // legacy agents stop after one step
-    return null;
-  }
-
   const model = getSupportedModelConfig(agentConfiguration.model);
 
   async function publishAgentError(
@@ -220,7 +226,9 @@ export async function runModel(
 
   const {
     enabledSkills,
+    systemSkills,
     equippedSkills,
+    renderSkillsAsUserMessages,
     hasConditionalJITTools,
     mcpActions,
     mcpToolsListingError,
@@ -241,12 +249,16 @@ export async function runModel(
         userMessage.context.clientSideMCPServerIds
       );
 
-    const { enabledSkills, equippedSkills } =
+    const { enabledSkills, systemSkills, equippedSkills } =
       await SkillResource.listForAgentLoop(auth, runAgentData);
+    const renderSkillsAsUserMessages = await hasFeatureFlag(
+      auth,
+      "skills_as_user_messages"
+    );
 
     const skillServers = await getSkillServers(auth, {
       agentConfiguration,
-      skills: enabledSkills,
+      skills: [...systemSkills, ...enabledSkills],
     });
 
     const {
@@ -269,6 +281,8 @@ export async function runModel(
       hasConditionalJITTools,
       enabledSkills,
       equippedSkills,
+      systemSkills,
+      renderSkillsAsUserMessages,
       mcpActions,
       mcpToolsListingError,
     };
@@ -284,10 +298,6 @@ export async function runModel(
   }
 
   // Filter out ask_user_question for origins that don't support interactive questions.
-  const ASK_USER_QUESTION_ALLOWED_ORIGINS: UserMessageOrigin[] = [
-    "web",
-    "slack",
-  ];
   const filteredMcpActions = !ASK_USER_QUESTION_ALLOWED_ORIGINS.includes(
     userMessage.context.origin
   )
@@ -365,6 +375,13 @@ export async function runModel(
     workspaceContext = await buildWorkspaceContext(auth);
   }
 
+  const projectContext = await constructProjectContext(auth, {
+    conversation,
+  });
+
+  const isNewFileExplorer = conversation.metadata?.useFileSystem === true;
+  const hasSandboxTools = await hasFeatureFlag(auth, "sandbox_tools");
+
   const prompt = constructPromptMultiActions(auth, {
     userMessage,
     agentConfiguration,
@@ -375,13 +392,21 @@ export async function runModel(
     agentsList,
     conversation,
     serverToolsAndInstructions: filteredMcpActions,
+    systemSkills,
     enabledSkills,
     equippedSkills,
+    renderSkillsAsUserMessages,
     memoriesContext,
     toolsetsContext,
     userContext,
     workspaceContext,
+    projectContext,
+    isNewFileExplorer,
+    hasSandboxTools,
   });
+  const leadingMessages = renderSkillsAsUserMessages
+    ? removeNulls([renderEquippedSkillsUserMessage(equippedSkills)])
+    : [];
 
   const specifications: AgentActionSpecification[] = [];
   for (const a of availableActions) {
@@ -411,6 +436,9 @@ export async function runModel(
           tools,
           allowedTokenCount: model.contextSize - model.generationTokensCount,
           agentConfiguration,
+          leadingMessages,
+          enabledSkills,
+          renderSkillsAsUserMessages,
         })
       )
   );
@@ -613,9 +641,37 @@ export async function runModel(
           isByokProviderId(model.providerId) &&
           (type === "authentication_error" || type === "permission_error")
         ) {
-          await ProviderCredentialResource.markAsUnhealthy(auth, {
-            providerId: model.providerId,
-          });
+          const invalidatedCredential =
+            await ProviderCredentialResource.markAsUnhealthy(auth, {
+              providerId: model.providerId,
+            });
+
+          if (invalidatedCredential) {
+            void emitAuditLogEventDirect({
+              workspace: auth.getNonNullableWorkspace(),
+              action: "credentials.invalidated",
+              actor: {
+                type: "system",
+                id: "byok_health_check",
+                name: "BYOK Health Check",
+              },
+              targets: [
+                buildAuditLogTarget(
+                  "workspace",
+                  auth.getNonNullableWorkspace()
+                ),
+                buildAuditLogTarget("credential", {
+                  sId: invalidatedCredential.sId,
+                  name: model.providerId,
+                }),
+              ],
+              context: { location: "internal" },
+              metadata: {
+                provider_id: model.providerId,
+                reason: "authentication_failed",
+              },
+            });
+          }
         }
 
         const errorMessage =
@@ -629,7 +685,9 @@ export async function runModel(
             {
               code: "multi_actions_error",
               message: errorMessage,
-              metadata: null,
+              metadata: {
+                category: LLM_ERROR_TYPE_TO_CATEGORY[type],
+              },
             },
             errorDustRunId
           );
@@ -710,6 +768,26 @@ export async function runModel(
         },
         "No content generated by the agent."
       );
+    }
+
+    // On the last step, if the model produced no textual content, it effectively
+    // ran out of iterations without finalizing an answer. Surface a retryable
+    // empty_content error.
+    if (isLastStep && !processedContent.length) {
+      await publishAgentError(
+        {
+          code: "max_step_reached",
+          message:
+            "This agent took too many steps to answer your query. " +
+            "Try narrowing down your question or breaking it into smaller parts.",
+          metadata: {
+            category: "empty_content",
+            errorTitle: "Too many steps",
+          },
+        },
+        dustRunId
+      );
+      return null;
     }
 
     const chainOfThought =
@@ -799,7 +877,10 @@ export async function runModel(
       code: "max_step_reached",
       message:
         "The agent reached the maximum number of steps. This error can be safely retried.",
-      metadata: null,
+      metadata: {
+        category: "empty_content",
+        errorTitle: "Too many steps",
+      },
     });
     return null;
   }

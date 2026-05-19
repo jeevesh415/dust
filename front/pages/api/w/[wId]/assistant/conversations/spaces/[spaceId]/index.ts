@@ -1,4 +1,5 @@
 /** @ignoreswagger */
+// @migration-status: MIGRATED_TO_HONO
 import { getLightConversation } from "@app/lib/api/assistant/conversation/fetch";
 import { withSessionAuthenticationForWorkspace } from "@app/lib/api/auth_wrappers";
 import { getPaginationParams } from "@app/lib/api/pagination";
@@ -12,10 +13,30 @@ import type { WithAPIErrorResponse } from "@app/types/error";
 import { isString, removeNulls } from "@app/types/shared/utils/general";
 import type { NextApiRequest, NextApiResponse } from "next";
 
+type SpaceConversationsFilter = "all" | "group" | "with_me";
+
+function getSpaceConversationsFilter(
+  filterQueryParam: string | string[] | undefined
+): SpaceConversationsFilter {
+  if (!isString(filterQueryParam)) {
+    return "all";
+  }
+
+  switch (filterQueryParam) {
+    case "all":
+    case "group":
+    case "with_me":
+      return filterQueryParam;
+    default:
+      return "all";
+  }
+}
+
 export type GetSpaceConversationsResponseBody = {
   conversations: LightConversationType[];
   hasMore: boolean;
   lastValue: string | null;
+  isEmpty: boolean;
 };
 
 async function handler(
@@ -25,7 +46,7 @@ async function handler(
 ): Promise<void> {
   switch (req.method) {
     case "GET": {
-      const { spaceId } = req.query;
+      const { spaceId, filter } = req.query;
 
       if (!isString(spaceId)) {
         return apiError(req, res, {
@@ -37,7 +58,7 @@ async function handler(
         });
       }
 
-      const paginationRes = getPaginationParams(req, {
+      const paginationRes = getPaginationParams(req.query, {
         defaultLimit: 20,
         defaultOrderColumn: "updatedAt",
         defaultOrderDirection: "desc",
@@ -55,6 +76,7 @@ async function handler(
       }
 
       const pagination = paginationRes.value;
+      const conversationFilter = getSpaceConversationsFilter(filter);
 
       // Fetch and verify space access
       const space = await SpaceResource.fetchById(auth, spaceId);
@@ -83,7 +105,22 @@ async function handler(
           lastValue: pagination.lastValue,
           orderDirection: pagination.orderDirection,
         },
+        filter: conversationFilter,
       });
+
+      const { conversations: allConversations } =
+        await ConversationResource.listConversationsInSpacePaginated(auth, {
+          spaceId,
+          options: {
+            excludeTest: true,
+          },
+          pagination: {
+            limit: 1,
+            orderDirection: pagination.orderDirection,
+          },
+          filter: "all",
+        });
+      const isEmpty = allConversations.length === 0;
 
       // Fetch full conversation details for the paginated results
       // We're doing N+1 queries here, very bad for scaling
@@ -100,6 +137,7 @@ async function handler(
         ),
         hasMore,
         lastValue,
+        isEmpty,
       });
     }
     default:

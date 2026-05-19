@@ -1,10 +1,15 @@
 // biome-ignore-all lint/plugin/noNextImports: Next.js-specific file
+import {
+  AnnouncementBanner,
+  BANNER_VISIBLE_AFTER_MS,
+} from "@app/components/home/AnnouncementBanner";
 import { A } from "@app/components/home/ContentComponents";
 import { FooterNavigation } from "@app/components/home/menu/FooterNavigation";
 import { MainNavigation } from "@app/components/home/menu/MainNavigation";
 import { MobileNavigation } from "@app/components/home/menu/MobileNavigation";
 import { OpenDustButton } from "@app/components/home/OpenDustButton";
 import { PromoBanner } from "@app/components/home/PromoBanner";
+import { PublicWebsiteLogo } from "@app/components/home/PublicWebsiteLogo";
 import ScrollingHeader from "@app/components/home/ScrollingHeader";
 import UTMButton from "@app/components/UTMButton";
 import { useStripUtmParams } from "@app/hooks/useStripUtmParams";
@@ -21,10 +26,10 @@ import { TRACKING_AREAS, withTracking } from "@app/lib/tracking";
 import { classNames, getFaviconPath } from "@app/lib/utils";
 import { getOrCreateAnonymousId } from "@app/lib/utils/anonymous_id";
 import { appendUTMParams } from "@app/lib/utils/utm";
-import { Button, cn, DustLogo } from "@dust-tt/sparkle";
-import { cva } from "class-variance-authority";
+import { Button, cn } from "@dust-tt/sparkle";
 import Head from "next/head";
 import Link from "next/link";
+import { useRouter } from "next/router";
 import Script from "next/script";
 import { useCallback, useEffect, useState } from "react";
 import { useCookies } from "react-cookie";
@@ -50,6 +55,18 @@ export default function LandingLayout({
     hideNavigation,
     fullWidth,
   } = pageProps;
+
+  const router = useRouter();
+  // Initialize from the timestamp so there's no layout shift on first render.
+  // ?preview_banner in the URL forces it on for pre-launch testing.
+  const [showBanner, setShowBanner] = useState(
+    () => Date.now() >= BANNER_VISIBLE_AFTER_MS
+  );
+  useEffect(() => {
+    if ("preview_banner" in router.query) {
+      setShowBanner(true);
+    }
+  }, [router.query]);
 
   useStripUtmParams();
 
@@ -140,75 +157,76 @@ export default function LandingLayout({
           </div>
         </div>
       ) : (
-        <ScrollingHeader>
-          <div className="flex h-full w-full items-center gap-4 px-6 xl:gap-10">
-            <div className="hidden h-[24px] w-[96px] xl:block">
-              <PublicWebsiteLogo />
-            </div>
-            <MobileNavigation />
-            <div className="block xl:hidden">
-              <PublicWebsiteLogo />
-            </div>
-            <MainNavigation />
-            <div className="flex flex-grow items-center justify-end gap-4">
-              {hasSession && (isAuthLoading || isAuthenticated) ? (
-                <OpenDustButton
-                  variant="highlight"
-                  size="sm"
-                  trackingArea={TRACKING_AREAS.NAVIGATION}
-                  trackingObject="go_to_app"
-                />
-              ) : (
-                <>
-                  <a
-                    href={appendUTMParams(
-                      `/api/workos/login?returnTo=${encodeURIComponent(postLoginReturnToUrl)}`
-                    )}
-                    onClick={withTracking(TRACKING_AREAS.NAVIGATION, "sign_in")}
-                    className="hidden xl:inline-flex h-9 w-max items-center justify-center rounded-md pl-4 pr-1 py-2 text-base font-medium font-sans text-primary-700 hover:text-primary-600 active:text-primary-800 transition-colors hover:underline hover:underline-offset-4"
-                  >
-                    Sign in
-                  </a>
-                  <Link href="/sign-up">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      label="Try for free"
-                      onClick={withTracking(
-                        TRACKING_AREAS.NAVIGATION,
-                        "sign_up"
-                      )}
-                    />
-                  </Link>
-                  <UTMButton
-                    href="/home/contact"
-                    className="hidden xs:inline-flex"
+        <>
+          <AnnouncementBanner show={showBanner} />
+          <ScrollingHeader hasBanner={showBanner}>
+            <div className="flex h-full w-full items-center gap-4 px-6 xl:gap-10">
+              <div className="hidden h-[24px] w-[96px] xl:block">
+                <PublicWebsiteLogo />
+              </div>
+              <MobileNavigation />
+              <div className="block xl:hidden">
+                <PublicWebsiteLogo />
+              </div>
+              <MainNavigation />
+              <div className="flex flex-grow items-center justify-end gap-4">
+                {hasSession && (isAuthLoading || isAuthenticated) ? (
+                  <OpenDustButton
                     variant="highlight"
                     size="sm"
-                    label="Contact sales"
-                    onClick={withTracking(
-                      TRACKING_AREAS.NAVIGATION,
-                      "contact_sales"
-                    )}
+                    trackingArea={TRACKING_AREAS.NAVIGATION}
+                    trackingObject="go_to_app"
                   />
-                </>
-              )}
+                ) : (
+                  <>
+                    <a
+                      href={appendUTMParams(
+                        `/api/workos/login?returnTo=${encodeURIComponent(postLoginReturnToUrl)}`
+                      )}
+                      onClick={withTracking(
+                        TRACKING_AREAS.NAVIGATION,
+                        "sign_in"
+                      )}
+                      className="hidden xl:inline-flex h-9 w-max items-center justify-center rounded-md pl-4 pr-1 py-2 text-base font-medium font-sans text-primary-700 hover:text-primary-600 active:text-primary-800 transition-colors hover:underline hover:underline-offset-4"
+                    >
+                      Sign in
+                    </a>
+                    <Link href="/sign-up">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        label="Try for free"
+                        onClick={withTracking(
+                          TRACKING_AREAS.NAVIGATION,
+                          "sign_up"
+                        )}
+                      />
+                    </Link>
+                    <UTMButton
+                      href="/home/contact"
+                      className="hidden xs:inline-flex"
+                      variant="highlight"
+                      size="sm"
+                      label="Contact sales"
+                      onClick={withTracking(
+                        TRACKING_AREAS.NAVIGATION,
+                        "contact_sales"
+                      )}
+                    />
+                  </>
+                )}
+              </div>
             </div>
-          </div>
-        </ScrollingHeader>
+          </ScrollingHeader>
+        </>
       )}
-      <div className="fixed bottom-0 left-0 right-0 top-0 -z-50" />
-      <div className="fixed inset-0 -z-30" />
-      {/* <div className="fixed bottom-0 left-0 right-0 top-0 -z-40 overflow-hidden transition duration-1000">
-        <Particles currentShape={currentShape} />
-      </div> */}
       <main className="z-10 flex w-full flex-col items-center">
         <div
           className={classNames(
             "flex w-full flex-col",
             fullWidth ? "" : "container",
-            "gap-6 px-6 pb-12 md:gap-24",
-            hideNavigation ? "pt-6" : "pt-24",
+            "gap-6 px-6 md:gap-24",
+            hideNavigation ? "pt-6" : showBanner ? "pt-[136px]" : "pt-[96px]",
             "xl:gap-16",
             "2xl:gap-24"
           )}
@@ -236,6 +254,14 @@ export default function LandingLayout({
               })(window,document,'script','dataLayer','${gtmTrackingId}');
             `}
           </Script>
+        )}
+        {cookieValue === "true" && (
+          // Marketing tier requires explicit Accept; skip the geo-based "auto" consent path.
+          <Script
+            id="claydar"
+            src="https://static.claydar.com/init.v1.js?id=clmYho8v0U"
+            strategy="afterInteractive"
+          />
         )}
         {!hideNavigation && <FooterNavigation />}
       </main>
@@ -390,38 +416,5 @@ const Header = () => {
         href="/static/AppIcon_228.png"
       />
     </Head>
-  );
-};
-
-interface PublicWebsiteLogoProps {
-  size?: "default" | "small";
-  utmParam?: string;
-  baseUrl?: string;
-}
-
-const logoVariants = cva("", {
-  variants: {
-    size: {
-      default: "h-[24px] w-[96px]",
-      small: "h-[20px] w-[80px]",
-    },
-  },
-  defaultVariants: {
-    size: "default",
-  },
-});
-
-export const PublicWebsiteLogo = ({
-  size = "default",
-  utmParam,
-  baseUrl,
-}: PublicWebsiteLogoProps) => {
-  const className = logoVariants({ size });
-  const href = `${baseUrl ?? ""}/home${utmParam ? `?${utmParam}` : ""}`;
-
-  return (
-    <Link href={href}>
-      <DustLogo className={className} />
-    </Link>
   );
 };

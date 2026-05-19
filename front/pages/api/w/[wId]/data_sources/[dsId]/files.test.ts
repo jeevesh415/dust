@@ -1,3 +1,4 @@
+import { internalFetch } from "@app/lib/api/internal_fetch";
 import { DataSourceViewFactory } from "@app/tests/utils/DataSourceViewFactory";
 import { FileFactory } from "@app/tests/utils/FileFactory";
 import { createPrivateApiMockRequest } from "@app/tests/utils/generic_private_api_tests";
@@ -63,8 +64,6 @@ vi.mock(import("@app/lib/api/config"), (() => ({
       url: "http://localhost:9999",
       apiKey: "foo",
     }),
-    getClientFacingUrl: vi.fn().mockReturnValue("http://localhost:3000"),
-    getAppUrl: vi.fn().mockReturnValue("http://localhost:3011"),
     getApiBaseUrl: vi.fn().mockReturnValue("http://localhost:3000"),
   },
 })) as any);
@@ -272,8 +271,8 @@ describe("POST /api/w/[wId]/data_sources/[dsId]/files", () => {
     mockFileContent.setContent("foo,bar,baz\n1,2,3\n4,5,6");
 
     // First fetch is to create the table
-    global.fetch = vi.fn().mockImplementation(async (url, init) => {
-      const req = JSON.parse(init.body);
+    vi.mocked(internalFetch).mockImplementation(async (url, init) => {
+      const req = JSON.parse((init as RequestInit).body as string);
       if ((url as string).endsWith("/tables")) {
         expect(req.table_id).toBe("test-table");
         expect(req.name).toBe("Test Table");
@@ -318,6 +317,8 @@ describe("POST /api/w/[wId]/data_sources/[dsId]/files", () => {
           })
         );
       }
+
+      throw new Error(`Unexpected fetch call to ${url}`);
     });
 
     await handler(req, res);

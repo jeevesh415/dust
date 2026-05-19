@@ -17,6 +17,7 @@ function makeFileAttachment(
     isQueryable: false,
     creator: null,
     source: null,
+    path: null,
     hidden: false,
     ...partial,
   };
@@ -61,7 +62,7 @@ describe("contentFromAttachments", () => {
     const out = contentFromAttachments(attachments);
 
     expect(out).toContain(
-      "The following files are currently attached to the conversation via the project context:"
+      "The following files are currently attached to the conversation via the pod context:"
     );
     expect(out).toContain('id="file-proj"');
     expect(out).toContain('isInProjectContext="true"');
@@ -92,7 +93,7 @@ describe("contentFromAttachments", () => {
     const out = contentFromAttachments(attachments);
 
     const idxDirectHeader = out.indexOf("conversation directly:");
-    const idxProjectHeader = out.indexOf("via the project context:");
+    const idxProjectHeader = out.indexOf("via the pod context:");
     const idxDirectFile = out.indexOf('id="direct-mid"');
     const idxProjFirst = out.indexOf('id="proj-first"');
     const idxProjLast = out.indexOf('id="proj-last"');

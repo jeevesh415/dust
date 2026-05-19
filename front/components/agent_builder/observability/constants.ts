@@ -114,9 +114,7 @@ export const FEEDBACK_DISTRIBUTION_LEGEND = [
 
 export type AnalyticsVisibleOrigin = Exclude<
   UserMessageOrigin,
-  | "reinforced_agent_notification"
-  | "reinforced_skill_notification"
-  | "reinforcement"
+  "reinforced_skill_notification" | "branch_anchor"
 >;
 
 export const USER_MESSAGE_ORIGIN_LABELS: Record<
@@ -143,11 +141,19 @@ export const USER_MESSAGE_ORIGIN_LABELS: Record<
   zapier: { label: "Zapier", color: buildColorClass("blue", 700) },
   zendesk: { label: "Zendesk", color: buildColorClass("golden", 700) },
   powerpoint: { label: "PowerPoint", color: buildColorClass("violet", 300) },
+  reinforcement: {
+    label: "Self-improving skills",
+    color: buildColorClass("emerald", 700),
+  },
   transcript: { label: "Transcript", color: buildColorClass("golden", 500) },
   triggered: { label: "Trigger", color: buildColorClass("orange", 700) },
   triggered_programmatic: {
     label: "Trigger",
     color: buildColorClass("orange", 300),
+  },
+  wakeup: {
+    label: "Wake-up",
+    color: buildColorClass("violet", 700),
   },
   onboarding_conversation: {
     label: "Onboarding",
@@ -155,7 +161,7 @@ export const USER_MESSAGE_ORIGIN_LABELS: Record<
   },
   agent_sidekick: { label: "Sidekick", color: buildColorClass("emerald", 300) },
   project_kickoff: {
-    label: "Project Kickoff",
+    label: "Pod Kickoff",
     color: buildColorClass("lime", 300),
   },
 };

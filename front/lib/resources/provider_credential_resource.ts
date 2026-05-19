@@ -20,6 +20,7 @@ import {
   ApiKeyCredentialContentSchema,
   type ApiKeyCredentialsType,
   type ProviderCredentialType,
+  type ProvidersHealth,
 } from "@app/types/provider_credential";
 import type { ModelId } from "@app/types/shared/model_id";
 import type { Result } from "@app/types/shared/result";
@@ -35,7 +36,7 @@ import type { Attributes, ModelStatic, Transaction } from "sequelize";
 const API_KEY_REVEAL_WINDOW_MINUTES = 2;
 const PROVIDER_CREDENTIALS_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
-type CachedProviderCredential = {
+type ProviderCredential = {
   id: ModelId;
   workspaceId: ModelId;
   providerId: ByokModelProviderIdType;
@@ -116,10 +117,14 @@ export class ProviderCredentialResource extends BaseResource<ProviderCredentialM
     workspaceModelId: ModelId
   ) => `provider_credentials:workspaceId:${workspaceModelId}`;
 
+  private static readonly providerCredentialHealthCacheKeyResolver = (
+    workspaceModelId: ModelId
+  ) => `provider_credentials_health:workspaceId:${workspaceModelId}`;
+
   private static async _baseFetchUncached(
     workspaceModelId: ModelId,
     transaction?: Transaction
-  ): Promise<CachedProviderCredential[]> {
+  ): Promise<ProviderCredential[]> {
     const models = await ProviderCredentialResource.model.findAll({
       where: { workspaceId: workspaceModelId },
       transaction,
@@ -145,10 +150,29 @@ export class ProviderCredentialResource extends BaseResource<ProviderCredentialM
     }));
   }
 
+  private static async _fetchProvidersHealthUncached(
+    workspaceModelId: ModelId,
+    transaction?: Transaction
+  ): Promise<ProvidersHealth> {
+    const models = await ProviderCredentialResource.model.findAll({
+      attributes: ["providerId", "isHealthy"],
+      where: { workspaceId: workspaceModelId },
+      transaction,
+    });
+
+    return Object.fromEntries(models.map((m) => [m.providerId, m.isHealthy]));
+  }
+
   // Cache eviction is handled by Redis's allkeys-lfu eviction policy.
   private static baseFetchCached = cacheWithRedis(
     ProviderCredentialResource._baseFetchUncached,
     ProviderCredentialResource.providerCredentialCacheKeyResolver,
+    { cacheNullValues: false, ttlMs: PROVIDER_CREDENTIALS_CACHE_TTL_MS }
+  );
+
+  private static fetchProvidersHealthCached = cacheWithRedis(
+    ProviderCredentialResource._fetchProvidersHealthUncached,
+    ProviderCredentialResource.providerCredentialHealthCacheKeyResolver,
     { cacheNullValues: false, ttlMs: PROVIDER_CREDENTIALS_CACHE_TTL_MS }
   );
 
@@ -157,8 +181,22 @@ export class ProviderCredentialResource extends BaseResource<ProviderCredentialM
     ProviderCredentialResource.providerCredentialCacheKeyResolver
   );
 
+  private static invalidateProvidersHealthCache = invalidateCacheWithRedis(
+    ProviderCredentialResource._fetchProvidersHealthUncached,
+    ProviderCredentialResource.providerCredentialHealthCacheKeyResolver
+  );
+
+  private static async invalidateProviderCredentialCaches(
+    workspaceId: ModelId
+  ): Promise<void> {
+    await Promise.all([
+      this.invalidateProviderCredentialCache(workspaceId),
+      this.invalidateProvidersHealthCache(workspaceId),
+    ]);
+  }
+
   private static fromCachedData(
-    data: CachedProviderCredential
+    data: ProviderCredential
   ): ProviderCredentialResource {
     const blob: Attributes<ProviderCredentialModel> = {
       id: data.id,
@@ -278,7 +316,7 @@ export class ProviderCredentialResource extends BaseResource<ProviderCredentialM
       editedByUserId: user.id,
     });
 
-    await this.invalidateProviderCredentialCache(workspace.id);
+    await this.invalidateProviderCredentialCaches(workspace.id);
 
     notifyProviderCredentialsHealthUpdated(auth);
 
@@ -356,7 +394,7 @@ export class ProviderCredentialResource extends BaseResource<ProviderCredentialM
       credentialsId: oldCredentialId,
     });
 
-    await ProviderCredentialResource.invalidateProviderCredentialCache(
+    await ProviderCredentialResource.invalidateProviderCredentialCaches(
       workspace.id
     );
 
@@ -379,11 +417,9 @@ export class ProviderCredentialResource extends BaseResource<ProviderCredentialM
     workspaceId: ModelId,
     transaction?: Transaction
   ): Promise<Partial<Record<ByokModelProviderIdType, boolean>>> {
-    const cached = transaction
-      ? await this._baseFetchUncached(workspaceId, transaction)
-      : await this.baseFetchCached(workspaceId);
-
-    return Object.fromEntries(cached.map((c) => [c.providerId, c.isHealthy]));
+    return transaction
+      ? this._fetchProvidersHealthUncached(workspaceId, transaction)
+      : this.fetchProvidersHealthCached(workspaceId);
   }
 
   static async deleteAllForWorkspace(auth: Authenticator): Promise<void> {
@@ -393,13 +429,14 @@ export class ProviderCredentialResource extends BaseResource<ProviderCredentialM
       where: { workspaceId: workspace.id },
     });
 
-    await this.invalidateProviderCredentialCache(workspace.id);
+    await this.invalidateProviderCredentialCaches(workspace.id);
   }
 
+  // Returns the invalidated credential so the caller can emit credentials.invalidated, or null if no change was made.
   static async markAsUnhealthy(
     auth: Authenticator,
     { providerId }: { providerId: ByokModelProviderIdType }
-  ): Promise<void> {
+  ): Promise<ProviderCredentialResource | null> {
     const workspace = auth.getNonNullableWorkspace();
     assert(
       auth.getNonNullablePlan().isByok,
@@ -408,7 +445,7 @@ export class ProviderCredentialResource extends BaseResource<ProviderCredentialM
 
     const credential = await this.fetchByProvider(auth, providerId);
     if (!credential) {
-      return;
+      return null;
     }
 
     const isAuthError = await hasCredentialAuthError({
@@ -417,7 +454,7 @@ export class ProviderCredentialResource extends BaseResource<ProviderCredentialM
     });
 
     if (!isAuthError) {
-      return;
+      return null;
     }
 
     const [affectedCount] = await ProviderCredentialModel.update(
@@ -425,10 +462,14 @@ export class ProviderCredentialResource extends BaseResource<ProviderCredentialM
       { where: { workspaceId: workspace.id, providerId, isHealthy: true } }
     );
 
-    if (affectedCount > 0) {
-      await this.invalidateProviderCredentialCache(workspace.id);
-      notifyProviderCredentialsHealthUpdated(auth);
+    if (affectedCount === 0) {
+      return null;
     }
+
+    await this.invalidateProviderCredentialCaches(workspace.id);
+    notifyProviderCredentialsHealthUpdated(auth);
+
+    return credential;
   }
 
   async delete(
@@ -455,7 +496,7 @@ export class ProviderCredentialResource extends BaseResource<ProviderCredentialM
           credentialsId: this.credentialId,
         });
 
-        await ProviderCredentialResource.invalidateProviderCredentialCache(
+        await ProviderCredentialResource.invalidateProviderCredentialCaches(
           workspace.id
         );
 

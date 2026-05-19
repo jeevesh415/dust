@@ -1,5 +1,3 @@
-// biome-ignore-all lint/plugin/noNextImports: Next.js-specific file
-
 import type { LightMCPToolConfigurationType } from "@app/lib/actions/mcp";
 import type { StepContext } from "@app/lib/actions/types";
 import {
@@ -9,10 +7,13 @@ import {
 import { getRelatedContentFragments } from "@app/lib/api/assistant/content_fragments";
 import { runAgentLoopWorkflow } from "@app/lib/api/assistant/conversation/agent_loop";
 import { getContentFragmentBlob } from "@app/lib/api/assistant/conversation/content_fragment";
+import {
+  getConversationRankVersionLock,
+  getNextConversationMessageRank,
+} from "@app/lib/api/assistant/conversation/lock";
 import { createUserMentions } from "@app/lib/api/assistant/conversation/mentions";
 import {
   createAgentMessages,
-  createCompactionMessage,
   createUserMessage,
 } from "@app/lib/api/assistant/conversation/messages";
 import {
@@ -20,6 +21,7 @@ import {
   updateConversationRequirements,
 } from "@app/lib/api/assistant/conversation/permissions";
 import { ensureConversationTitle } from "@app/lib/api/assistant/conversation/title";
+import { RUNNING_AGENT_SWITCH_BLOCK_MESSAGE } from "@app/lib/api/assistant/errors";
 import {
   batchRenderMessages,
   batchRenderUserMessagesWithoutMentions,
@@ -49,12 +51,18 @@ import {
 } from "@app/lib/api/audit/workos_audit";
 import { maybeUpsertFileAttachment } from "@app/lib/api/files/attachments";
 import { getRemainingKeyCapMicroUsd } from "@app/lib/api/programmatic_usage/key_cap";
-import { isProgrammaticUsage } from "@app/lib/api/programmatic_usage/tracking";
+import {
+  checkProgrammaticUsageLimits,
+  isProgrammaticUsage,
+} from "@app/lib/api/programmatic_usage/tracking";
 import { fetchLatestProjectContextFileContentFragment } from "@app/lib/api/projects/context";
 import { isModelAvailable, isProviderWhitelisted } from "@app/lib/assistant";
 import { Authenticator, getFeatureFlags } from "@app/lib/auth";
 import { getSupportedModelConfig } from "@app/lib/llms/model_configurations";
 import { extractFromString, serializeMention } from "@app/lib/mentions/format";
+import { isLegacyPlan } from "@app/lib/metronome/plan_type";
+import { isUserBlocked } from "@app/lib/metronome/user_block";
+import { AgentStepContentToolExecutionModel } from "@app/lib/models/agent/actions/agent_step_content_tool_execution";
 import {
   AgentMCPActionModel,
   AgentMCPActionOutputItemModel,
@@ -62,7 +70,6 @@ import {
 import { AgentStepContentModel } from "@app/lib/models/agent/agent_step_content";
 import {
   AgentMessageModel,
-  CompactionMessageModel,
   ConversationModel,
   MentionModel,
   MessageModel,
@@ -78,12 +85,13 @@ import { CreditResource } from "@app/lib/resources/credit_resource";
 import { DataSourceViewResource } from "@app/lib/resources/data_source_view_resource";
 import { MembershipResource } from "@app/lib/resources/membership_resource";
 import { SpaceResource } from "@app/lib/resources/space_resource";
-import { frontSequelize } from "@app/lib/resources/storage";
 import { UserModel } from "@app/lib/resources/storage/models/user";
 import { getResourceIdFromSId } from "@app/lib/resources/string_ids";
 import { generateRandomModelSId } from "@app/lib/resources/string_ids_server";
+import { WakeUpResource } from "@app/lib/resources/wakeup_resource";
 
 import { ServerSideTracking } from "@app/lib/tracking/server";
+import { concurrentExecutor } from "@app/lib/utils/async_utils";
 import {
   getTimeframeSecondsFromLiteral,
   rateLimiter,
@@ -91,10 +99,7 @@ import {
 import { withTransaction } from "@app/lib/utils/sql_utils";
 import { getStatsDClient } from "@app/lib/utils/statsd";
 import logger, { auditLog } from "@app/logger/logger";
-import {
-  launchAgentLoopWorkflow,
-  launchCompactionWorkflow,
-} from "@app/temporal/agent_loop/client";
+import { launchAgentLoopWorkflow } from "@app/temporal/agent_loop/client";
 import type {
   ContentFragmentInputWithContentNode,
   ContentFragmentInputWithFileIdType,
@@ -107,6 +112,7 @@ import type {
 import { GLOBAL_AGENTS_SID } from "@app/types/assistant/assistant";
 import type {
   AgenticMessageData,
+  AgentMessageStatus,
   AgentMessageType,
   AgentMessageTypeWithoutMentions,
   CitationType,
@@ -134,24 +140,20 @@ import {
   isUserMention,
   toMentionType,
 } from "@app/types/assistant/mentions";
-import type { SupportedModel } from "@app/types/assistant/models/types";
 import type {
   ContentFragmentContextType,
   ContentFragmentType,
 } from "@app/types/content_fragment";
-import { isContentFragmentType } from "@app/types/content_fragment";
 import type { APIErrorWithStatusCode } from "@app/types/error";
 import type { ModelId } from "@app/types/shared/model_id";
 import type { Result } from "@app/types/shared/result";
 import { Err, Ok } from "@app/types/shared/result";
 import { assertNever } from "@app/types/shared/utils/assert_never";
-import { md5 } from "@app/types/shared/utils/encryption";
 import { removeNulls } from "@app/types/shared/utils/general";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import assert from "assert";
+import type { IncomingHttpHeaders } from "http";
 import uniq from "lodash/uniq";
-import type { NextApiRequest } from "next";
-import type { Transaction } from "sequelize";
 import { col } from "sequelize";
 
 // Rate limit for programmatic usage: 1 message per this amount of dollars per minute.
@@ -243,6 +245,7 @@ export async function createConversation(
     triggerId: conversation.triggerSId,
     metadata: conversation.metadata,
     branchId: null,
+    isRunningAgentLoop: conversation.isRunningAgentLoop,
   };
 }
 
@@ -305,7 +308,7 @@ export async function deleteOrLeaveConversation(
       },
       "Conversation soft-deleted"
     );
-    await conversation.updateVisibilityToDeleted();
+    await conversation.updateVisibilityToDeleted(auth);
   }
 
   return new Ok({ success: true });
@@ -437,67 +440,9 @@ export async function getLastUserMessageMentions(
  * Conversation API
  */
 
-/**
- * To avoid deadlocks when using Postgresql advisory locks, please make sure to not issue any other
- * SQL query outside of the transaction `t` that is holding the lock.
- * Otherwise, the other query will be competing for a connection in the database connection pool,
- * resulting in a potential deadlock when the pool is fully occupied.
- */
-async function getConversationRankVersionLock(
-  auth: Authenticator,
-  conversation: ConversationWithoutContentType,
-  t: Transaction
-) {
-  const now = new Date();
-  // Get a lock using the unique lock key (number withing postgresql BigInt range).
-  const hash = md5(`conversation_message_rank_version_${conversation.id}`);
-  const lockKey = parseInt(hash, 16) % 9999999999;
-  // biome-ignore lint/plugin/noRawSql: advisory lock requires raw SQL
-  await frontSequelize.query("SELECT pg_advisory_xact_lock(:key)", {
-    transaction: t,
-    replacements: { key: lockKey },
-  });
-
-  logger.info(
-    {
-      workspaceId: auth.getNonNullableWorkspace().sId,
-      conversationId: conversation.sId,
-      duration: new Date().getTime() - now.getTime(),
-      lockKey,
-    },
-    "[ASSISTANT_TRACE] Advisory lock acquired"
-  );
-}
-
-async function getNextConversationMessageRank(
-  auth: Authenticator,
-  {
-    conversation,
-    transaction,
-  }: {
-    conversation: ConversationWithoutContentType;
-    transaction: Transaction;
-  }
-): Promise<number> {
-  const owner = auth.getNonNullableWorkspace();
-
-  return (
-    ((await MessageModel.max<number | null, MessageModel>("rank", {
-      where: {
-        workspaceId: owner.id,
-        conversationId: conversation.id,
-        branchId: conversation.branchId
-          ? getResourceIdFromSId(conversation.branchId)
-          : null,
-      },
-      transaction,
-    })) ?? -1) + 1
-  );
-}
-
 export function isUserMessageContextValid(
   auth: Authenticator,
-  req: NextApiRequest,
+  headers: IncomingHttpHeaders,
   context: UserMessageContext
 ): boolean {
   const authMethod = auth.authMethod();
@@ -510,7 +455,7 @@ export function isUserMessageContextValid(
     "user-agent": userAgent,
     "x-dust-extension-version": extensionVersion,
     "x-zendesk-user-id": zendeskUserId,
-  } = req.headers;
+  } = headers;
 
   switch (context.origin) {
     case "api":
@@ -540,12 +485,13 @@ export function isUserMessageContextValid(
     case "transcript":
     case "triggered":
     case "triggered_programmatic":
+    case "wakeup":
     case "onboarding_conversation":
     case "agent_sidekick":
     case "project_kickoff":
-    case "reinforced_agent_notification":
     case "reinforced_skill_notification":
     case "reinforcement":
+    case "branch_anchor":
     case "web":
       return false;
     default:
@@ -567,7 +513,6 @@ export async function postUserMessage(
     skipToolsValidation,
     skipDustAutoMention,
     doNotAssociateUser,
-    steeringEnabled,
   }: {
     conversation: ConversationType;
     content: string;
@@ -577,7 +522,6 @@ export async function postUserMessage(
     skipToolsValidation: boolean;
     doNotAssociateUser?: boolean;
     skipDustAutoMention?: boolean;
-    steeringEnabled?: boolean;
   }
 ): Promise<
   Result<
@@ -629,6 +573,38 @@ export async function postUserMessage(
     }
   }
 
+  // Snapshot user-explicit agent mentions before any auto-injection. Steering and
+  // visibility decisions downstream depend on user intent, not on server-injected mentions.
+  const explicitAgentMentions = mentions.filter(isAgentMention);
+
+  // Auto-inject @dust for mention-less web/extension messages in single-user conversations.
+  // Must run before the plan rate-limit check so the resulting agent message is counted.
+  if (
+    !skipDustAutoMention &&
+    mentions.length === 0 &&
+    (context.origin === "web" || context.origin === "extension")
+  ) {
+    const hasOtherHumans =
+      uniq(
+        conversation.content
+          .map((versions) => versions[versions.length - 1])
+          .filter(isUserMessageType)
+          .filter((m) => m.user?.sId && m.user.sId !== auth.user()?.sId)
+      ).length >= 1;
+
+    if (!hasOtherHumans) {
+      const dustAgent = await getAgentConfiguration(auth, {
+        agentId: GLOBAL_AGENTS_SID.DUST,
+        variant: "extra_light",
+      });
+
+      if (dustAgent && dustAgent.status === "active") {
+        mentions.push({ configurationId: dustAgent.sId });
+        content = `${serializeMention({ id: dustAgent.sId, type: "agent", label: dustAgent.name })} ${content}`;
+      }
+    }
+  }
+
   // Check plan and rate limit.
   const limitResult = await checkMessagesLimit(auth, { mentions, context });
   if (limitResult.isErr()) {
@@ -657,7 +633,14 @@ export async function postUserMessage(
     });
   }
 
-  const agentMentions = mentions.filter(isAgentMention);
+  const canInteractRes = await WakeUpResource.canUserInteract(
+    auth,
+    conversation
+  );
+  if (canInteractRes.isErr()) {
+    return canInteractRes;
+  }
+
   let runningAgentMessage = conversation.content
     .flat()
     .find(
@@ -666,30 +649,35 @@ export async function postUserMessage(
     );
 
   // Steering invariants: enforce single agent loop per conversation.
-  if (steeringEnabled) {
-    if (agentMentions.length > 1) {
-      return new Err({
-        status_code: 400,
-        api_error: {
-          type: "invalid_request_error",
-          message: "Only one agent can be mentioned per message.",
-        },
-      });
-    }
+  if (explicitAgentMentions.length > 1) {
+    return new Err({
+      status_code: 400,
+      api_error: {
+        type: "invalid_request_error",
+        message: "Only one agent can be mentioned per message.",
+      },
+    });
+  }
 
-    if (
-      runningAgentMessage &&
-      agentMentions.length > 0 &&
-      agentMentions[0].configurationId !== runningAgentMessage.configuration.sId
-    ) {
-      return new Err({
-        status_code: 400,
-        api_error: {
-          type: "invalid_request_error",
-          message: "Cannot run a different agent while one is running.",
-        },
-      });
-    }
+  // When isHandover is true we allow creating a new agentic loop as the parent one will close asap,
+  // the steering code path is disabled in that case: we allow mentioning another agent (the agent
+  // to handoff to) and we don't set the user message state to pending (see below).
+  const isHandover = agenticMessageData?.type === "agent_handover";
+
+  if (
+    runningAgentMessage &&
+    explicitAgentMentions.length > 0 &&
+    explicitAgentMentions[0].configurationId !==
+      runningAgentMessage.configuration.sId &&
+    !isHandover
+  ) {
+    return new Err({
+      status_code: 400,
+      api_error: {
+        type: "invalid_request_error",
+        message: RUNNING_AGENT_SWITCH_BLOCK_MESSAGE,
+      },
+    });
   }
 
   // `getAgentConfiguration` checks that we're only pulling a configuration from the
@@ -718,36 +706,6 @@ export async function postUserMessage(
 
   let agentConfigurations = removeNulls(results[0]);
   let shouldCreateBranch = false;
-
-  // Check if no mentions, in that case, we might automatically append an @dust mention.
-  if (
-    !skipDustAutoMention &&
-    mentions.length === 0 &&
-    (context.origin === "web" || context.origin === "extension")
-  ) {
-    const hasOtherHumans =
-      uniq(
-        conversation.content
-          .map((versions) => versions[versions.length - 1])
-          .filter(isUserMessageType)
-          .filter((m) => m.user?.sId && m.user.sId !== auth.user()?.sId)
-      ).length >= 1;
-
-    if (!hasOtherHumans) {
-      // Check if the global @dust agent is active for this workspace.
-      const dustAgent = await getAgentConfiguration(auth, {
-        agentId: GLOBAL_AGENTS_SID.DUST,
-        variant: "extra_light",
-      });
-
-      if (dustAgent && dustAgent.status === "active") {
-        agentConfigurations.push(dustAgent);
-        const dustMention: MentionType = { configurationId: dustAgent.sId };
-        mentions.push(dustMention);
-        content = `${serializeMention({ id: dustAgent.sId, type: "agent", label: dustAgent.name })} ${content}`;
-      }
-    }
-  }
 
   for (const agentConfig of agentConfigurations) {
     if (!canAccessAgent(agentConfig)) {
@@ -793,9 +751,8 @@ export async function postUserMessage(
       });
     }
 
-    // If the conversation is part of a project and the conversation branches feature flag is enabled.
     // When the agent is not usable, we will create a branch.
-    if (isPartOfProject && featureFlags.includes("conversation_branches")) {
+    if (isPartOfProject) {
       const canAgentBeUsed = await canAgentBeUsedInProjectConversation(auth, {
         configuration: agentConfig,
         conversation,
@@ -817,7 +774,6 @@ export async function postUserMessage(
     // We will do best effort to create a branch, but there a several conditions that we will not create a branch.
     // - User is null, cannot create branch without a user, should never happen, but we will log an error and continue.
     // - Message has user mentions, we don't support multiple users in a branch yet.
-    // - Conversation has no content, we cannot create a branch as the start of the conversation.
     // - Last message in conversation has no content should never happen, but we will log an error and continue.
     // If we do not create a branch, the user will receive a notification that the agent is not usable.
     if (shouldCreateBranch) {
@@ -829,9 +785,36 @@ export async function postUserMessage(
           "Message has user mentions, for now we do not support branching with user mentions."
         );
       } else if (conversation.content.length === 0) {
-        logger.info(
-          "Conversation has no content, cannot create branch as the start of the conversation."
+        // Create an invisible anchor message so the branch has a previousMessageId
+        // to reference.
+        const anchorMessage = await createUserMessage(auth, {
+          conversation,
+          content: "",
+          metadata: {
+            type: "create",
+            user: user.toJSON(),
+            rank: 0,
+            context: {
+              ...context,
+              origin: "branch_anchor",
+            },
+          },
+          transaction: t,
+        });
+
+        const branch = await ConversationBranchResource.makeNew(
+          auth,
+          {
+            conversationId: conversation.id,
+            previousMessageId: anchorMessage.id,
+            state: "open",
+            userId: user.id,
+          },
+          t
         );
+
+        conversation.branchId = branch.sId;
+        nextMessageRank = 1;
       } else {
         // Get the last message in the conversation.
         const previousMessage =
@@ -887,7 +870,7 @@ export async function postUserMessage(
     // Re-read the agent message status inside the critical section of the advisory lock. Between
     // the initial check and acquiring the lock, the agent loop may have finalized — if so, clear
     // runningAgentMessage so we fall through to the normal flow.
-    if (steeringEnabled && runningAgentMessage) {
+    if (runningAgentMessage) {
       const agentMessageRow = await AgentMessageModel.findOne({
         where: {
           id: runningAgentMessage.agentMessageId,
@@ -902,9 +885,11 @@ export async function postUserMessage(
     }
 
     // We set the visibility of the user message to "pending" if steering is enabled, we have a
-    // running agent message and there are agent mentions in the user messsage.
+    // running agent message and there are agent mentions in the user messsage. If we are handing
+    // over we don't attempt steering as the intent is to start a new agentic loop and stop the
+    // parent one ASAP.
     const visibility: MessageVisibility =
-      steeringEnabled && runningAgentMessage && agentMentions.length > 0
+      runningAgentMessage && explicitAgentMentions.length > 0 && !isHandover
         ? "pending"
         : "visible";
 
@@ -996,17 +981,8 @@ export async function postUserMessage(
     });
   }
 
-  const conversationRes = await ConversationResource.fetchById(
-    auth,
-    conversation.sId
-  );
-  if (!conversationRes) {
-    throw new Error(
-      "Unexpected: Conversation not found after posting message."
-    );
-  }
   await triggerConversationUnreadNotifications(auth, {
-    conversationId: conversationRes.sId,
+    conversationId: conversation.sId,
     messageId: userMessage.sId,
   });
 
@@ -1028,9 +1004,14 @@ export async function postUserMessage(
         buildAuditLogTarget("agent", agentMessage.configuration),
       ],
       metadata: {
-        conversationId: conversation.sId,
-        agentName: agentMessage.configuration.name,
+        conversation_id: conversation.sId,
+        agent_name: agentMessage.configuration.name,
         origin: context.origin,
+        ...(conversation.triggerId
+          ? { trigger_id: conversation.triggerId }
+          : {}),
+        initiating_user_id: auth.user()?.sId ?? "unknown",
+        initiating_user_email: auth.user()?.email ?? "unknown",
       },
     });
   }
@@ -1043,11 +1024,7 @@ export async function postUserMessage(
       conversation,
       userMessage,
     });
-  } else if (
-    steeringEnabled &&
-    runningAgentMessage &&
-    userMessage.visibility === "pending"
-  ) {
+  } else if (runningAgentMessage && userMessage.visibility === "pending") {
     // Pending path: signal the running agent loop to gracefully stop.
     await gracefullyStopAgentLoop(auth, {
       messageIds: [runningAgentMessage.sId],
@@ -1151,18 +1128,24 @@ export async function editUserMessage(
     });
   }
 
+  const canInteractRes = await WakeUpResource.canUserInteract(
+    auth,
+    conversation
+  );
+  if (canInteractRes.isErr()) {
+    return canInteractRes;
+  }
+
   let userMessage: UserMessageType | null = null;
   let agentMessages: AgentMessageType[] = [];
 
   const results = await Promise.all([
-    Promise.all(
-      mentions.filter(isAgentMention).map((mention) =>
-        getAgentConfiguration(auth, {
-          agentId: mention.configurationId,
-          variant: "light",
-        })
-      )
-    ),
+    getAgentConfigurations(auth, {
+      agentIds: mentions
+        .filter(isAgentMention)
+        .map((mention) => mention.configurationId),
+      variant: "light",
+    }),
     ConversationResource.upsertParticipation(auth, {
       conversation,
       action: "posted",
@@ -1170,7 +1153,7 @@ export async function editUserMessage(
     }),
   ]);
 
-  const agentConfigurations = removeNulls(results[0]);
+  const agentConfigurations = results[0];
 
   for (const agentConfig of agentConfigurations) {
     if (!canAccessAgent(agentConfig)) {
@@ -1535,15 +1518,24 @@ export async function createAgentMessageFromText(
         {
           workspaceId: owner.id,
           mcpServerConfigurationId: "",
-          version: 0,
           agentMessageId: agentMessageRow.id,
-          stepContentId: functionCallStepContent.id,
           status: "succeeded",
           citationsAllocated,
           augmentedInputs: {},
           toolConfiguration: {} as LightMCPToolConfigurationType,
           stepContext: {} as StepContext,
           executionDurationMs: null,
+        },
+        { transaction: t }
+      );
+
+      await AgentStepContentToolExecutionModel.create(
+        {
+          workspaceId: owner.id,
+          conversationId: conversation.id,
+          agentMessageId: agentMessageRow.id,
+          agentMCPActionId: createdAction.id,
+          stepContentId: functionCallStepContent.id,
         },
         { transaction: t }
       );
@@ -1696,6 +1688,38 @@ export async function retryAgentMessage(
     return limitResult;
   }
 
+  const retryAgentConfiguration = await getAgentConfiguration(auth, {
+    agentId: message.configuration.sId,
+    variant: "extra_light",
+  });
+  if (!retryAgentConfiguration || !canAccessAgent(retryAgentConfiguration)) {
+    return new Err({
+      status_code: 400,
+      api_error: {
+        type: "invalid_request_error",
+        message:
+          "Invalid agent message retry request, the agent is no longer available to you.",
+      },
+    });
+  }
+
+  if (isProjectConversation(conversation)) {
+    const canAgentBeUsed = await canAgentBeUsedInProjectConversation(auth, {
+      configuration: retryAgentConfiguration,
+      conversation,
+    });
+    if (!canAgentBeUsed) {
+      return new Err({
+        status_code: 400,
+        api_error: {
+          type: "invalid_request_error",
+          message:
+            "Invalid agent message retry request, the agent is restricted by space usage.",
+        },
+      });
+    }
+  }
+
   let agentMessageResult: {
     agentMessage: AgentMessageType;
   } | null = null;
@@ -1746,30 +1770,6 @@ export async function retryAgentMessage(
         throw new AgentMessageError(
           "Invalid agent message retry request, this message was already retried."
         );
-      }
-
-      // Check if agent is still available to the user.
-      const agentConfiguration = await getAgentConfiguration(auth, {
-        agentId: message.configuration.sId,
-        variant: "extra_light",
-      });
-      if (!agentConfiguration || !canAccessAgent(agentConfiguration)) {
-        throw new AgentMessageError(
-          "Invalid agent message retry request, the agent is no longer available to you."
-        );
-      }
-
-      // Agent could be part of a conversation that was moved to a space OR the agent configuration could have changed to use a space that is not usable in a project.
-      if (isProjectConversation(conversation)) {
-        const canAgentBeUsed = await canAgentBeUsedInProjectConversation(auth, {
-          configuration: agentConfiguration,
-          conversation,
-        });
-        if (!canAgentBeUsed) {
-          throw new AgentMessageError(
-            "Invalid agent message retry request, the agent is restricted by space usage."
-          );
-        }
       }
 
       const { agentMessages } = await createAgentMessages(auth, {
@@ -1874,13 +1874,18 @@ export async function retryAgentMessage(
 // Injects a new content fragment in the conversation.
 export async function postNewContentFragment(
   auth: Authenticator,
-  conversation: ConversationType,
+  conversation: ConversationWithoutContentType,
   cf: ContentFragmentInputWithFileIdType | ContentFragmentInputWithContentNode,
   context: ContentFragmentContextType | null
 ): Promise<Result<ContentFragmentType, Error>> {
   const owner = auth.workspace();
-  if (!owner || owner.id !== conversation.owner.id) {
+  if (!owner) {
     throw new Error("Invalid auth for conversation.");
+  }
+  if (
+    (await ConversationResource.canAccess(auth, conversation.sId)) !== "allowed"
+  ) {
+    return new Err(new Error("Conversation access restricted."));
   }
 
   // Project conversations only allow content fragments from the project space or the global space.
@@ -1918,14 +1923,12 @@ export async function postNewContentFragment(
         cf.fileId
       );
       if (r) {
-        const alreadyPresent = conversation.content.some((versions) => {
-          const latest = versions[versions.length - 1];
-          return (
-            isContentFragmentType(latest) &&
-            latest.contentFragmentVersion === "latest" &&
-            latest.contentFragmentId === r.fragment.sId
-          );
-        });
+        const alreadyPresent =
+          await ConversationResource.hasMessageForContentFragmentSeries(auth, {
+            conversation,
+            contentFragmentId: r.fragment.sId,
+            contentFragmentVersion: "latest",
+          });
 
         if (!alreadyPresent) {
           await withTransaction(async (t) => {
@@ -1985,13 +1988,13 @@ export async function postNewContentFragment(
   // If the request is superseding an existing content fragment, we need to validate that it exists
   // and is part of the conversation.
   if (supersededContentFragmentId) {
-    const found = conversation.content.some((versions) => {
-      const latest = versions[versions.length - 1];
-      return (
-        isContentFragmentType(latest) &&
-        latest.contentFragmentId === supersededContentFragmentId
-      );
-    });
+    const found = await ConversationResource.hasMessageForContentFragmentSeries(
+      auth,
+      {
+        conversation,
+        contentFragmentId: supersededContentFragmentId,
+      }
+    );
 
     if (!found) {
       return new Err(new Error("Superseded content fragment not found."));
@@ -2045,7 +2048,7 @@ export async function postNewContentFragment(
 
     if (isContentFragmentInputWithContentNode(cf)) {
       await updateConversationRequirements(auth, {
-        contentFragment: cf,
+        contentFragmentDatasourceViewIds: [cf.nodeDataSourceViewId],
         conversation,
         t,
       });
@@ -2064,7 +2067,56 @@ export async function postNewContentFragment(
   return new Ok(render);
 }
 
-export async function softDeleteUserMessage(
+/**
+ * Returns the agent replies that follow `userMessage` in the conversation and would be orphaned
+ * by soft-deleting it. These are agent messages at subsequent ranks up to (but not including) the
+ * next non-agent rank. Already-deleted agent messages are skipped.
+ *
+ * Invariant: agent replies are immediately contiguous to the user message they respond to (no
+ * compaction, content fragment, or another user message inserted in between). If that ever
+ * changes, this walk will stop short and leave orphans that re-introduce the trailing-assistant
+ * bug this cascade is meant to fix.
+ *
+ * New conversations are capped at one mention per user message (enforced in postUserMessage) so
+ * in practice there's at most one, but legacy conversations can have multiple agent replies in a
+ * single turn, which is why the return type is an array.
+ */
+function getAgentRepliesToCascadeOnUserDelete(
+  conversation: ConversationType,
+  userMessage: UserMessageType
+): AgentMessageType[] {
+  const orphans: AgentMessageType[] = [];
+  let sawUserMessage = false;
+  for (const versions of conversation.content) {
+    const latest = versions[versions.length - 1];
+    if (!sawUserMessage) {
+      sawUserMessage = latest.sId === userMessage.sId;
+      continue;
+    }
+    if (!isAgentMessageType(latest)) {
+      break;
+    }
+    if (latest.visibility !== "deleted") {
+      orphans.push(latest);
+    }
+  }
+  return orphans;
+}
+
+/**
+ * Soft-delete a user message and the agent replies that followed it.
+ *
+ * Both deletions are represented as new v+1 `messages` rows with `visibility: "deleted"` rather
+ * than UPDATEs on the v0 rows. This is required so other clients viewing the conversation see the
+ * deletion in realtime: the message event stream fires on new rows (publishAgentMessagesEvents /
+ * publishMessageEventsOnMessagePostOrEdit), not on UPDATEs. As a side benefit, v0 stays intact as
+ * immutable history.
+ *
+ * The cascade to the following agent replies is necessary because otherwise the orphaned agent
+ * messages would be rendered for the model with no preceding user turn, producing a trailing
+ * assistant turn that providers like Anthropic reject (400 invalid_request_error).
+ */
+export async function softDeleteUserMessageAndReplies(
   auth: Authenticator,
   {
     message,
@@ -2086,6 +2138,15 @@ export async function softDeleteUserMessage(
     return new Err(new ConversationError("message_deletion_not_authorized"));
   }
 
+  // Known small race: this snapshot of `conversation.content` is taken before the rank lock
+  // below. A concurrent retry/edit that takes the lock first and writes a v+1 at the same rank
+  // could cause the cascade insert to hit the (rank, version) unique constraint.
+  const orphanAgentMessages = getAgentRepliesToCascadeOnUserDelete(
+    conversation,
+    message
+  );
+
+  const cascadedAgentMessages: AgentMessageType[] = [];
   const userMessage = await withTransaction(async (t) => {
     await getConversationRankVersionLock(auth, conversation, t);
 
@@ -2121,6 +2182,19 @@ export async function softDeleteUserMessage(
       );
     }
 
+    for (const orphan of orphanAgentMessages) {
+      const { agentMessages } = await createAgentMessages(auth, {
+        conversation,
+        metadata: {
+          type: "delete",
+          agentMessage: orphan,
+          parentId: message.id,
+        },
+        transaction: t,
+      });
+      cascadedAgentMessages.push(...agentMessages);
+    }
+
     await ConversationResource.markAsUpdated(auth, { conversation, t });
 
     return userMessage;
@@ -2131,6 +2205,23 @@ export async function softDeleteUserMessage(
     { ...userMessage, contentFragments: [], mentions: [], richMentions: [] },
     []
   );
+
+  if (cascadedAgentMessages.length > 0) {
+    await publishAgentMessagesEvents(conversation, cascadedAgentMessages);
+  }
+
+  // Signal any still-running agent loops to stop. Orphans with status "created" have a live
+  // Temporal workflow that would otherwise keep streaming to a deleted message. The gracefully-
+  // stopped event also lets the client flip the message status and hide the Stop button.
+  const runningOrphans = orphanAgentMessages.filter(
+    (m) => m.status === "created"
+  );
+  if (runningOrphans.length > 0) {
+    await gracefullyStopAgentLoop(auth, {
+      messageIds: runningOrphans.map((m) => m.sId),
+      conversationId: conversation.sId,
+    });
+  }
 
   auditLog(
     {
@@ -2147,6 +2238,12 @@ export async function softDeleteUserMessage(
   return new Ok({ success: true });
 }
 
+/**
+ * Soft-delete a single agent message.
+ *
+ * See {@link softDeleteUserMessageAndReplies} for the rationale of the v+1 placeholder pattern
+ * (realtime sync + immutable history).
+ */
 export async function softDeleteAgentMessage(
   auth: Authenticator,
   {
@@ -2203,6 +2300,15 @@ export async function softDeleteAgentMessage(
 
   await publishAgentMessagesEvents(conversation, agentMessages);
 
+  // Stop the underlying agent loop if it's still running so the Temporal workflow doesn't keep
+  // streaming to a deleted message and the client sees the Stop button disappear.
+  if (message.status === "created") {
+    await gracefullyStopAgentLoop(auth, {
+      messageIds: [message.sId],
+      conversationId: conversation.sId,
+    });
+  }
+
   auditLog(
     {
       author: user.toJSON(),
@@ -2218,7 +2324,33 @@ export async function softDeleteAgentMessage(
 
 interface MessageLimit {
   isLimitReached: boolean;
-  limitType: "rate_limit_error" | "plan_message_limit_exceeded" | null;
+  limitType:
+    | "rate_limit_error"
+    | "plan_message_limit_exceeded"
+    | "credits_exhausted"
+    | null;
+  message?: string;
+}
+
+function getMessageLimitErrorMessage({
+  limitType,
+  message,
+}: {
+  limitType: NonNullable<MessageLimit["limitType"]>;
+  message?: string;
+}): string {
+  if (message) {
+    return message;
+  }
+
+  switch (limitType) {
+    case "plan_message_limit_exceeded":
+      return "The message limit for this plan has been exceeded.";
+    case "credits_exhausted":
+      return "Your workspace has run out of credits. Please purchase more credits to continue.";
+    case "rate_limit_error":
+      return "Rate limit exceeded. Please retry later.";
+  }
 }
 
 async function checkMessagesLimit(
@@ -2236,6 +2368,30 @@ async function checkMessagesLimit(
     return new Ok(undefined);
   }
 
+  // Block users flagged by the Metronome `alerts.spend_threshold_reached`
+  // webhook. The flag is set per (workspace, user) in Redis and is only
+  // checked for non-legacy Metronome plans.
+  const owner = auth.getNonNullableWorkspace();
+  if (owner.metronomeCustomerId) {
+    const onLegacyPlan = await isLegacyPlan(owner.sId);
+    if (!onLegacyPlan) {
+      const user = auth.user();
+      if (user) {
+        const blocked = await isUserBlocked(owner.sId, user.sId);
+        if (blocked) {
+          return new Err({
+            status_code: 403,
+            api_error: {
+              type: "credits_exhausted",
+              message:
+                "Your workspace has run out of credits. Please purchase more credits to continue.",
+            },
+          });
+        }
+      }
+    }
+  }
+
   const messageLimit = await isMessagesLimitReached(auth, {
     mentions,
     context,
@@ -2245,10 +2401,10 @@ async function checkMessagesLimit(
       status_code: 403,
       api_error: {
         type: messageLimit.limitType,
-        message:
-          messageLimit.limitType === "plan_message_limit_exceeded"
-            ? "The message limit for this plan has been exceeded."
-            : "Rate limit exceeded. Please retry later.",
+        message: getMessageLimitErrorMessage({
+          limitType: messageLimit.limitType,
+          message: messageLimit.message,
+        }),
       },
     });
   }
@@ -2425,7 +2581,25 @@ async function isMessagesLimitReached(
   }
 
   if (isProgrammaticUsage(auth, { userMessageOrigin: context.origin })) {
-    return checkProgrammaticUsageRateLimit(auth);
+    const limitsResult = await checkProgrammaticUsageLimits(auth);
+    if (limitsResult.isErr()) {
+      return {
+        isLimitReached: true,
+        limitType: limitsResult.error.type,
+        message: limitsResult.error.message,
+      };
+    }
+
+    const programmaticUsageRateLimit =
+      await checkProgrammaticUsageRateLimit(auth);
+    if (programmaticUsageRateLimit.isLimitReached) {
+      return programmaticUsageRateLimit;
+    }
+
+    return {
+      isLimitReached: false,
+      limitType: null,
+    };
   }
 
   // Checking rate limit
@@ -2484,8 +2658,9 @@ async function isMessagesLimitReached(
     activeSeats,
   });
   const agentMentions = mentions.filter(isAgentMention);
-  const remainingMentions = await Promise.all(
-    agentMentions.map(() =>
+  const remainingMentions = await concurrentExecutor(
+    agentMentions,
+    () =>
       rateLimiter({
         key: makeAgentMentionsRateLimitKeyForWorkspace(
           owner,
@@ -2494,8 +2669,8 @@ async function isMessagesLimitReached(
         maxPerTimeframe: effectiveMaxMessages,
         timeframeSeconds: getTimeframeSecondsFromLiteral(maxMessagesTimeframe),
         logger,
-      })
-    )
+      }),
+    { concurrency: 4 }
   );
   // We let the user talk to all agents if any of the rate limiter answered "ok".
   // Subsequent calls to this function would block the user anyway.
@@ -2535,191 +2710,11 @@ export async function isConversationEventAllowedForAuth(
     case "compaction_message_done":
     case "conversation_title":
     case "user_message_promoted":
+    case "plan_updated":
       return true;
     default:
       assertNever(type);
   }
-}
-
-/**
- * Create a CompactionMessage in the conversation and launch the compaction workflow.
- *
- * The CompactionMessage is created with status "created" inside the conversation advisory lock,
- * ensuring it's serialized with other conversation operations. The workflow is launched
- * fire-and-forget after the transaction commits.
- */
-export async function compactConversation(
-  auth: Authenticator,
-  {
-    conversation,
-    model,
-  }: {
-    conversation: ConversationType;
-    model: SupportedModel;
-  }
-): Promise<
-  Result<{ compactionMessage: CompactionMessageType }, APIErrorWithStatusCode>
-> {
-  const owner = auth.getNonNullableWorkspace();
-
-  // Block compaction while an agent message is running or a compaction is running.
-  const runningAgentMessage = conversation.content
-    .flat()
-    .find(
-      (m): m is AgentMessageType =>
-        isAgentMessageType(m) && m.status === "created"
-    );
-  const runningCompaction = conversation.content
-    .flat()
-    .find(
-      (m): m is CompactionMessageType =>
-        isCompactionMessageType(m) && m.status === "created"
-    );
-  const lastMessage = conversation.content.at(-1)?.at(-1);
-
-  if (
-    runningAgentMessage ||
-    runningCompaction ||
-    (lastMessage && isCompactionMessageType(lastMessage))
-  ) {
-    return new Err({
-      status_code: 409,
-      api_error: {
-        type: "invalid_request_error",
-        message:
-          "Cannot compact while another compaction or an agent message is running, or when the last message is already a compaction message.",
-      },
-    });
-  }
-
-  const { compactionMessage } = await withTransaction(async (t) => {
-    await getConversationRankVersionLock(auth, conversation, t);
-
-    // Re-check the existence of a compaction message or running agent message inside the critical
-    // section of the advisory lock to avoid stacking compaction with other compaction or running
-    // agent loop.
-    const [runningCompactionMessage, runningAgentMessage] = await Promise.all([
-      MessageModel.findOne({
-        where: {
-          conversationId: conversation.id,
-          workspaceId: owner.id,
-        },
-        include: [
-          {
-            model: CompactionMessageModel,
-            as: "compactionMessage",
-            required: true,
-            where: { status: "created" },
-          },
-        ],
-        transaction: t,
-      }),
-      MessageModel.findOne({
-        where: {
-          conversationId: conversation.id,
-          workspaceId: owner.id,
-        },
-        include: [
-          {
-            model: AgentMessageModel,
-            as: "agentMessage",
-            required: true,
-            where: { status: "created" },
-          },
-        ],
-        transaction: t,
-      }),
-    ]);
-
-    if (runningCompactionMessage || runningAgentMessage) {
-      return { compactionMessage: null };
-    }
-
-    const nextMessageRank = await getNextConversationMessageRank(auth, {
-      conversation,
-      transaction: t,
-    });
-
-    const compactionMessage = await createCompactionMessage(auth, {
-      conversation,
-      rank: nextMessageRank,
-      transaction: t,
-    });
-
-    return { compactionMessage };
-  });
-
-  if (!compactionMessage) {
-    return new Err({
-      status_code: 409,
-      api_error: {
-        type: "invalid_request_error",
-        message:
-          "Cannot compact while another compaction or an agent message is running.",
-      },
-    });
-  }
-
-  await publishConversationEvent(
-    {
-      type: "compaction_message_new",
-      created: Date.now(),
-      messageId: compactionMessage.sId,
-      message: compactionMessage,
-    },
-    { conversationId: conversation.sId }
-  );
-
-  void launchCompactionWorkflow({
-    auth,
-    conversationId: conversation.sId,
-    compactionMessageId: compactionMessage.sId,
-    compactionMessageVersion: compactionMessage.version,
-    model,
-  });
-
-  return new Ok({ compactionMessage });
-}
-
-export async function updateCompactionMessageWithContentAndFinalStatus(
-  auth: Authenticator,
-  {
-    conversation,
-    compactionMessage,
-    status,
-    content,
-  }: {
-    conversation: ConversationWithoutContentType;
-    compactionMessage: CompactionMessageType;
-    status: "succeeded" | "failed";
-    content: string | null;
-  }
-): Promise<{
-  completedTs: number;
-  status: "succeeded" | "failed";
-}> {
-  const completedAt = new Date();
-  const owner = auth.getNonNullableWorkspace();
-
-  await withTransaction(async (t) => {
-    await getConversationRankVersionLock(auth, conversation, t);
-
-    await CompactionMessageModel.update(
-      { status, content },
-      {
-        where: {
-          id: compactionMessage.compactionMessageId,
-          workspaceId: owner.id,
-        },
-        transaction: t,
-      }
-    );
-  });
-
-  return {
-    completedTs: completedAt.getTime(),
-    status,
-  };
 }
 
 /**
@@ -2738,12 +2733,12 @@ export async function updateAgentMessageWithFinalStatus(
   }: {
     conversation: ConversationWithoutContentType;
     agentMessage: AgentMessageType;
-    status: "succeeded" | "cancelled" | "failed" | "gracefully_stopped";
+    status: Exclude<AgentMessageStatus, "created">;
     error?: ToolErrorEvent["error"];
   }
 ): Promise<{
   completedTs: number;
-  status: "succeeded" | "cancelled" | "failed" | "gracefully_stopped";
+  status: Exclude<AgentMessageStatus, "created">;
 }> {
   const completedAt = new Date();
   const owner = auth.getNonNullableWorkspace();
@@ -2843,6 +2838,28 @@ export async function updateAgentMessageWithFinalStatus(
       t,
     });
 
+    if (status === "cancelled") {
+      // When the agent message is cancelled it means the user pushed the "stop" button so the
+      // intent is to abort all work. "interrupted" is NOT included here: the user chose to
+      // redirect rather than stop, so pending messages continue processing.
+      return {
+        promotedUserMessages,
+        promotedAuth,
+        agentMessage: null,
+      };
+    }
+
+    if (!agentMessage.configuration) {
+      // Configuration is not available (e.g., workflow error path where the agent
+      // message is reconstructed without its configuration). Promote pending user
+      // messages but don't attempt to create a new agent message.
+      return {
+        promotedUserMessages,
+        promotedAuth,
+        agentMessage: null,
+      };
+    }
+
     const nextMessageRank = await getNextConversationMessageRank(auth, {
       conversation,
       transaction: t,
@@ -2894,9 +2911,14 @@ export async function updateAgentMessageWithFinalStatus(
         buildAuditLogTarget("agent", newAgentMessage.configuration),
       ],
       metadata: {
-        conversationId: conversation.sId,
-        agentName: newAgentMessage.configuration.name,
+        conversation_id: conversation.sId,
+        agent_name: newAgentMessage.configuration.name,
         origin: "steering",
+        ...(conversation.triggerId
+          ? { trigger_id: conversation.triggerId }
+          : {}),
+        initiating_user_id: promotedAuth.user()?.sId ?? "unknown",
+        initiating_user_email: promotedAuth.user()?.email ?? "unknown",
       },
     });
 

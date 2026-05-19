@@ -45,10 +45,32 @@ type AuditAction =
   // OAuth & Credentials.
   | "oauth.initiated"
   | "oauth.authorized"
+  | "oauth.revoked"
   | "credentials.created"
+  | "credentials.updated"
+  | "credentials.revoked"
+  | "credentials.invalidated"
+  // MCP Connections.
+  | "mcp_connection.created"
+  | "mcp_connection.deleted"
   // Projects.
   | "project.joined"
   | "project.left"
+  // Self-improvement.
+  | "self_improvement.enabled"
+  | "self_improvement.batch_mode_updated"
+  | "skill.self_improvement_updated"
+  // Sandbox.
+  | "sandbox_egress_policy.agent_requests_setting_updated"
+  | "sandbox_egress_policy.sandbox_updated"
+  | "sandbox_egress_policy.updated"
+  | "sandbox_env_var.allowed_domains_updated"
+  | "sandbox_env_var.created"
+  | "sandbox_env_var.deleted"
+  | "sandbox_env_var.promoted_to_https_secret"
+  | "sandbox_env_var.updated"
+  // Workspace settings.
+  | "workspace.audit_logs_updated"
   // SCIM / Directory Sync.
   | "scim.user_provisioned"
   | "scim.user_updated"
@@ -61,8 +83,17 @@ type AuditAction =
   | "agent.executed"
   | "tool.executed"
   // Triggers.
+  | "trigger.created"
+  | "trigger.deleted"
+  | "trigger.enabled"
+  | "trigger.disabled"
   | "trigger.fired"
   | "trigger.email_received"
+  // Wake-ups.
+  | "wake_up.cancelled"
+  | "wake_up.created"
+  | "wake_up.expired"
+  | "wake_up.fired"
   // Agent lifecycle.
   | "agent.created"
   | "agent.updated"
@@ -70,6 +101,7 @@ type AuditAction =
   | "agent.restored"
   | "agent.scope_changed"
   // Spaces.
+  | "space.accessed"
   | "space.created"
   | "space.deleted"
   | "space.permissions_updated"
@@ -80,9 +112,13 @@ type AuditAction =
   | "datasource.updated"
   | "datasource.deleted"
   | "datasource.deleted_admin"
+  | "datasource.reauthorized"
   // Audit Logs.
   | "audit_log.viewed"
-  | "audit_log.export_configured";
+  | "audit_log.export_configured"
+  // Coupons.
+  | "coupon.redeemed"
+  | "coupon.revoked";
 
 export type EmitAuditLogEventParams = {
   auth: Authenticator;
@@ -93,12 +129,35 @@ export type EmitAuditLogEventParams = {
 };
 
 /**
- * Returns true if audit logs are enabled for the workspace,
- * either via feature flag or plan setting.
+ * Serializes all metadata values to strings so the emitted event matches the
+ * schema definitions, which declare every metadata value as `"string"`.
+ */
+function serializeMetadata(
+  metadata: Record<string, string | number | boolean> | undefined
+): Record<string, string> | undefined {
+  if (!metadata) {
+    return undefined;
+  }
+  const result: Record<string, string> = {};
+  for (const [key, value] of Object.entries(metadata)) {
+    result[key] = typeof value === "string" ? value : String(value);
+  }
+  return result;
+}
+
+/**
+ * Returns true if audit logs are enabled for the workspace.
+ * Enabled when the `audit_logs` feature flag is set or the plan allows it,
+ * unless the workspace kill switch (`metadata.disableAuditLogs`) is on.
+ * The kill switch suppresses both the audit logs UI and event emission, and
+ * can be flipped by workspace admins or by Dust admins via poke.
  */
 export async function isAuditLogsEnabled(
   auth: Authenticator
 ): Promise<boolean> {
+  if (auth.getNonNullableWorkspace().metadata?.disableAuditLogs === true) {
+    return false;
+  }
   if (await hasFeatureFlag(auth, "audit_logs")) {
     return true;
   }
@@ -127,14 +186,22 @@ export async function emitAuditLogEvent({
       return;
     }
 
+    const actor = buildAuditActor(auth);
+    if (!actor.type) {
+      logger.warn({ action }, "Audit event emitted without actor_type");
+    }
+
     await createAuditLogEvent({
       workspace,
       event: {
         action,
-        actor: buildAuditActor(auth),
+        actor,
         targets,
         context: context ?? { location: auth.clientIp() ?? "internal" },
-        metadata,
+        metadata: serializeMetadata({
+          ...metadata,
+          actor_type: actor.type,
+        }),
       },
     });
   } catch (error) {
@@ -174,6 +241,10 @@ export async function emitAuditLogEventDirect({
       return;
     }
 
+    if (workspace.metadata?.disableAuditLogs === true) {
+      return;
+    }
+
     const [subscription, featureFlags] = await Promise.all([
       SubscriptionResource.fetchLastByWorkspace(workspace),
       FeatureFlagResource.listForWorkspace(workspace),
@@ -187,6 +258,10 @@ export async function emitAuditLogEventDirect({
       return;
     }
 
+    if (!actor.type) {
+      logger.warn({ action }, "Audit event emitted without actor_type");
+    }
+
     await createAuditLogEvent({
       workspace,
       event: {
@@ -194,7 +269,10 @@ export async function emitAuditLogEventDirect({
         actor,
         targets,
         context,
-        metadata,
+        metadata: serializeMetadata({
+          ...metadata,
+          actor_type: actor.type,
+        }),
       },
     });
   } catch (error) {
@@ -249,9 +327,13 @@ type AuditTargetType =
   | "data_source"
   | "tool"
   | "trigger"
+  | "wake_up"
   | "api_key"
   | "invitation"
-  | "group";
+  | "group"
+  | "credential"
+  | "mcp_connection"
+  | "sandbox_env_var";
 
 /**
  * Resource shape required for each audit target type.

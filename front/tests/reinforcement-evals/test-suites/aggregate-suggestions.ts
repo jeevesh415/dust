@@ -1,9 +1,12 @@
 import {
   editSkillCallCount,
+  editSkillCallsWithSources,
+  editSkillWithAgentFacingDescription,
   editSkillWithInstructions,
   editSkillWithTool,
   mockTool,
   noSuggestion,
+  rejectSuggestion,
   type TestSuite,
   type WorkspaceContext,
 } from "@app/tests/reinforcement-evals/lib/types";
@@ -15,9 +18,9 @@ function makeInstructionSuggestion(input: {
   sId: string;
   analysis: string;
   instructionEdits: Array<{
-    old_string: string;
-    new_string: string;
-    expected_occurrences?: number;
+    targetBlockId: string;
+    content: string;
+    type?: "replace";
   }>;
   skillConfigurationId?: string;
   source?: "reinforcement" | "synthetic";
@@ -28,14 +31,19 @@ function makeInstructionSuggestion(input: {
     updatedAt: Date.now(),
     skillConfigurationId: input.skillConfigurationId ?? SKILL_SID,
     analysis: input.analysis,
+    title: null,
     state: "pending",
     source: input.source ?? "synthetic",
-    sourceConversationId: null,
+    sourceConversationsCount: 0,
+    visibleSourceConversationIds: [],
+    notificationConversationId: null,
+    updatedBy: null,
     kind: "edit",
     suggestion: {
       instructionEdits: input.instructionEdits.map((e) => ({
-        ...e,
-        expected_occurrences: e.expected_occurrences ?? 1,
+        targetBlockId: e.targetBlockId,
+        content: e.content,
+        type: "replace" as const,
       })),
     },
   };
@@ -55,12 +63,43 @@ function makeToolSuggestion(input: {
     updatedAt: Date.now(),
     skillConfigurationId: input.skillConfigurationId ?? SKILL_SID,
     analysis: input.analysis,
+    title: null,
     state: "pending",
     source: input.source ?? "synthetic",
-    sourceConversationId: null,
+    sourceConversationsCount: 0,
+    visibleSourceConversationIds: [],
+    notificationConversationId: null,
+    updatedBy: null,
     kind: "edit",
     suggestion: {
       toolEdits: [{ action: input.action, toolId: input.toolId }],
+    },
+  };
+}
+
+function makeAgentFacingDescriptionSuggestion(input: {
+  sId: string;
+  analysis: string;
+  content: string;
+  skillConfigurationId?: string;
+  source?: "reinforcement" | "synthetic";
+}): SkillSuggestionType {
+  return {
+    sId: input.sId,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    skillConfigurationId: input.skillConfigurationId ?? SKILL_SID,
+    analysis: input.analysis,
+    title: null,
+    state: "pending",
+    source: input.source ?? "synthetic",
+    sourceConversationsCount: 0,
+    visibleSourceConversationIds: [],
+    notificationConversationId: null,
+    updatedBy: null,
+    kind: "edit",
+    suggestion: {
+      agentFacingDescriptionEdit: { content: input.content },
     },
   };
 }
@@ -99,9 +138,9 @@ export const aggregateSuggestionsSuite: TestSuite = {
             "User complained that the skill's responses were too blunt and impersonal. The instructions should emphasize a warmer, more empathetic tone.",
           instructionEdits: [
             {
-              old_string: "Be professional.",
-              new_string:
-                "Be professional, warm, and empathetic. Acknowledge the customer's situation before providing solutions.",
+              targetBlockId: "block-professional",
+              content:
+                "<p>Be professional, warm, and empathetic. Acknowledge the customer's situation before providing solutions.</p>",
             },
           ],
         }),
@@ -111,9 +150,9 @@ export const aggregateSuggestionsSuite: TestSuite = {
             "User found the skill's language too robotic. The instructions should guide the skill to use more natural, conversational language.",
           instructionEdits: [
             {
-              old_string: "Be professional.",
-              new_string:
-                "Be professional and use natural, conversational language. Avoid formulaic or robotic phrasing.",
+              targetBlockId: "block-professional",
+              content:
+                "<p>Be professional and use natural, conversational language. Avoid formulaic or robotic phrasing.</p>",
             },
           ],
         }),
@@ -123,15 +162,17 @@ export const aggregateSuggestionsSuite: TestSuite = {
             "User reported the skill jumped straight to solutions without acknowledging the problem. Instructions should include empathy-first guidance.",
           instructionEdits: [
             {
-              old_string: "Be professional.",
-              new_string:
-                "Be professional. Always acknowledge the customer's frustration before jumping to a solution.",
+              targetBlockId: "block-professional",
+              content:
+                "<p>Be professional. Always acknowledge the customer's frustration before jumping to a solution.</p>",
             },
           ],
         }),
       ],
       workspaceContext: WORKSPACE_CONTEXT,
-      expectedToolCalls: [editSkillWithInstructions(SKILL_SID)],
+      expectedToolCalls: [
+        editSkillWithInstructions(SKILL_SID, ["sug-1", "sug-2", "sug-3"]),
+      ],
       judgeCriteria: `The analyst MUST call edit_skill with instructionEdits for skill "${SKILL_SID}".
 The merged suggestion should:
 - Combine all three themes: warmth/empathy, natural language, and acknowledge-first approach
@@ -181,7 +222,13 @@ Score 3 if well-merged with all themes, clear structure, and analysis referencin
         }),
       ],
       workspaceContext: WORKSPACE_CONTEXT,
-      expectedToolCalls: [editSkillWithTool("skill_engineering", "mcp_jira")],
+      expectedToolCalls: [
+        editSkillWithTool("skill_engineering", "mcp_jira", [
+          "sug-1",
+          "sug-2",
+          "sug-3",
+        ]),
+      ],
       judgeCriteria: `The analyst MUST call edit_skill with toolEdits to suggest adding JIRA (mcp_jira)
 to skill "skill_engineering". The aggregated suggestion should:
 - Merge the 3 individual suggestions into a single recommendation
@@ -210,9 +257,9 @@ Score 3 if well-merged with clear analysis covering all use cases and conversati
             "User complained about the skill's tone being too cold. The skill should adopt a warmer communication style with more empathy.",
           instructionEdits: [
             {
-              old_string: "Be professional.",
-              new_string:
-                "Be professional, warm, and empathetic. Show care for the customer's needs.",
+              targetBlockId: "block-professional",
+              content:
+                "<p>Be professional, warm, and empathetic. Show care for the customer's needs.</p>",
             },
           ],
         }),
@@ -226,9 +273,9 @@ Score 3 if well-merged with clear analysis covering all use cases and conversati
               "Multiple users found responses impersonal. Adding warmth and a friendlier tone would improve satisfaction.",
             instructionEdits: [
               {
-                old_string: "Be professional.",
-                new_string:
-                  "Be professional. Use a warm, conversational tone. Be friendly and approachable. Show genuine care for the user's needs.",
+                targetBlockId: "block-professional",
+                content:
+                  "<p>Be professional. Use a warm, conversational tone. Be friendly and approachable. Show genuine care for the user's needs.</p>",
               },
             ],
           }),
@@ -236,13 +283,14 @@ Score 3 if well-merged with clear analysis covering all use cases and conversati
         rejected: [],
       },
       workspaceContext: WORKSPACE_CONTEXT,
-      expectedToolCalls: [noSuggestion()],
+      expectedToolCalls: [noSuggestion(), rejectSuggestion(["sug-1"])],
       judgeCriteria: `The synthetic suggestion about tone/warmth is essentially the same as the existing pending
-suggestion. The analyst must not duplicate it.
+suggestion. The analyst must not duplicate it and must reject the source suggestion using reject_suggestion.
 
 Score 0 if it creates a suggestion similar to the existing pending one (tone/warmth/friendliness).
-Score 1 if it creates an unrelated suggestion.
-Score 3 if no suggestion is created.`,
+Score 1 if no edit_skill suggestion is created but reject_suggestion is not called for sug-1.
+Score 1 if reject_suggestion is called but with wrong sourceSuggestionIds.
+Score 3 if no edit_skill suggestion is created AND reject_suggestion is called with sourceSuggestionIds including "sug-1".`,
     },
     {
       scenarioId: "dedup-vs-rejected",
@@ -260,9 +308,9 @@ Score 3 if no suggestion is created.`,
             "User was frustrated that the skill didn't acknowledge their problem before jumping to solutions. The skill should show empathy first.",
           instructionEdits: [
             {
-              old_string: "Be professional.",
-              new_string:
-                "Be professional. When users report issues, always acknowledge their frustration and show understanding before providing a solution.",
+              targetBlockId: "block-professional",
+              content:
+                "<p>Be professional. When users report issues, always acknowledge their frustration and show understanding before providing a solution.</p>",
             },
           ],
         }),
@@ -277,22 +325,23 @@ Score 3 if no suggestion is created.`,
               "Users wanted more empathetic responses. The skill should acknowledge frustration and show understanding before jumping to solutions.",
             instructionEdits: [
               {
-                old_string: "Be professional.",
-                new_string:
-                  "Be professional. When users report problems, first acknowledge their frustration. Show understanding and empathy before providing solutions.",
+                targetBlockId: "block-professional",
+                content:
+                  "<p>Be professional. When users report problems, first acknowledge their frustration. Show understanding and empathy before providing solutions.</p>",
               },
             ],
           }),
         ],
       },
       workspaceContext: WORKSPACE_CONTEXT,
-      expectedToolCalls: [noSuggestion()],
+      expectedToolCalls: [noSuggestion(), rejectSuggestion(["sug-1"])],
       judgeCriteria: `The synthetic suggestion about empathy/acknowledging frustration is essentially the same
-as a previously rejected suggestion. The analyst must not recreate it.
+as a previously rejected suggestion. The analyst must not recreate it and must reject the source suggestion using reject_suggestion.
 
 Score 0 if it creates a suggestion similar to the rejected one (empathy/acknowledging frustration).
-Score 1 if it creates an unrelated suggestion.
-Score 3 if no suggestion is created.`,
+Score 1 if no edit_skill suggestion is created but reject_suggestion is not called for sug-1.
+Score 1 if reject_suggestion is called but with wrong sourceSuggestionIds.
+Score 3 if no edit_skill suggestion is created AND reject_suggestion is called with sourceSuggestionIds including "sug-1".`,
     },
     {
       scenarioId: "split-unrelated-topics",
@@ -311,9 +360,9 @@ Score 3 if no suggestion is created.`,
             "User found the responses cold and transactional. The skill should adopt a warmer, more empathetic tone to make customers feel heard.",
           instructionEdits: [
             {
-              old_string: "Be professional.",
-              new_string:
-                "Be professional and empathetic. Acknowledge the customer's feelings before moving to solutions.",
+              targetBlockId: "block-professional",
+              content:
+                "<p>Be professional and empathetic. Acknowledge the customer's feelings before moving to solutions.</p>",
             },
           ],
         }),
@@ -323,9 +372,9 @@ Score 3 if no suggestion is created.`,
             "User felt the skill's language was overly formal and robotic. Instructions should encourage a more natural, conversational style.",
           instructionEdits: [
             {
-              old_string: "Be professional.",
-              new_string:
-                "Be professional but approachable. Use natural, conversational language instead of formal or robotic phrasing.",
+              targetBlockId: "block-professional",
+              content:
+                "<p>Be professional but approachable. Use natural, conversational language instead of formal or robotic phrasing.</p>",
             },
           ],
         }),
@@ -335,9 +384,9 @@ Score 3 if no suggestion is created.`,
             "User asked to update their account email but the skill looked up the wrong account because it searched by name instead of account ID. Instructions should require using the account ID when calling the CRM tool.",
           instructionEdits: [
             {
-              old_string: "Use the CRM tool to look up customer accounts.",
-              new_string:
-                "Use the CRM tool to look up customer accounts. Always search by account ID rather than customer name to avoid fetching the wrong record.",
+              targetBlockId: "block-crm",
+              content:
+                "<p>Use the CRM tool to look up customer accounts. Always search by account ID rather than customer name to avoid fetching the wrong record.</p>",
             },
           ],
         }),
@@ -347,15 +396,20 @@ Score 3 if no suggestion is created.`,
             "User reported the skill retrieved outdated account data. The CRM tool must be called with the refresh flag so the skill always works with the latest information.",
           instructionEdits: [
             {
-              old_string: "Use the CRM tool to look up customer accounts.",
-              new_string:
-                "Use the CRM tool to look up customer accounts. Pass the refresh flag when calling the CRM tool to ensure account data is up to date.",
+              targetBlockId: "block-crm",
+              content:
+                "<p>Use the CRM tool to look up customer accounts. Pass the refresh flag when calling the CRM tool to ensure account data is up to date.</p>",
             },
           ],
         }),
       ],
       workspaceContext: WORKSPACE_CONTEXT,
-      expectedToolCalls: [editSkillCallCount(2)],
+      expectedToolCalls: [
+        editSkillCallsWithSources([
+          ["sug-tone-1", "sug-tone-2"],
+          ["sug-tool-1", "sug-tool-2"],
+        ]),
+      ],
       judgeCriteria: `The analyst receives 4 synthetic suggestions: 2 about tone (warmth/empathy and natural language)
 and 2 about CRM tool usage (search by ID, use refresh flag). These are unrelated topics and MUST
 result in 2 separate edit_skill calls — one for tone, one for CRM tool usage.
@@ -382,12 +436,12 @@ tool usage (account ID + refresh flag), each with well-written merged instructio
           sId: "sug-1",
           skillConfigurationId: "skill_writing",
           analysis:
-            "User found responses slightly long. The skill tends to include one or two unnecessary filler sentences at the end.",
+            "Response was slightly long. The skill tends to include one or two unnecessary filler sentences at the end.",
           instructionEdits: [
             {
-              old_string: "Focus on clarity and correctness.",
-              new_string:
-                "Focus on clarity and correctness. Keep responses concise. Avoid unnecessary filler sentences.",
+              targetBlockId: "instructions-root",
+              content:
+                "<p>Focus on clarity and correctness. Keep responses concise. Avoid unnecessary filler sentences.</p>",
             },
           ],
         }),
@@ -396,10 +450,69 @@ tool usage (account ID + refresh flag), each with well-written merged instructio
       expectedToolCalls: [noSuggestion()],
       judgeCriteria: `There is only one synthetic suggestion from a single conversation, and the issue is minor
 (slight verbosity / filler sentences — a style preference). According to prioritisation rules,
-low-severity issues from a single conversation should be dropped.
+low-severity issues from a single conversation should be ignored, but not rejected.
 
-Score 0 if it creates any suggestion based on this single minor synthetic input.
-Score 3 if no suggestion is created (correct: single low-severity conversation is insufficient evidence).`,
+Score 0 if it creates any edit_skill suggestion based on this single minor synthetic input.
+Score 1 if no edit_skill suggestion is created but reject_suggestion is not called for sug-1.
+Score 1 if reject_suggestion is called.
+Score 3 if no edit_skill suggestion is created AND reject_suggestion is not called.`,
+    },
+    {
+      scenarioId: "merge-description-edits-keep-tool-separate",
+      type: "aggregation",
+      skillConfig: {
+        name: "Payment Issue Resolver",
+        sId: "skill_payment_resolver",
+        description: "Helps customers with payment issues.",
+        instructions:
+          "When a payment fails, ask for the transaction ID and call payment-retry. For chargeback disputes, collect the dispute reason and call chargeback-open.",
+      },
+      syntheticSuggestions: [
+        makeAgentFacingDescriptionSuggestion({
+          sId: "sug-desc-1",
+          skillConfigurationId: "skill_payment_resolver",
+          analysis:
+            "Skill triggered for a billing address change. The description is too generic, the agent should not have selected this skill.",
+          content:
+            "Use this skill ONLY for failed payments and chargeback disputes. Do not use it for billing address updates, invoice questions, or other account-management tasks.",
+        }),
+        makeAgentFacingDescriptionSuggestion({
+          sId: "sug-desc-2",
+          skillConfigurationId: "skill_payment_resolver",
+          analysis:
+            "Skill triggered for an invoice download request. Description gives no signal that this skill is scoped to payment failures and chargebacks only.",
+          content:
+            "For payment failures and chargeback disputes only. Skip this skill for invoice or receipt requests — those are handled elsewhere.",
+        }),
+        makeToolSuggestion({
+          sId: "sug-tool-1",
+          skillConfigurationId: "skill_payment_resolver",
+          analysis:
+            "User asked the skill to file an internal incident ticket for a flagged chargeback. The skill had no JIRA tool to do so, it's crucial to add it.",
+          action: "add",
+          toolId: "mcp_jira",
+        }),
+      ],
+      workspaceContext: WORKSPACE_CONTEXT,
+      expectedToolCalls: [
+        editSkillCallCount(2),
+        editSkillWithAgentFacingDescription("skill_payment_resolver", [
+          "sug-desc-1",
+          "sug-desc-2",
+        ]),
+        editSkillWithTool("skill_payment_resolver", "mcp_jira", ["sug-tool-1"]),
+      ],
+      judgeCriteria: `Two of the three drafts target the agent-facing description (both about narrowing routing), and one is unrelated tooling work (adding JIRA). Aggregation rules require:
+- ONE description-edit suggestion per skill, merging both description drafts (sug-desc-1 + sug-desc-2). The merged description must explicitly limit the skill to payment failures + chargebacks AND steer the agent away from generic billing/invoice/account-management requests.
+- The description edit MUST be its own standalone edit_skill call. Do NOT bundle it with the tool addition (different topic, different fix).
+- A separate edit_skill call for the JIRA tool addition (sug-tool-1).
+
+Score 0 if no edit_skill call carries an agentFacingDescriptionEdit for skill_payment_resolver.
+Score 0 if the description edit and the tool addition are bundled into a single edit_skill call.
+Score 0 if more than 2 edit_skill calls are produced (failure to merge sug-desc-1 + sug-desc-2).
+Score 1 if 2 separate edit_skill calls are made but the merged description doesn't explicitly carve out billing/invoice routing (i.e. it stays vague).
+Score 2 if 2 separate edit_skill calls are made and the merged description narrows scope but does not reference both supporting drafts (sug-desc-1 + sug-desc-2 in sourceSuggestionIds).
+Score 3 if exactly 2 edit_skill calls are made: one with agentFacingDescriptionEdit consolidating sug-desc-1 + sug-desc-2 into a description that limits the skill to failures/chargebacks AND explicitly excludes generic billing/invoice/account-management requests; one with toolEdits adding mcp_jira referencing sug-tool-1.`,
     },
   ],
 };

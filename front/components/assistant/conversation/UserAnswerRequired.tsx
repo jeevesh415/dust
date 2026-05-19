@@ -1,5 +1,6 @@
 import { useBlockedActionsContext } from "@app/components/assistant/conversation/BlockedActionsProvider";
 import { useAnswerUserQuestion } from "@app/hooks/useAnswerUserQuestion";
+import { useUserAnswerDraft } from "@app/hooks/useUserAnswerDraft";
 import type { BlockedToolExecution } from "@app/lib/actions/mcp";
 import type { UserQuestionAnswer } from "@app/lib/actions/types";
 import { useAuth } from "@app/lib/auth/AuthContext";
@@ -14,7 +15,8 @@ import {
   OptionCard,
   Spinner,
 } from "@dust-tt/sparkle";
-import { useState } from "react";
+import type { KeyboardEvent } from "react";
+import { useEffect, useRef, useState } from "react";
 
 interface UserAnswerRequiredProps {
   blockedAction: BlockedToolExecution & {
@@ -24,6 +26,20 @@ interface UserAnswerRequiredProps {
   owner: LightWorkspaceType;
   conversationId: string;
   messageId: string;
+}
+
+function isPrintableKey(e: KeyboardEvent<HTMLDivElement>) {
+  return (
+    e.key.length === 1 && e.key !== " " && !e.altKey && !e.ctrlKey && !e.metaKey
+  );
+}
+
+function isEditableTarget(target: EventTarget) {
+  return (
+    target instanceof HTMLInputElement ||
+    target instanceof HTMLTextAreaElement ||
+    (target instanceof HTMLElement && target.isContentEditable)
+  );
 }
 
 export function UserAnswerRequired({
@@ -39,19 +55,34 @@ export function UserAnswerRequired({
     owner,
   });
 
-  const [selectedOptions, setSelectedOptions] = useState<number[]>([]);
-  const [customResponse, setCustomResponse] = useState("");
+  const answerDraft = useUserAnswerDraft({
+    multiSelect: blockedAction.question.multiSelect,
+  });
   const [isSkipPending, setIsSkipPending] = useState(false);
+  const [activeOptionIndex, setActiveOptionIndex] = useState(0);
+  const [isCustomResponseFocused, setIsCustomResponseFocused] = useState(false);
+  const [isKeyboardNavigating, setIsKeyboardNavigating] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const customResponseInputRef = useRef<HTMLInputElement>(null);
 
   const { question } = blockedAction;
   const isTriggeredByCurrentUser = blockedAction.userId === user?.sId;
 
-  const trimmedCustomResponse = customResponse.trim();
-  const isCustomResponseSelected =
-    trimmedCustomResponse.length > 0 && selectedOptions.length === 0;
+  const isCustomResponseActive =
+    isCustomResponseFocused ||
+    answerDraft.answerToSubmit?.customResponse !== undefined;
 
   const isAnswerSubmitting = isSubmitting && !isSkipPending;
   const isSkipSubmitting = isSubmitting && isSkipPending;
+
+  // Reset the keyboard cursor and focus when a new blocked action replaces the current one.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: blockedAction.actionId is an intentional reset trigger
+  useEffect(() => {
+    setActiveOptionIndex(0);
+    setIsCustomResponseFocused(false);
+    setIsKeyboardNavigating(false);
+    containerRef.current?.focus({ preventScroll: true });
+  }, [blockedAction.actionId]);
 
   async function submitAnswer(
     answer: UserQuestionAnswer,
@@ -71,38 +102,43 @@ export function UserAnswerRequired({
 
     setIsSkipPending(false);
   }
+
+  function activateOption(index: number) {
+    setIsCustomResponseFocused(false);
+    setActiveOptionIndex(index);
+  }
+
   function handleOptionClick(index: number) {
     if (isSubmitting) {
       return;
     }
 
-    if (question.multiSelect) {
-      setSelectedOptions((prev) =>
-        prev.includes(index)
-          ? prev.filter((i) => i !== index)
-          : [...prev, index]
-      );
+    activateOption(index);
+
+    const answer = answerDraft.selectOption(index);
+
+    if (answer !== null) {
+      void submitAnswer(answer);
+    }
+  }
+
+  function moveActiveOption(direction: 1 | -1) {
+    if (question.options.length === 0) {
       return;
     }
 
-    setSelectedOptions([index]);
-    void submitAnswer({ selectedOptions: [index] });
+    setActiveOptionIndex(
+      (prev) =>
+        (prev + direction + question.options.length) % question.options.length
+    );
   }
 
   function handleSubmit() {
-    if (isSubmitting) {
+    if (isSubmitting || answerDraft.answerToSubmit === null) {
       return;
     }
 
-    if (!isCustomResponseSelected && selectedOptions.length === 0) {
-      return;
-    }
-
-    void submitAnswer(
-      selectedOptions.length > 0
-        ? { selectedOptions }
-        : { selectedOptions, customResponse: trimmedCustomResponse }
-    );
+    void submitAnswer(answerDraft.answerToSubmit);
   }
 
   function handleSkip() {
@@ -111,6 +147,103 @@ export function UserAnswerRequired({
     }
 
     void submitAnswer({ selectedOptions: [] }, { isSkip: true });
+  }
+
+  function handleActiveOptionSelection() {
+    if (question.options.length === 0) {
+      return;
+    }
+
+    handleOptionClick(activeOptionIndex);
+  }
+
+  function handleStartCustomResponse(character: string) {
+    setIsCustomResponseFocused(true);
+    answerDraft.appendCustomResponse(character);
+    customResponseInputRef.current?.focus();
+  }
+
+  function handleCustomResponseKeyDown(e: KeyboardEvent<HTMLInputElement>) {
+    if (
+      e.key === "Backspace" &&
+      answerDraft.customResponse.length === 0 &&
+      question.options.length > 0
+    ) {
+      e.preventDefault();
+      setIsKeyboardNavigating(true);
+      setIsCustomResponseFocused(false);
+      setActiveOptionIndex(question.options.length - 1);
+      containerRef.current?.focus();
+      return;
+    }
+
+    if (
+      e.key === "Enter" &&
+      (!question.multiSelect || e.metaKey || e.ctrlKey)
+    ) {
+      e.preventDefault();
+      setIsKeyboardNavigating(true);
+      handleSubmit();
+    }
+  }
+
+  function handleContainerKeyDownCapture(e: KeyboardEvent<HTMLDivElement>) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      setIsKeyboardNavigating(true);
+      handleSkip();
+      return;
+    }
+
+    if (isEditableTarget(e.target)) {
+      return;
+    }
+
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter" && question.multiSelect) {
+      e.preventDefault();
+      e.stopPropagation();
+      setIsKeyboardNavigating(true);
+      handleSubmit();
+    }
+  }
+
+  function handleContainerKeyDown(e: KeyboardEvent<HTMLDivElement>) {
+    if (isEditableTarget(e.target)) {
+      return;
+    }
+
+    if (isPrintableKey(e)) {
+      e.preventDefault();
+      setIsKeyboardNavigating(true);
+      handleStartCustomResponse(e.key);
+      return;
+    }
+
+    switch (e.key) {
+      case "ArrowDown":
+        e.preventDefault();
+        setIsKeyboardNavigating(true);
+        setIsCustomResponseFocused(false);
+        moveActiveOption(1);
+        containerRef.current?.focus();
+        break;
+      case "ArrowUp":
+        e.preventDefault();
+        setIsKeyboardNavigating(true);
+        setIsCustomResponseFocused(false);
+        moveActiveOption(-1);
+        containerRef.current?.focus();
+        break;
+      case "Enter":
+      case " ":
+        if (e.currentTarget === e.target) {
+          e.preventDefault();
+          setIsKeyboardNavigating(true);
+          handleActiveOptionSelection();
+        }
+        break;
+    }
   }
 
   if (!isTriggeredByCurrentUser) {
@@ -127,9 +260,15 @@ export function UserAnswerRequired({
 
   return (
     <div
+      ref={containerRef}
+      tabIndex={0}
+      onKeyDownCapture={handleContainerKeyDownCapture}
+      onKeyDown={handleContainerKeyDown}
+      onMouseMove={() => setIsKeyboardNavigating(false)}
       className={cn(
-        "flex flex-col gap-4 rounded-3xl border border-border bg-background p-4",
-        "dark:border-border-night dark:bg-background-night"
+        "flex flex-col gap-4 rounded-2xl border border-dark bg-background p-5 outline-none",
+        "dark:border-dark-night dark:bg-background-night",
+        isKeyboardNavigating && "cursor-none"
       )}
     >
       <div className="text-base font-medium leading-tight text-foreground dark:text-foreground-night">
@@ -147,7 +286,17 @@ export function UserAnswerRequired({
               label={option.label}
               description={option.description}
               counterValue={index + 1}
-              selected={selectedOptions.includes(index)}
+              selected={answerDraft.selectedOptions.includes(index)}
+              disableHover={isKeyboardNavigating}
+              onFocusCapture={() => activateOption(index)}
+              onMouseEnter={() => activateOption(index)}
+              className={cn(
+                activeOptionIndex === index &&
+                  !isCustomResponseActive &&
+                  !answerDraft.selectedOptions.includes(index) &&
+                  "bg-primary-100 dark:bg-primary-100-night",
+                isKeyboardNavigating && "cursor-none"
+              )}
               onClick={() => handleOptionClick(index)}
               disabled={isAnswerSubmitting}
             />
@@ -155,15 +304,13 @@ export function UserAnswerRequired({
           <Card
             variant="tertiary"
             className={cn(
-              "flex w-full items-center gap-2 rounded-2xl p-3 transition-colors",
-              isCustomResponseSelected &&
-                "border-border dark:border-border-night",
-              isCustomResponseSelected
-                ? "bg-muted-background dark:bg-muted-background-night"
+              "w-full items-center gap-2 transition-colors",
+              isCustomResponseActive
+                ? "bg-primary-100 dark:bg-primary-100-night"
                 : [
-                    "bg-background hover:bg-muted-background/60",
-                    "dark:bg-background-night",
-                    "dark:hover:bg-muted-background-night/60",
+                    "bg-background dark:bg-background-night ",
+                    !isKeyboardNavigating &&
+                      "hover:bg-primary-100 dark:hover:bg-primary-100-night",
                   ]
             )}
           >
@@ -171,12 +318,10 @@ export function UserAnswerRequired({
               value={question.options.length + 1}
               size="sm"
               variant="ghost"
-              className={cn(
-                "shrink-0 bg-border-dark text-muted-foreground",
-                "dark:bg-border-dark-night dark:text-muted-foreground-night"
-              )}
+              className="shrink-0 bg-border-darker dark:bg-border-darker-night"
             />
             <Input
+              ref={customResponseInputRef}
               id={`custom-response-${blockedAction.actionId}`}
               containerClassName="flex-1"
               className={cn(
@@ -184,20 +329,18 @@ export function UserAnswerRequired({
                 "px-0 py-0 text-sm shadow-none",
                 "dark:border-transparent dark:bg-transparent",
                 "focus-visible:border-transparent focus-visible:ring-0",
-                "dark:focus-visible:border-transparent dark:focus-visible:ring-0"
+                "dark:focus-visible:border-transparent dark:focus-visible:ring-0",
+                isKeyboardNavigating && "cursor-none"
               )}
               placeholder="Type something else"
-              value={customResponse}
+              value={answerDraft.customResponse}
               onFocus={() => {
-                setSelectedOptions([]);
+                setIsCustomResponseFocused(true);
+                answerDraft.selectCustomResponse();
               }}
-              onChange={(e) => setCustomResponse(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  handleSubmit();
-                }
-              }}
+              onBlur={() => setIsCustomResponseFocused(false)}
+              onChange={(e) => answerDraft.updateCustomResponse(e.target.value)}
+              onKeyDown={handleCustomResponseKeyDown}
               name="custom-response"
               disabled={isSubmitting}
             />
@@ -222,9 +365,7 @@ export function UserAnswerRequired({
           variant="highlight"
           size="sm"
           isLoading={isAnswerSubmitting}
-          disabled={
-            trimmedCustomResponse.length === 0 && selectedOptions.length === 0
-          }
+          disabled={answerDraft.answerToSubmit === null}
           onClick={handleSubmit}
           aria-label="Send answer"
         />

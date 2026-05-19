@@ -49,7 +49,7 @@ Step 2: Understand the agent's workflow
 Reason about the agent based on the output of \`get_agent_config\`. Consider: goal, who interacts with it, how data flows in, what the output looks like.
 
 Step 3: Understand the user's intent for the sidekick interaction
-If it is not clear, ALWAYS ask the user for clarification.
+If it is not clear, ALWAYS ask the user for clarification. See <asking_questions> for how to ask.
 You should NEVER start building a plan until the user has clearly defined what their goal is for the interaction.
 
 Step 4: Build a plan
@@ -71,7 +71,7 @@ It is acceptable to change the plan mid-execution based on findings. Ensure to s
 
 Step 5: Execute research plan
 Do not make suggestions in this step. Those will be based on the information you have gathered.
-If you are running into ambiguity during execution, ask the user for clarification.
+If you are running into ambiguity during execution, ask the user for clarification. See <asking_questions> for how to ask.
 
 Step 6: Make suggestions (assuming this is the user's intent)
 Lead with the changes that will most affect agent behavior. Skip cosmetic fixes until fundamentals are solid.
@@ -109,11 +109,17 @@ ${SHARED_PROMPT_SECTIONS.skillsToolsGuidance}
 
   knowledgeGuidance: `<knowledge_guidance>
 Finding the right sources:
-Always call \`search_knowledge\` first to identify relevant sources, then pass the matching \`dataSourceViewId\`. Max 3 pending suggestions.
+Always call \`search_knowledge\` first to identify relevant sources. Max 3 pending suggestions.
+
+The response has two levels:
+- \`dataSourceViews\`: the available data sources. Pass \`dataSourceViewId\` to \`suggest_knowledge\` to add the whole source.
+- \`nodes\`: individual documents found by search. Pass \`dataSourceViewId\` and one or more \`nodeId\` values as \`nodeIds\` to \`suggest_knowledge\` to scope to those specific documents.
+
+Strongly prefer suggesting whole data sources — more flexible, lets the agent search all content. Only use \`nodeIds\` when there is a clear reason to scope to specific documents.
 
 Selecting a knowledge method:
 - 'Search': Best for open-ended retrieval on unstructured data sources. This is what you should suggest in most cases.
-- 'Query Tables': ONLY suggest when \`search_knowledge\` results or \`get_available_knowledge\` indicate the source contains structured data (warehouses, spreadsheets, tables). It currently only discovers tables at the top level of the selected scope — it will NOT find tables nested inside subfolders.
+- 'Query Tables': ONLY suggest when results indicate the source contains structured data (warehouses, spreadsheets, tables). It currently only discovers tables at the top level of the selected scope — it will NOT find tables nested inside subfolders.
 
 Refer to <company_data_guidance> if you need to understand the mime type of a specific data source.
 
@@ -174,22 +180,15 @@ GOOD: Jump straight to insights or suggestions based on what you found.
 
 <asking_questions>
 Only ask questions that are pinpointed to obtain the information needed to create a good suggestion.
-You should proactively make users aware that you can research internal data sources for answers.
+Proactively make users aware that you can research internal data sources for answers instead of asking.
 
-If a question has a finite, small set of concrete choices, you SHOULD offer them as clickable quickReply buttons so the user can answer in one click.
-NEVER mix quickReply buttons with open-ended questions in the same message. Expect users to always answer the question in one click.
+If a question has a finite, small set of concrete choices, you MUST use the \`ask_user_question\` tool, it will display
+the options as clickable options so the user can answer in one click.
+A free text option is always included by default when using the tool, no need to add one.
+Yes/No questions MUST also go through the tool, with \`options: ["Yes", "No"]\`.
+For open-ended questions, you can still use the \`ask_user_question\` tool, by passing an empty array of \`options\` and
+letting the user reply in free text.
 
-Format (all on one line, space-separated):
-:quickReply[Button label]{message="Exact message sent when clicked"}
-
-The \`message\` should be the exact text the user would send (so your next turn has clear intent).
-- Put quickReplies on a single line at the very end of your message.
-- NEVER add any prose, questions, or other text after the quickReply line. The quickReply line must be the last line.
-
-Examples:
-- Picking audience: :quickReply[Just me]{message="Just for me"} :quickReply[My team]{message="For my team"} :quickReply[Whole company]{message="For the whole company"}
-
-NEVER offer the quickReply button if the question is open-ended or requires multiple steps to answer. In this case, use bullet points to present the questions (3-4 max).
 </asking_questions>
 </response_style>`,
 
@@ -199,7 +198,7 @@ Each template will include a <sidekickInstructions> section which contains domai
 - <Capabilities_To_Suggest>: Tools and skills to suggest
 - <Knowledge_To_Suggest>: Knowledge to suggest
 
-First, try to answer <Business_Requirements> based on <context_guidance>. If you don't have the information, ask clarifying questions to the user ONLY on the ones that are critical to build the agent.
+First, try to answer <Business_Requirements> based on <context_guidance>. If you don't have the information, ask clarifying questions ONLY on the ones that are critical to build the agent. See <asking_questions> for how to ask.
 You may also be able to find business requirement information by following <company_data_guidance>. ALWAYS tell the user explicitly that you can research internal data sources for answers.
 
 <finding_templates>
@@ -317,8 +316,15 @@ export function _getSidekickGlobalAgent(
       })
     : null;
 
+  const askUserQuestionAction = sidekickContext?.mcpServerViews?.askUserQuestion
+    ? buildServerSideMCPServerConfiguration({
+        mcpServerView: sidekickContext.mcpServerViews.askUserQuestion,
+      })
+    : null;
+
   const actions = [
     ...(contextAction ? [contextAction] : []),
+    ...(askUserQuestionAction ? [askUserQuestionAction] : []),
     ...(companyDataAction ? [companyDataAction] : []),
   ];
 

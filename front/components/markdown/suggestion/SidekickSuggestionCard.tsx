@@ -9,13 +9,18 @@ import { useSidekickSuggestions } from "@app/components/agent_builder/sidekick/S
 import { getDefaultMCPAction } from "@app/components/agent_builder/types";
 import { InstructionSuggestionExtension } from "@app/components/editor/extensions/agent_builder/InstructionSuggestionExtension";
 import { getIcon } from "@app/components/resources/resources_icons";
+import { getBlockOuterHtml } from "@app/components/shared/utils";
 import { getMcpServerViewDisplayName } from "@app/lib/actions/mcp_helper";
 import type { MCPServerViewType } from "@app/lib/api/mcp";
 import { CONNECTOR_UI_CONFIGURATIONS } from "@app/lib/connector_providers_ui";
 import { getDisplayNameForDataSource } from "@app/lib/data_sources";
 import { getSkillAvatarIcon } from "@app/lib/skill";
 import { useAgentConfigurations } from "@app/lib/swr/assistants";
-import type { DataSourceViewType } from "@app/types/data_source_view";
+import { useDataSourceViewContentNodes } from "@app/lib/swr/data_source_views";
+import type {
+  DataSourceViewContentNode,
+  DataSourceViewType,
+} from "@app/types/data_source_view";
 import { defaultSelectionConfiguration } from "@app/types/data_source_view";
 import { assertNeverAndIgnore } from "@app/types/shared/utils/assert_never";
 import type {
@@ -84,13 +89,7 @@ const InstructionsSuggestionCard = memo(
         return "";
       }
 
-      const parser = new DOMParser();
-      const doc = parser.parseFromString(instructionsHtml, "text/html");
-      const targetElement = doc.querySelector(
-        `[data-block-id="${targetBlockId}"]`
-      );
-
-      return targetElement ? targetElement.outerHTML : "";
+      return getBlockOuterHtml(instructionsHtml, targetBlockId);
     }, [targetBlockId, getCommittedInstructionsHtml]);
 
     const editor = useEditor(
@@ -479,13 +478,23 @@ const KNOWLEDGE_METHOD_ACTION_VERB: Record<string, string> = {
   query_tables: "Query",
 };
 
+const MAX_VISIBLE_NODES = 2;
+
+function formatNodeScopeTitles(nodes: DataSourceViewContentNode[]): string {
+  const visible = nodes.slice(0, MAX_VISIBLE_NODES);
+  const rest = nodes.length - MAX_VISIBLE_NODES;
+  const titles = visible.map((n) => n.title).join(", ");
+  return rest > 0 ? `${titles} (+${rest} more)` : titles;
+}
+
 function buildNewKnowledgeAction(
   serverView: MCPServerViewType,
   method: string,
   dataSourceView: DataSourceViewType,
   displayName: string,
   description: string | null,
-  currentActions: AgentBuilderFormData["actions"]
+  currentActions: AgentBuilderFormData["actions"],
+  selectedNodes: DataSourceViewContentNode[]
 ): ReturnType<typeof getDefaultMCPAction> {
   const newAction = getDefaultMCPAction(serverView);
   if (method === "query_tables") {
@@ -509,9 +518,9 @@ function buildNewKnowledgeAction(
   newAction.configuration.dataSourceConfigurations = {
     [dataSourceView.sId]: {
       dataSourceView,
-      selectedResources: [],
+      selectedResources: selectedNodes,
       excludedResources: [],
-      isSelectAll: true,
+      isSelectAll: selectedNodes.length === 0,
       tagsFilter: null,
     },
   };
@@ -548,17 +557,32 @@ function KnowledgeSuggestionCard({
   const cardState = mapSuggestionStateToCardState(state);
   const { acceptSuggestion, rejectSuggestion } = useSidekickSuggestions();
   const { setValue, getValues } = useFormContext<AgentBuilderFormData>();
+  const { owner } = useAgentBuilderContext();
 
   const isAddition = suggestion.action === "add";
   const { dataSourceView, serverView } = relations;
   const method = suggestion.method ?? "search";
   const isQueryTables = method === "query_tables";
   const displayName = getDisplayNameForDataSource(dataSourceView.dataSource);
+  const hasNodeScope =
+    suggestion.nodeIds != null && suggestion.nodeIds.length > 0;
+
+  const { nodes: selectedNodes, isNodesLoading } =
+    useDataSourceViewContentNodes({
+      owner,
+      dataSourceView,
+      internalIds: suggestion.nodeIds,
+      viewType: "document",
+      disabled: !hasNodeScope,
+    });
 
   const handleAccept = async (
     agentSuggestion: AgentKnowledgeSuggestionWithRelationsType
   ) => {
     if (!serverView) {
+      return;
+    }
+    if (hasNodeScope && isNodesLoading) {
       return;
     }
     const success = await acceptSuggestion(agentSuggestion);
@@ -575,7 +599,8 @@ function KnowledgeSuggestionCard({
             dataSourceView,
             displayName,
             suggestion.description ?? null,
-            currentActions
+            currentActions,
+            selectedNodes
           ),
         ]
       : removeFirstWhere(currentActions, (action) =>
@@ -600,6 +625,20 @@ function KnowledgeSuggestionCard({
       ].getLogoComponent()
     : FolderIcon;
 
+  const hasVisibleScope = hasNodeScope && selectedNodes.length > 0;
+  const description =
+    hasVisibleScope || analysis ? (
+      <div className="flex flex-col gap-1">
+        {hasVisibleScope && (
+          <span>
+            <span className="font-medium">Selections:</span>{" "}
+            {formatNodeScopeTitles(selectedNodes)}
+          </span>
+        )}
+        {analysis && <span>{analysis}</span>}
+      </div>
+    ) : undefined;
+
   const labels = isAddition
     ? {
         title: `Add ${displayName} as knowledge source`,
@@ -616,7 +655,7 @@ function KnowledgeSuggestionCard({
     <ActionCardBlock
       {...labels}
       visual={<Avatar icon={icon} size="sm" />}
-      description={analysis ?? undefined}
+      description={description}
       state={cardState}
       rejectedTitle={`${displayName} knowledge rejected`}
       actionsPosition="header"

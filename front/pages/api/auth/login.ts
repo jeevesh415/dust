@@ -1,3 +1,5 @@
+// @migration-status: MIGRATED_TO_HONO
+
 /** @ignoreswagger */
 import type { NextApiRequest, NextApiResponse } from "next";
 

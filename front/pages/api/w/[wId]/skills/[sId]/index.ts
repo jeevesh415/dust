@@ -1,6 +1,9 @@
 /** @ignoreswagger */
+// @migration-status: MIGRATED_TO_HONO
 import { withSessionAuthenticationForWorkspace } from "@app/lib/api/auth_wrappers";
+import { resolveAdditionalRequestedSpaceModelIds } from "@app/lib/api/skills/space_requirements";
 import { type Authenticator, getFeatureFlags } from "@app/lib/auth";
+import { pruneOutdatedSkillEditSuggestions } from "@app/lib/reinforcement/skill_suggestion_pruning";
 import { DataSourceViewResource } from "@app/lib/resources/data_source_view_resource";
 import { FileResource } from "@app/lib/resources/file_resource";
 import { MCPServerViewResource } from "@app/lib/resources/mcp_server_view_resource";
@@ -14,12 +17,12 @@ import type {
   SkillWithRelationsType,
 } from "@app/types/assistant/skill_configuration";
 import type { WithAPIErrorResponse } from "@app/types/error";
+import type { ModelId } from "@app/types/shared/model_id";
 import { isString } from "@app/types/shared/utils/general";
-import { isLeft } from "fp-ts/lib/Either";
-import * as t from "io-ts";
-import * as reporter from "io-ts-reporters";
 import uniq from "lodash/uniq";
 import type { NextApiRequest, NextApiResponse } from "next";
+import { z } from "zod";
+import { fromError } from "zod-validation-error";
 
 export type GetSkillResponseBody = {
   skill: SkillType;
@@ -46,29 +49,26 @@ export type DeleteSkillResponseBody = {
 };
 
 // Request body schema for PATCH.
-const PatchSkillRequestBodySchema = t.intersection([
-  t.type({
-    name: t.string,
-    agentFacingDescription: t.string,
-    userFacingDescription: t.string,
-    instructions: t.string,
-    icon: t.union([t.string, t.null]),
-    tools: t.array(
-      t.type({
-        mcpServerViewId: t.string,
-      })
-    ),
-    attachedKnowledge: t.array(AttachedKnowledgeSchema),
-  }),
-  // TODO(2026-03-02): make mandatory once always sent by the client.
-  t.partial({
-    fileAttachments: t.array(t.type({ fileId: t.string })),
-    isDefault: t.boolean,
-    instructionsHtml: t.union([t.string, t.null]),
-  }),
-]);
+const PatchSkillRequestBodySchema = z.object({
+  name: z.string(),
+  agentFacingDescription: z.string(),
+  userFacingDescription: z.string(),
+  instructions: z.string(),
+  icon: z.string().nullable(),
+  tools: z.array(
+    z.object({
+      mcpServerViewId: z.string(),
+    })
+  ),
+  attachedKnowledge: z.array(AttachedKnowledgeSchema),
+  instructionsHtml: z.string().nullable(),
+  additionalRequestedSpaceIds: z.array(z.string()).optional(),
+  fileAttachments: z.array(z.object({ fileId: z.string() })).optional(),
+  isDefault: z.boolean().optional(),
+  reinforcement: z.enum(["auto", "on", "off"]).optional(),
+});
 
-type PatchSkillRequestBody = t.TypeOf<typeof PatchSkillRequestBodySchema>;
+type PatchSkillRequestBody = z.infer<typeof PatchSkillRequestBodySchema>;
 
 async function handler(
   req: NextApiRequest,
@@ -138,10 +138,10 @@ async function handler(
     }
 
     case "PATCH": {
-      const bodyValidation = PatchSkillRequestBodySchema.decode(req.body);
+      const bodyValidation = PatchSkillRequestBodySchema.safeParse(req.body);
 
-      if (isLeft(bodyValidation)) {
-        const pathError = reporter.formatValidationErrors(bodyValidation.left);
+      if (!bodyValidation.success) {
+        const pathError = fromError(bodyValidation.error).toString();
         return apiError(req, res, {
           status_code: 400,
           api_error: {
@@ -151,7 +151,7 @@ async function handler(
         });
       }
 
-      const body: PatchSkillRequestBody = bodyValidation.right;
+      const body: PatchSkillRequestBody = bodyValidation.data;
       const name = body.name.trim();
 
       if (!name) {
@@ -250,13 +250,53 @@ async function handler(
         })
       );
 
-      const requestedSpaceIds = await SkillResource.computeRequestedSpaceIds(
-        auth,
-        {
+      const computedRequestedSpaceIds =
+        await SkillResource.computeRequestedSpaceIds(auth, {
           mcpServerViews,
           attachedKnowledge: attachedKnowledgeWithDataSourceViews,
+        });
+
+      let additionalRequestedSpaceIds: ModelId[];
+
+      if (body.additionalRequestedSpaceIds !== undefined) {
+        const additionalRequestedSpaceIdsRes =
+          await resolveAdditionalRequestedSpaceModelIds(
+            auth,
+            body.additionalRequestedSpaceIds
+          );
+
+        if (additionalRequestedSpaceIdsRes.isErr()) {
+          return apiError(req, res, {
+            status_code: 400,
+            api_error: {
+              type: "invalid_request_error",
+              message: additionalRequestedSpaceIdsRes.error.message,
+            },
+          });
         }
-      );
+
+        additionalRequestedSpaceIds = additionalRequestedSpaceIdsRes.value;
+      } else {
+        const previousAttachedKnowledge =
+          await skill.getAttachedKnowledge(auth);
+        const previousComputedRequestedSpaceIds =
+          await SkillResource.computeRequestedSpaceIds(auth, {
+            mcpServerViews: skill.mcpServerViews,
+            attachedKnowledge: previousAttachedKnowledge,
+          });
+        const previousComputedRequestedSpaceIdsSet = new Set(
+          previousComputedRequestedSpaceIds
+        );
+
+        additionalRequestedSpaceIds = skill.requestedSpaceIds.filter(
+          (spaceId) => !previousComputedRequestedSpaceIdsSet.has(spaceId)
+        );
+      }
+
+      const requestedSpaceIds = uniq([
+        ...computedRequestedSpaceIds,
+        ...additionalRequestedSpaceIds,
+      ]);
 
       // Validate file attachments if provided (gated behind sandbox_tools).
       let files: FileResource[] | undefined;
@@ -323,10 +363,13 @@ async function handler(
         isDefault: body.isDefault,
         mcpServerViews,
         name,
+        reinforcement: body.reinforcement,
         requestedSpaceIds,
         userFacingDescription: body.userFacingDescription,
         ...(shouldActivate ? { status: "active" as const } : {}),
       });
+
+      await pruneOutdatedSkillEditSuggestions(auth, skill);
 
       return res.status(200).json({
         skill: skill.toJSON(auth),

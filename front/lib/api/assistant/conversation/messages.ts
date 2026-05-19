@@ -118,7 +118,7 @@ export async function createUserMessage(
       agenticMessageData = metadata.message.agenticMessageData;
       break;
     case "delete":
-      // In case of delete, we use the message metadata to delete the user message.
+      // See softDeleteUserMessageAndReplies for why a v+1 placeholder is used instead of an UPDATE.
       rank = metadata.message.rank;
       version = metadata.message.version + 1;
       parentId = metadata.message.id;
@@ -335,6 +335,9 @@ export const createAgentMessages = async (
 
     case "delete":
       {
+        // See softDeleteUserMessageAndReplies / softDeleteAgentMessage for why a v+1 placeholder is used
+        // instead of an UPDATE. MessageModel's exclusivity constraint forces us to anchor the v+1
+        // row with a new AgentMessageModel (status "cancelled", it never ran).
         const agentConfiguration = metadata.agentMessage.configuration;
         const agentMessageRow = await AgentMessageModel.create({
           status: "cancelled",
@@ -402,6 +405,7 @@ export const createAgentMessages = async (
                 {
                   configuration,
                   conversation,
+                  transaction,
                 }
               );
 
@@ -491,7 +495,13 @@ export const createAgentMessages = async (
             });
           },
           {
-            concurrency: 10,
+            // TODO(20260423 jd)
+            // all callsites of this function pass a transaction
+            // so concurent executor is purely cosmetic
+            // eventually we will get rid of these monstruous transactions
+            // so not putting a for loop
+            // and downsizing from 10 to max peak concurrency - 1
+            concurrency: 4,
           }
         );
       }
@@ -638,10 +648,12 @@ export async function createCompactionMessage(
   {
     conversation,
     rank,
+    sourceConversationId,
     transaction,
   }: {
     conversation: ConversationWithoutContentType;
     rank: number;
+    sourceConversationId?: string;
     transaction: Transaction;
   }
 ): Promise<CompactionMessageType> {
@@ -651,6 +663,8 @@ export async function createCompactionMessage(
     {
       status: "created",
       content: null,
+      runIds: null,
+      sourceConversationId: sourceConversationId ?? null,
       workspaceId: workspace.id,
     },
     { transaction }
@@ -683,5 +697,6 @@ export async function createCompactionMessage(
     branchId: conversation.branchId,
     status: "created",
     content: null,
+    ...(sourceConversationId ? { sourceConversationId } : {}),
   };
 }

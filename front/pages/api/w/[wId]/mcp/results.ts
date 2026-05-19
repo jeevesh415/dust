@@ -1,14 +1,14 @@
 /** @ignoreswagger */
+// @migration-status: MIGRATED_TO_HONO
 import { validateMCPServerAccess } from "@app/lib/api/actions/mcp/client_side_registry";
 import { publishMCPResults } from "@app/lib/api/assistant/mcp_events";
 import { withSessionAuthenticationForWorkspace } from "@app/lib/api/auth_wrappers";
 import type { Authenticator } from "@app/lib/auth";
 import { apiError } from "@app/logger/withlogging";
 import type { WithAPIErrorResponse } from "@app/types/error";
-import { isLeft } from "fp-ts/lib/Either";
-import * as t from "io-ts";
-import * as reporter from "io-ts-reporters";
 import type { NextApiRequest, NextApiResponse } from "next";
+import { z } from "zod";
+import { fromError } from "zod-validation-error";
 
 export const config = {
   api: {
@@ -18,9 +18,9 @@ export const config = {
   },
 };
 
-const PostMCPResultsRequestBodyCodec = t.type({
-  result: t.unknown,
-  serverId: t.string,
+const PostMCPResultsRequestBodySchema = z.object({
+  result: z.unknown(),
+  serverId: z.string(),
 });
 
 type PostMCPResultsResponseType = {
@@ -32,20 +32,18 @@ async function handler(
   res: NextApiResponse<WithAPIErrorResponse<PostMCPResultsResponseType>>,
   auth: Authenticator
 ): Promise<void> {
-  const r = PostMCPResultsRequestBodyCodec.decode(req.body);
-  if (isLeft(r)) {
-    const pathError = reporter.formatValidationErrors(r.left);
-
+  const r = PostMCPResultsRequestBodySchema.safeParse(req.body);
+  if (!r.success) {
     return apiError(req, res, {
       status_code: 400,
       api_error: {
         type: "invalid_request_error",
-        message: pathError.join(","),
+        message: fromError(r.error).toString(),
       },
     });
   }
 
-  const { serverId, result } = r.right;
+  const { serverId, result } = r.data;
 
   const isValidAccess = await validateMCPServerAccess(auth, {
     serverId,

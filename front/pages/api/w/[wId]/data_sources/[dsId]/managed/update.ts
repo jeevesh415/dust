@@ -1,6 +1,12 @@
 /** @ignoreswagger */
+// @migration-status: MIGRATED_TO_HONO
 // Public API types are okay to use here because it's front/connectors communication.
 
+import {
+  buildAuditLogTarget,
+  emitAuditLogEvent,
+  getAuditLogContext,
+} from "@app/lib/api/audit/workos_audit";
 import { withSessionAuthenticationForWorkspace } from "@app/lib/api/auth_wrappers";
 import config from "@app/lib/api/config";
 import { registerSlackWebhookRouterEntry } from "@app/lib/api/data_sources";
@@ -20,9 +26,8 @@ import { isAPIError } from "@app/types/error";
 import { sendUserOperationMessage } from "@app/types/shared/user_operation";
 // biome-ignore lint/plugin/enforceClientTypesInPublicApi: existing usage
 import { isConnectorsAPIError } from "@dust-tt/client";
-import { isLeft } from "fp-ts/lib/Either";
-import * as reporter from "io-ts-reporters";
 import type { NextApiRequest, NextApiResponse } from "next";
+import { fromError } from "zod-validation-error";
 
 export type GetDataSourceUpdateResponseBody = {
   connectorId: string;
@@ -84,10 +89,12 @@ async function handler(
 
   switch (req.method) {
     case "POST":
-      const bodyValidation = UpdateConnectorRequestBodySchema.decode(req.body);
+      const bodyValidation = UpdateConnectorRequestBodySchema.safeParse(
+        req.body
+      );
 
-      if (isLeft(bodyValidation)) {
-        const pathError = reporter.formatValidationErrors(bodyValidation.left);
+      if (!bodyValidation.success) {
+        const pathError = fromError(bodyValidation.error).toString();
 
         return apiError(req, res, {
           status_code: 400,
@@ -104,7 +111,7 @@ async function handler(
       );
       const updateRes = await connectorsAPI.updateConnector({
         connectorId: dataSource.connectorId.toString(),
-        connectionId: bodyValidation.right.connectionId,
+        connectionId: bodyValidation.data.connectionId,
       });
       const email = user.email;
       if (email && !isDisposableEmailDomain(email)) {
@@ -145,8 +152,8 @@ async function handler(
       // For Slack connections, update the signing secret in the webhook router
       if (dataSource.connectorProvider === "slack") {
         const webhookRes = await registerSlackWebhookRouterEntry({
-          connectionId: bodyValidation.right.connectionId,
-          extraConfig: bodyValidation.right.extraConfig,
+          connectionId: bodyValidation.data.connectionId,
+          extraConfig: bodyValidation.data.extraConfig,
         });
 
         if (webhookRes.isErr()) {
@@ -172,6 +179,21 @@ async function handler(
         dataSource: dataSource.toJSON(),
         user,
         workspace: owner,
+      });
+
+      void emitAuditLogEvent({
+        auth,
+        action: "datasource.reauthorized",
+        targets: [
+          buildAuditLogTarget("workspace", owner),
+          buildAuditLogTarget("data_source", dataSource),
+        ],
+        context: getAuditLogContext(auth, req),
+        metadata: {
+          data_source_name: dataSource.name,
+          provider: dataSource.connectorProvider ?? "unknown",
+          new_connection_id: bodyValidation.data.connectionId,
+        },
       });
 
       res.status(200).json(updateRes.value);

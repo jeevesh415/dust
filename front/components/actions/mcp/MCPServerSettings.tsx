@@ -3,7 +3,11 @@ import {
   OAUTH_USE_CASE_TO_DESCRIPTION,
   OAUTH_USE_CASE_TO_LABEL,
 } from "@app/components/actions/mcp/MCPServerAuthConnection";
+import { SensitivityLabelsConfig } from "@app/components/shared/labels/SensitivityLabelsConfig";
+import type { SensitivityLabelsController } from "@app/components/shared/labels/types";
+import { getSensitivityLabelProviderForServerId } from "@app/lib/actions/mcp_internal_actions/constants";
 import type { MCPServerViewType } from "@app/lib/api/mcp";
+import { useFeatureFlags } from "@app/lib/auth/AuthContext";
 import {
   useDeleteMCPServerConnection,
   useMCPServerConnections,
@@ -16,11 +20,13 @@ import { useMemo, useState } from "react";
 interface MCPServerSettingsProps {
   mcpServerView: MCPServerViewType;
   owner: LightWorkspaceType;
+  sensitivityLabelsController?: SensitivityLabelsController;
 }
 
 export function MCPServerSettings({
   mcpServerView,
   owner,
+  sensitivityLabelsController,
 }: MCPServerSettingsProps) {
   const authorization = mcpServerView.server.authorization;
 
@@ -49,7 +55,12 @@ export function MCPServerSettings({
   const [selectedUseCase, setSelectedUseCase] =
     useState<MCPOAuthUseCase | null>(null);
 
+  const { featureFlags } = useFeatureFlags();
+  const hasSensitivityLabels = featureFlags.includes("sensitivity_labels");
   const useCase = selectedUseCase ?? mcpServerView.oAuthUseCase;
+  const sensitivityLabelProvider = getSensitivityLabelProviderForServerId(
+    mcpServerView.server.sId
+  );
 
   const handleDeleteConnection = () => {
     if (!connection) {
@@ -131,6 +142,17 @@ export function MCPServerSettings({
           </div>
         </div>
       )}
+
+      {connection &&
+        hasSensitivityLabels &&
+        sensitivityLabelProvider !== null &&
+        sensitivityLabelsController && (
+          <SensitivityLabelsConfig
+            owner={owner}
+            controller={sensitivityLabelsController}
+          />
+        )}
+
       {authorization?.availableScopes &&
         authorization.availableScopes.length > 0 && (
           <div className="space-y-2">

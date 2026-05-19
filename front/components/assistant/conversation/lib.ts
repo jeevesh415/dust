@@ -61,6 +61,8 @@ export function createPlaceholderUserMessage({
             type: "content_fragment" as const,
             contentFragmentType: "file" as const,
             fileId: cf.fileId,
+            path: null,
+            skipFileProcessing: false,
             title: cf.title,
             snippet: null,
             generatedTables: [],
@@ -185,7 +187,6 @@ export function createPlaceholderAgentMessage({
       lastUpdated: new Date(),
       actionProgress: new Map(),
       pendingToolCalls: [],
-      useFullChainOfThought: false,
     },
   };
 }

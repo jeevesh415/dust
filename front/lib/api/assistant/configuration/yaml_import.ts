@@ -5,16 +5,16 @@ import {
   agentYAMLConfigSchema,
   agentYAMLGenerationSettingsSchema,
 } from "@app/lib/agent_yaml_converter/schemas";
+import { createOrUpgradeAgentConfiguration } from "@app/lib/api/assistant/configuration/create_or_upgrade";
 import { getAgentConfigurationAsYAMLConfig } from "@app/lib/api/assistant/configuration/yaml_export";
 import type { Authenticator } from "@app/lib/auth";
 import { KillSwitchResource } from "@app/lib/resources/kill_switch_resource";
+import { TagResource } from "@app/lib/resources/tags_resource";
 import { UserResource } from "@app/lib/resources/user_resource";
-import { createOrUpgradeAgentConfiguration } from "@app/pages/api/w/[wId]/assistant/agent_configurations";
 import type { AgentConfigurationType } from "@app/types/assistant/agent";
 import type { APIErrorWithStatusCode } from "@app/types/error";
 import type { Result } from "@app/types/shared/result";
 import { Err, Ok } from "@app/types/shared/result";
-import uniqueId from "lodash/uniqueId";
 
 interface SkippedAction {
   name: string;
@@ -48,24 +48,23 @@ async function importAgentConfiguration(
   }
 
   const editorEmails = yamlConfig.editors;
-  if (editorEmails.length === 0) {
-    return new Err({
-      status_code: 400,
-      api_error: {
-        type: "invalid_request_error",
-        message: "At least one editor is required.",
-      },
-    });
-  }
+  const fetchedEditors = await UserResource.listUserWithExactEmails(
+    auth.getNonNullableWorkspace(),
+    editorEmails
+  );
 
-  const editorUsers = await UserResource.fetchByEmails(editorEmails);
+  const uploadingUser = auth.user();
+  const editorUsers =
+    uploadingUser && !fetchedEditors.some((u) => u.id === uploadingUser.id)
+      ? [...fetchedEditors, uploadingUser]
+      : fetchedEditors;
 
   if (editorUsers.length === 0) {
     return new Err({
       status_code: 400,
       api_error: {
         type: "invalid_request_error",
-        message: "No valid editor users found.",
+        message: "At least one editor is required.",
       },
     });
   }
@@ -91,6 +90,22 @@ async function importAgentConfiguration(
   const { configurations: mcpConfigurations, skipped: skippedActions } =
     mcpConfigurationsResult.value;
 
+  const tagNames = yamlConfig.tags.map((t) => t.name);
+  const resolvedTags = await TagResource.findByNames(auth, tagNames);
+  const missingTags = tagNames.filter(
+    (name) => !resolvedTags.some((t) => t.name === name)
+  );
+
+  if (missingTags.length > 0) {
+    return new Err({
+      status_code: 400,
+      api_error: {
+        type: "invalid_request_error",
+        message: `Tags not found: ${missingTags.map((t) => `"${t}"`).join(", ")}.`,
+      },
+    });
+  }
+
   const assistant = {
     name: yamlConfig.agent.handle,
     description: yamlConfig.agent.description,
@@ -108,11 +123,7 @@ async function importAgentConfiguration(
     maxStepsPerRun: yamlConfig.agent.max_steps_per_run,
     actions: mcpConfigurations,
     templateId: null,
-    tags: yamlConfig.tags.map((tag) => ({
-      sId: uniqueId(),
-      name: tag.name,
-      kind: tag.kind,
-    })),
+    tags: resolvedTags.map((t) => t.toJSON()),
     editors: editorUsers.map((user) => ({
       sId: user.sId,
     })),

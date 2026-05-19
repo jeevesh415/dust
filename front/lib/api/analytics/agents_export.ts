@@ -1,8 +1,10 @@
+import { getAgentConfigurations } from "@app/lib/api/assistant/configuration/agent";
 import { bucketsToArray, searchAnalytics } from "@app/lib/api/elasticsearch";
+import type { Authenticator } from "@app/lib/auth";
 import { getFrontReplicaDbConnection } from "@app/lib/resources/storage";
+import { isGlobalAgentId } from "@app/types/assistant/assistant";
 import type { Result } from "@app/types/shared/result";
 import { Err, Ok } from "@app/types/shared/result";
-import type { WorkspaceType } from "@app/types/user";
 import type { estypes } from "@elastic/elasticsearch";
 import { QueryTypes } from "sequelize";
 
@@ -58,8 +60,10 @@ export const AGENT_EXPORT_HEADERS: (keyof AgentExportRow)[] = [
 
 export async function fetchAgentExportRows(
   baseQuery: estypes.QueryDslQueryContainer,
-  owner: WorkspaceType
+  auth: Authenticator,
+  includeHiddenAgents: boolean
 ): Promise<Result<AgentExportRow[], Error>> {
+  const owner = auth.getNonNullableWorkspace();
   const esResult = await searchAnalytics<never, TopAgentsExportAggs>(
     {
       bool: {
@@ -101,8 +105,7 @@ export async function fetchAgentExportRows(
     ])
   );
 
-  const scopeFilter =
-    owner.role === "admin" ? "" : `AND ac."scope" != 'hidden'`;
+  const scopeFilter = includeHiddenAgents ? "" : `AND ac."scope" != 'hidden'`;
 
   // TODO(BACK5): Migrate to AgentConfigurationResource when a suitable method exists.
   const readReplica = getFrontReplicaDbConnection();
@@ -152,6 +155,32 @@ export async function fetchAgentExportRows(
       lastEdit: agent.lastEdit,
     };
   });
+
+  const globalAgentIds = buckets
+    .map((b) => String(b.key))
+    .filter(isGlobalAgentId);
+  if (globalAgentIds.length > 0) {
+    const globalAgents = await getAgentConfigurations(auth, {
+      agentIds: globalAgentIds,
+      variant: "extra_light",
+    });
+    for (const agent of globalAgents) {
+      const metrics = esMetrics.get(agent.sId);
+      rows.push({
+        agentId: agent.sId,
+        name: agent.name,
+        description: agent.description,
+        settings: "global",
+        modelId: agent.model.modelId,
+        providerId: agent.model.providerId,
+        authorEmails: "",
+        messages: metrics?.messages ?? 0,
+        distinctUsersReached: metrics?.distinctUsersReached ?? 0,
+        distinctConversations: metrics?.distinctConversations ?? 0,
+        lastEdit: "",
+      });
+    }
+  }
 
   rows.sort((a, b) => b.messages - a.messages);
 

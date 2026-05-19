@@ -3,6 +3,8 @@ import {
   useConversationMenu,
 } from "@app/components/assistant/conversation/ConversationMenu";
 import { useConversationSidePanelContext } from "@app/components/assistant/conversation/ConversationSidePanelContext";
+import { EditConversationTitleDialog } from "@app/components/assistant/conversation/EditConversationTitleDialog";
+import { getParentConversationTitleLabel } from "@app/components/assistant/conversation/utils";
 import { AppLayoutTitle } from "@app/components/sparkle/AppLayoutTitle";
 import { useConversation } from "@app/hooks/conversations";
 import { useActiveConversationId } from "@app/hooks/useActiveConversationId";
@@ -10,19 +12,25 @@ import { useAuth } from "@app/lib/auth/AuthContext";
 import { useAppRouter } from "@app/lib/platform";
 import { useSpaceInfo } from "@app/lib/swr/spaces";
 import { useIsMobile } from "@app/lib/swr/useIsMobile";
-import { getProjectRoute } from "@app/lib/utils/router";
+import { getConversationRoute, getProjectRoute } from "@app/lib/utils/router";
+import { getConversationDisplayTitle } from "@app/types/assistant/conversation";
 import type { WorkspaceType } from "@app/types/user";
 import type { BreadcrumbItem } from "@dust-tt/sparkle";
 import {
+  ActionGitBranchIcon,
   ArrowLeftIcon,
-  AttachmentIcon,
   Breadcrumbs,
   Button,
+  Chip,
+  FolderIcon,
   MoreIcon,
+  Tooltip,
 } from "@dust-tt/sparkle";
 import { useState } from "react";
 
-import { EditConversationTitleDialog } from "./EditConversationTitleDialog";
+const BREADCRUMB_MIDDLE_TRUNCATE_LENGTH = 35;
+const DESKTOP_TITLE_TRUNCATE_LENGTH = 120;
+const MOBILE_FORKED_TITLE_TRUNCATE_LENGTH = 35;
 
 export function ConversationTitle({ owner }: { owner: WorkspaceType }) {
   const activeConversationId = useActiveConversationId();
@@ -48,7 +56,9 @@ export function ConversationTitle({ owner }: { owner: WorkspaceType }) {
     handleMenuOpenChange,
   } = useConversationMenu();
 
-  const currentTitle = conversation?.title ?? "";
+  const currentTitle = conversation
+    ? getConversationDisplayTitle(conversation)
+    : "";
 
   if (!activeConversationId) {
     return null;
@@ -57,6 +67,8 @@ export function ConversationTitle({ owner }: { owner: WorkspaceType }) {
   const spaceId = conversation?.spaceId;
   const isProjectConversation = !!spaceId;
   const isLoading = isProjectConversation && !spaceInfo;
+  const forkedFrom = conversation?.forkingData?.forkedFrom;
+  const isMobileForkedConversation = isMobile && !!forkedFrom;
 
   const breadcrumbItems: BreadcrumbItem[] = [];
 
@@ -79,19 +91,75 @@ export function ConversationTitle({ owner }: { owner: WorkspaceType }) {
     });
   }
 
+  const ForkedFromChip = () => {
+    if (!forkedFrom) {
+      return null;
+    }
+
+    const chipLabel = getParentConversationTitleLabel(forkedFrom);
+    const tooltipLabel = `Branched from '${chipLabel}'`;
+
+    return (
+      <div className="flex h-9 shrink-0 items-center">
+        <Tooltip
+          label={tooltipLabel}
+          tooltipTriggerAsChild
+          trigger={
+            <span className="inline-flex h-9 items-center">
+              <Chip
+                className={
+                  isMobile
+                    ? "shrink-0 dd-privacy-mask [&>span]:sr-only"
+                    : "max-w-44 shrink-0 dd-privacy-mask"
+                }
+                color="primary"
+                href={getConversationRoute(
+                  owner.sId,
+                  forkedFrom.parentConversationId
+                )}
+                icon={ActionGitBranchIcon}
+                label={isMobile ? tooltipLabel : chipLabel}
+                size="mini"
+              />
+            </span>
+          }
+        />
+      </div>
+    );
+  };
+
   return (
     <AppLayoutTitle>
       <div
         className="grid h-full min-w-0 max-w-full grid-cols-[1fr,auto] items-center gap-3"
         onContextMenu={handleRightClick}
       >
-        <div className="min-w-0 overflow-x-auto scrollbar-hide">
-          <Breadcrumbs
-            items={breadcrumbItems}
-            className="dd-privacy-mask"
-            truncateLengthMiddle={35}
-            truncateLengthEnd={120}
-          />
+        <div
+          className={
+            isMobileForkedConversation
+              ? "flex min-w-0 items-center gap-2 overflow-hidden scrollbar-hide"
+              : "flex min-w-0 items-center gap-2 overflow-x-auto scrollbar-hide"
+          }
+        >
+          <div
+            className={
+              isMobileForkedConversation
+                ? "flex min-w-0 flex-1 items-center overflow-hidden"
+                : "flex min-w-0 items-center"
+            }
+          >
+            <Breadcrumbs
+              items={breadcrumbItems}
+              className="dd-privacy-mask"
+              truncateLengthMiddle={BREADCRUMB_MIDDLE_TRUNCATE_LENGTH}
+              truncateLengthEnd={
+                isMobileForkedConversation
+                  ? MOBILE_FORKED_TITLE_TRUNCATE_LENGTH
+                  : DESKTOP_TITLE_TRUNCATE_LENGTH
+              }
+            />
+          </div>
+          <ForkedFromChip />
         </div>
         <EditConversationTitleDialog
           isOpen={showRenameDialog}
@@ -104,7 +172,7 @@ export function ConversationTitle({ owner }: { owner: WorkspaceType }) {
           <Button
             size="sm"
             label={isMobile ? undefined : "Files"}
-            icon={AttachmentIcon}
+            icon={FolderIcon}
             variant="ghost"
             onClick={() => openPanel({ type: "files" })}
           />
@@ -112,19 +180,21 @@ export function ConversationTitle({ owner }: { owner: WorkspaceType }) {
             activeConversationId={activeConversationId}
             conversation={conversation}
             owner={owner}
-            trigger={
+            trigger={({ isPendingAction }) => (
               <Button
                 size="sm"
                 variant="ghost"
                 icon={MoreIcon}
                 aria-label="Conversation menu"
+                isLoading={isPendingAction}
                 disabled={
                   activeConversationId === null ||
                   conversation === null ||
-                  user === null
+                  user === null ||
+                  isPendingAction
                 }
               />
-            }
+            )}
             isConversationDisplayed={true}
             isOpen={isMenuOpen}
             onOpenChange={handleMenuOpenChange}

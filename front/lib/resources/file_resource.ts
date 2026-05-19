@@ -5,6 +5,7 @@ import config from "@app/lib/api/config";
 import {
   disambiguateFileName,
   getConversationFilePath,
+  getProjectFilesBasePath,
   makeProcessedMountFileName,
 } from "@app/lib/api/files/mount_path";
 import {
@@ -98,8 +99,12 @@ export class FileResource extends BaseResource<FileModel> {
   static async makeNew(
     blob: Omit<CreationAttributes<FileModel>, "status" | "sId" | "version">
   ) {
+    // Normalize the user-visible file name to NFC. GCS object names are byte-exact and macOS
+    // uploads commonly arrive in NFD, which breaks lookups when consumers (e.g. LLMs) echo paths
+    // back in NFC. Normalizing on the way in keeps mount paths stable.
     const key = await FileResource.model.create({
       ...blob,
+      fileName: blob.fileName.normalize("NFC"),
       status: "created",
       version: 0,
     });
@@ -357,6 +362,28 @@ export class FileResource extends BaseResource<FileModel> {
     return files.map((f) => new this(this.model, f.get()));
   }
 
+  // List plan-mode files attached to a conversation. Callers filter active vs. closed via the
+  // returned `useCaseMetadata.isPlanClosed` flag (present only on closed plans). Ordered by
+  // createdAt DESC so the most recent plan is first.
+  static async listPlanFilesForConversation(
+    auth: Authenticator,
+    { conversationId }: { conversationId: string }
+  ): Promise<FileResource[]> {
+    const owner = auth.getNonNullableWorkspace();
+
+    const files = await this.model.findAll({
+      where: {
+        workspaceId: owner.id,
+        useCase: "conversation",
+        status: "ready",
+        useCaseMetadata: { conversationId, isPlanFile: true },
+      },
+      order: [["createdAt", "DESC"]],
+    });
+
+    return files.map((f) => new this(this.model, f.get()));
+  }
+
   static async fetchByMountFilePaths(
     auth: Authenticator,
     mountFilePaths: string[]
@@ -569,6 +596,10 @@ export class FileResource extends BaseResource<FileModel> {
    * Returns the file version to read for "best available" content.
    */
   private getContentVersion(): FileVersion {
+    if (this.useCaseMetadata?.skipFileProcessing === true) {
+      return "original";
+    }
+
     return hasProcessedVersion(this.contentType) ? "processed" : "original";
   }
 
@@ -912,11 +943,20 @@ export class FileResource extends BaseResource<FileModel> {
     return result;
   }
 
+  /**
+   * Public entry point to trigger mount path resolution. Idempotent — no-ops when a path is
+   * already set or when the file's use case isn't mount-eligible. Used by backfill scripts.
+   */
+  async ensureMountFilePath(auth: Authenticator): Promise<void> {
+    await this.resolveAndSetMountFilePath(auth);
+  }
+
   // Mount file path logic.
   //
-  // Files used in conversations are copied to a gcsfuse-mountable GCS path so sandboxes can access
-  // them as a flat, human-readable filesystem:
+  // Files used in conversations or projects are copied to a gcsfuse-mountable GCS path so
+  // sandboxes can access them as a flat, human-readable filesystem:
   //   w/{wId}/conversations/{cId}/files/{fileName}
+  //   w/{wId}/projects/{spaceId}/files/{fileName}
   //
   // The canonical path (files/w/{wId}/{fileId}/{version}) remains the immutable original. The mount
   // path is the mutable "live" version. Initial copy from canonical, then frame edits write
@@ -931,7 +971,7 @@ export class FileResource extends BaseResource<FileModel> {
    * Examines the file's use case and metadata to determine whether a mount path should be created.
    * Branches internally by use case:
    * - conversation / tool_output: mounts under w/{wId}/conversations/{cId}/files/
-   * - (future use cases can be added here)
+   * - project_context:            mounts under w/{wId}/projects/{spaceId}/files/
    *
    * No-ops if the file already has a mountFilePath or conditions aren't met.
    */
@@ -948,9 +988,11 @@ export class FileResource extends BaseResource<FileModel> {
       resolvedPath = await this.resolveConversationMountPath(auth, {
         conversationId: useCaseMetadata.conversationId,
       });
+    } else if (useCase === "project_context" && useCaseMetadata?.spaceId) {
+      resolvedPath = await this.resolveProjectMountPath(auth, {
+        projectId: useCaseMetadata.spaceId,
+      });
     }
-
-    // TODO(2026-03-09 SANDBOX): Add support for project context.
 
     if (resolvedPath) {
       await this.setMountFilePath(auth, resolvedPath);
@@ -985,8 +1027,29 @@ export class FileResource extends BaseResource<FileModel> {
   }
 
   /**
+   * Resolve the mount path for a project_context file. Checks for collisions via the unique index
+   * on mountFilePath and disambiguates with the file's sId if needed.
+   */
+  private async resolveProjectMountPath(
+    auth: Authenticator,
+    { projectId }: { projectId: string }
+  ): Promise<string> {
+    const owner = auth.getNonNullableWorkspace();
+    const basePath = getProjectFilesBasePath({
+      workspaceId: owner.sId,
+      projectId,
+    });
+
+    const desiredPath = `${basePath}${this.fileName}`;
+    const isTaken = await this.isMountFilePathTaken(desiredPath);
+
+    return isTaken ? `${basePath}${disambiguateFileName(this)}` : desiredPath;
+  }
+
+  /**
    * Set the mount file path and copy the file's original (and processed if exists) versions to the
-   * conversation-level GCS path for gcsfuse mounting.
+   * given GCS path for gcsfuse mounting. The path is conversation- or project-scoped depending on
+   * the caller.
    *
    * This is a one-time operation: copies from the canonical path to the mount path. Subsequent
    * edits (frames) write directly to the mount path.
@@ -1016,7 +1079,11 @@ export class FileResource extends BaseResource<FileModel> {
   private async isMountFilePathTaken(mountFilePath: string): Promise<boolean> {
     const existing = await FileResource.model.findOne({
       attributes: ["id"],
-      where: { workspaceId: this.workspaceId, mountFilePath },
+      where: {
+        workspaceId: this.workspaceId,
+        mountFilePath,
+        id: { [Op.ne]: this.id },
+      },
     });
     return existing !== null;
   }
@@ -1028,6 +1095,13 @@ export class FileResource extends BaseResource<FileModel> {
 
     const bucket = getPrivateUploadBucket();
     await bucket.delete(this.mountFilePath, { ignoreNotFound: true });
+
+    if (
+      this.useCaseMetadata?.skipFileProcessing === true ||
+      !hasProcessedVersion(this.contentType)
+    ) {
+      return;
+    }
 
     // Only delete processed mount file if this file type has real processing.
     const processedMountPath = makeProcessedMountFileName({
@@ -1094,7 +1168,33 @@ export class FileResource extends BaseResource<FileModel> {
   }
 
   rename(newFileName: string) {
-    return this.update({ fileName: newFileName });
+    return this.update({ fileName: newFileName.normalize("NFC") });
+  }
+
+  renameMountFile(newFileName: string, newMountFilePath: string) {
+    return this.update({
+      fileName: newFileName.normalize("NFC"),
+      mountFilePath: newMountFilePath,
+    });
+  }
+
+  updateMount({
+    destFileName,
+    destMountFilePath,
+    destUseCase,
+    destUseCaseMetadata,
+  }: {
+    destFileName: string;
+    destMountFilePath: string;
+    destUseCase: FileUseCase;
+    destUseCaseMetadata?: FileUseCaseMetadata;
+  }) {
+    return this.update({
+      fileName: destFileName.normalize("NFC"),
+      mountFilePath: destMountFilePath,
+      useCase: destUseCase,
+      useCaseMetadata: destUseCaseMetadata ?? null,
+    });
   }
 
   // Sharing logic.
@@ -1441,6 +1541,26 @@ export class FileResource extends BaseResource<FileModel> {
     return ALL_FILE_FORMATS[this.contentType].isSafeToDisplay;
   }
 
+  private static async fetchReadyFileForCopy(
+    auth: Authenticator,
+    sourceId: string
+  ): Promise<Result<FileResource, Error>> {
+    const sourceFile = await FileResource.fetchById(auth, sourceId);
+    if (!sourceFile) {
+      return new Err(new Error(`Source file not found: ${sourceId}`));
+    }
+
+    if (!sourceFile.isReady) {
+      return new Err(
+        new Error(
+          `Source file is not ready for copying: ${sourceId} (status: ${sourceFile.status})`
+        )
+      );
+    }
+
+    return new Ok(sourceFile);
+  }
+
   /**
    * Copy a file to a new file with the specified use case and metadata.
    * This method copies both the file metadata and the content stored in GCS.
@@ -1458,10 +1578,12 @@ export class FileResource extends BaseResource<FileModel> {
       sourceId,
       useCase,
       useCaseMetadata,
+      includeProcessedVersion,
     }: {
       sourceId: string;
       useCase: FileUseCase;
       useCaseMetadata?: FileUseCaseMetadata;
+      includeProcessedVersion?: boolean;
     }
   ): Promise<
     Result<
@@ -1469,22 +1591,13 @@ export class FileResource extends BaseResource<FileModel> {
       Error | { name: "dust_error"; code: string; message: string }
     >
   > {
-    // Fetch the source file.
-    const sourceFile = await FileResource.fetchById(auth, sourceId);
-    if (!sourceFile) {
-      return new Err(new Error(`Source file not found: ${sourceId}`));
-    }
-
-    if (!sourceFile.isReady) {
-      return new Err(
-        new Error(
-          `Source file is not ready for copying: ${sourceId} (status: ${sourceFile.status})`
-        )
-      );
+    const sourceFileRes = await this.fetchReadyFileForCopy(auth, sourceId);
+    if (sourceFileRes.isErr()) {
+      return sourceFileRes;
     }
 
     try {
-      // Create a new file with the same properties.
+      const sourceFile = sourceFileRes.value;
       const newFile = await FileResource.makeNew({
         workspaceId: auth.getNonNullableWorkspace().id,
         userId: auth.user()?.id ?? null,
@@ -1493,17 +1606,67 @@ export class FileResource extends BaseResource<FileModel> {
         fileSize: sourceFile.fileSize,
         useCase,
         useCaseMetadata,
+        snippet: sourceFile.snippet,
       });
 
-      await copyContent(auth, sourceFile, newFile);
-
-      // Mark the new file as ready.
+      await copyContent(auth, sourceFile, newFile, {
+        includeProcessedVersion,
+      });
       await newFile.markAsReady(auth);
 
       return new Ok(newFile);
     } catch (error) {
       return new Err(normalizeError(error));
     }
+  }
+
+  static async copyToConversation(
+    auth: Authenticator,
+    {
+      sourceId,
+      conversationId,
+      includeProcessedVersion,
+    }: {
+      sourceId: string;
+      conversationId: string;
+      includeProcessedVersion?: boolean;
+    }
+  ): Promise<
+    Result<
+      FileResource,
+      Error | { name: "dust_error"; code: string; message: string }
+    >
+  > {
+    const sourceFileRes = await this.fetchReadyFileForCopy(auth, sourceId);
+    if (sourceFileRes.isErr()) {
+      return sourceFileRes;
+    }
+
+    const sourceFile = sourceFileRes.value;
+    if (!isConversationFileUseCase(sourceFile.useCase)) {
+      return new Err(
+        new Error(
+          `Only conversation files can be copied to a conversation: ${sourceId} (useCase: ${sourceFile.useCase})`
+        )
+      );
+    }
+
+    const {
+      conversationId: _sourceConversationId,
+      generatedTables: _generatedTables,
+      lastEditedByAgentConfigurationId: _lastEditedByAgentConfigurationId,
+      ...restMetadata
+    } = sourceFile.useCaseMetadata ?? {};
+
+    return this.copy(auth, {
+      sourceId,
+      useCase: sourceFile.useCase,
+      useCaseMetadata: {
+        ...restMetadata,
+        conversationId,
+      },
+      includeProcessedVersion,
+    });
   }
 }
 

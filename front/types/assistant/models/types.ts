@@ -1,5 +1,5 @@
+import type { RegionType } from "@app/lib/api/regions/config";
 import { z } from "zod";
-
 import type { WhitelistableFeature } from "../../shared/feature_flags";
 import type { ExtractSpecificKeys } from "../../shared/typescipt_utils";
 import type { TokenizerConfig } from "../../tokenizer";
@@ -30,7 +30,6 @@ export const ModelConfigurationSchema = z.object({
   shortDescription: z.string(),
   isLegacy: z.boolean(),
   isLatest: z.boolean(),
-  nativeReasoningMetaPrompt: z.string().optional(),
   formattingMetaPrompt: z.string().optional(),
   toolUseMetaPrompt: z.string().optional(),
   tokenCountAdjustment: z.number().optional(),
@@ -75,6 +74,8 @@ export type ModelConfigurationType = Omit<
   minimumReasoningEffort: AgentReasoningEffort;
   maximumReasoningEffort: AgentReasoningEffort;
   defaultReasoningEffort: AgentReasoningEffort;
+  // Specify if the model is available in specific regions.
+  regionalAvailability: Record<RegionType, boolean>;
   // If undefined, model is available.
   // If object is empty, model is not available.
   // If defined, model must satisfy one of the conditions to be available.

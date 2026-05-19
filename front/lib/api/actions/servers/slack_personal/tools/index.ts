@@ -284,6 +284,14 @@ function buildSearchResults<T>(
   );
 }
 
+// Best-effort detection of Slack user IDs (U* or W* for enterprise grid).
+// When matched, wraps as <@ID> which is the format Slack search expects.
+// Non-matching values (e.g. bot names like "slackbot") are passed through as-is.
+const SLACK_USER_ID_RE = /^[UW][A-Z0-9]+$/;
+function formatUserRef(user: string): string {
+  return SLACK_USER_ID_RE.test(user) ? `<@${user}>` : user;
+}
+
 function buildSlackSearchQuery(
   initial: string,
   {
@@ -315,13 +323,13 @@ function buildSlackSearchQuery(
       .join(" ")}`;
   }
   if (usersFrom && usersFrom.length > 0) {
-    query = `${query} ${usersFrom.map((user) => `from:${user}`).join(" ")}`;
+    query = `${query} ${usersFrom.map((user) => `from:${formatUserRef(user)}`).join(" ")}`;
   }
   if (usersTo && usersTo.length > 0) {
-    query = `${query} ${usersTo.map((user) => `to:${user}`).join(" ")}`;
+    query = `${query} ${usersTo.map((user) => `to:${formatUserRef(user)}`).join(" ")}`;
   }
   if (usersMentioned && usersMentioned.length > 0) {
-    query = `${query} ${usersMentioned.map((user) => `${user}`).join(" ")}`;
+    query = `${query} ${usersMentioned.map((user) => formatUserRef(user)).join(" ")}`;
   }
   return query;
 }
@@ -341,7 +349,7 @@ function isSlackTokenRevoked(error: unknown): boolean {
 // or null if the error should be handled by the caller.
 function handleSlackAuthError(error: unknown) {
   if (isSlackTokenRevoked(error) || isSlackMissingScope(error)) {
-    return new Ok(makePersonalAuthenticationError("slack").content);
+    return new Ok(makePersonalAuthenticationError("slack_tools").content);
   }
   return null;
 }
@@ -542,7 +550,10 @@ export function createSlackPersonalTools(
       }
     },
 
-    post_message: async ({ to, message, threadTs, fileId }, { authInfo }) => {
+    post_message: async (
+      { to, message, threadTs, fileId, unfurlLinks, unfurlMedia },
+      { authInfo }
+    ) => {
       const accessToken = authInfo?.token;
       if (!accessToken) {
         return new Err(new MCPError("Access token not found"));
@@ -560,6 +571,8 @@ export function createSlackPersonalTools(
           message,
           threadTs,
           fileId,
+          unfurlLinks,
+          unfurlMedia,
           accessToken,
         });
       } catch (error) {
@@ -574,7 +587,7 @@ export function createSlackPersonalTools(
     },
 
     schedule_message: async (
-      { to, message, post_at, threadTs },
+      { to, message, post_at, threadTs, unfurlLinks, unfurlMedia },
       { authInfo }
     ) => {
       const accessToken = authInfo?.token;
@@ -594,6 +607,8 @@ export function createSlackPersonalTools(
           message,
           post_at,
           threadTs,
+          unfurlLinks,
+          unfurlMedia,
           accessToken,
         });
       } catch (error) {
@@ -736,7 +751,7 @@ export function createSlackPersonalTools(
       if (!response.ok) {
         // Trigger authentication flow for missing_scope.
         if (response.error === "missing_scope") {
-          return new Ok(makePersonalAuthenticationError("slack").content);
+          return new Ok(makePersonalAuthenticationError("slack_tools").content);
         }
         return new Err(
           new MCPError(response.error ?? "Failed to list threads")

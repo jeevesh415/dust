@@ -2,17 +2,15 @@ import type { ConversationAttachmentType } from "@app/lib/api/assistant/conversa
 import {
   getAttachmentFromContentFragment,
   isContentNodeAttachmentType,
-  isFileAttachmentType,
 } from "@app/lib/api/assistant/conversation/attachments";
 import { getContentFragmentBlob } from "@app/lib/api/assistant/conversation/content_fragment";
 import { getContentNodesForDataSourceView } from "@app/lib/api/data_source_view";
-import type {
-  UpsertDocumentArgs,
-  UpsertTableArgs,
-} from "@app/lib/api/data_sources";
-import { processAndUpsertToDataSource } from "@app/lib/api/files/upsert";
-import { PROJECT_CONTEXT_FOLDER_ID } from "@app/lib/api/projects/constants";
-import { fetchProjectDataSource } from "@app/lib/api/projects/data_sources";
+import {
+  deleteGCSMountFile,
+  moveFile,
+  renameGCSMountFile,
+} from "@app/lib/api/files/gcs_mount/files";
+import { getProjectFilesBasePath } from "@app/lib/api/files/mount_path";
 import type { Authenticator } from "@app/lib/auth";
 import type { DustError } from "@app/lib/error";
 import { MessageModel } from "@app/lib/models/agent/conversation";
@@ -21,14 +19,22 @@ import { DataSourceViewResource } from "@app/lib/resources/data_source_view_reso
 import { FileResource } from "@app/lib/resources/file_resource";
 import type { SpaceResource } from "@app/lib/resources/space_resource";
 import { ContentFragmentModel } from "@app/lib/resources/storage/models/content_fragment";
-import logger from "@app/logger/logger";
 import type { ContentFragmentInputWithContentNode } from "@app/types/api/internal/assistant";
-import { isSupportedDelimitedTextContentType } from "@app/types/files";
 import type { Result } from "@app/types/shared/result";
 import { Err, Ok } from "@app/types/shared/result";
 import { removeNulls } from "@app/types/shared/utils/general";
-import { slugify } from "@app/types/shared/utils/string_utils";
 import { Op } from "sequelize";
+
+/**
+ * Folder internal id under which conversation transcripts are indexed in the dust_project
+ * data source (see connectors/dust_project/lib/conversation_formatting.ts).
+ */
+export function getProjectConversationFolderInternalId(
+  dustProjectConnectorId: string,
+  spaceSId: string
+): string {
+  return `dust-project-${dustProjectConnectorId}-project-${spaceSId}`;
+}
 
 export async function listProjectContentFragments(
   auth: Authenticator,
@@ -78,34 +84,20 @@ export async function listProjectContextFiles(
 }
 
 /**
- * Project context attachments: latest file-backed and content-node fragments for the space,
- * same item shape as conversation attachments (see GET `.../conversations/[cId]/attachments`).
+ * Project context attachments: latest content-node fragments for the space, same item shape
+ * as conversation attachments (see GET `.../conversations/[cId]/attachments`). File-backed
+ * project files are served separately via the GCS-backed `/spaces/[spaceId]/files` endpoints.
  */
 export async function listProjectContextAttachments(
   auth: Authenticator,
   space: SpaceResource
 ): Promise<ConversationAttachmentType[]> {
   const fragments = await ContentFragmentResource.listBySpace(auth, space);
-  const fileModelIds = removeNulls(fragments.map((fr) => fr.fileId));
-  const filesByModelId = new Map<number, FileResource>();
-  if (fileModelIds.length > 0) {
-    const fetched = await FileResource.fetchByModelIdsWithAuth(
-      auth,
-      fileModelIds
-    );
-    for (const f of fetched) {
-      filesByModelId.set(f.id, f);
-    }
-  }
 
   const merged = new Map<string, ConversationAttachmentType>();
 
   for (const fragment of fragments) {
-    const file =
-      fragment.fileId != null
-        ? (filesByModelId.get(fragment.fileId) ?? null)
-        : null;
-    if (fragment.fileId != null && !file) {
+    if (fragment.fileId != null) {
       continue;
     }
 
@@ -114,17 +106,15 @@ export async function listProjectContextAttachments(
       fragment,
       {
         kind: "project_context",
-        file,
+        file: null,
       }
     );
     const attachment = getAttachmentFromContentFragment(cf);
-    if (!attachment) {
+    if (!attachment || !isContentNodeAttachmentType(attachment)) {
       continue;
     }
 
-    const key = isFileAttachmentType(attachment)
-      ? attachment.fileId
-      : attachment.contentFragmentId;
+    const key = attachment.contentFragmentId;
     if (merged.has(key)) {
       continue;
     }
@@ -259,62 +249,33 @@ export async function addFileToProject(
     });
   }
 
-  await file.updateUseCase(auth, "project_context", {
-    spaceId: space.sId,
-    conversationId: undefined,
-    sourceConversationId,
+  if (!file.mountFilePath) {
+    return new Err({
+      name: "dust_error",
+      code: "invalid_request_error",
+      message: "File has no mount path and cannot be moved to the project.",
+    });
+  }
+
+  const destFileName = file.fileName;
+  const moveRes = await moveFile(auth, {
+    file,
+    sourceGcsPath: file.mountFilePath,
+    destScope: { useCase: "project", projectId: space.sId },
+    destRelativeFilePath: destFileName,
+    destFileName,
+    destUseCase: "project_context",
+    destUseCaseMetadata: { spaceId: space.sId, sourceConversationId },
   });
-
-  const projectContextDatasource = await fetchProjectDataSource(auth, space);
-  if (projectContextDatasource.isErr()) {
-    return new Err(projectContextDatasource.error);
+  if (moveRes.isErr()) {
+    return new Err({
+      name: "dust_error",
+      code: "internal_error",
+      message: moveRes.error.message,
+    });
   }
 
-  let upsertArgs: UpsertDocumentArgs | UpsertTableArgs;
-
-  const commonArgs = {
-    title: file.fileName,
-    parents: [file.sId, PROJECT_CONTEXT_FOLDER_ID],
-  };
-
-  if (isSupportedDelimitedTextContentType(file.contentType)) {
-    upsertArgs = {
-      parentId: PROJECT_CONTEXT_FOLDER_ID,
-      tableId: file.sId,
-      name: slugify(file.fileName),
-      description: `Project context: ${file.fileName}`,
-      truncate: true,
-      mimeType: file.contentType,
-      ...commonArgs,
-    };
-  } else {
-    upsertArgs = {
-      parent_id: PROJECT_CONTEXT_FOLDER_ID,
-      document_id: file.sId,
-      dataSource: projectContextDatasource.value,
-      auth,
-      mime_type: file.contentType,
-      ...commonArgs,
-    };
-  }
-
-  const rUpsert = await processAndUpsertToDataSource(
-    auth,
-    projectContextDatasource.value,
-    { file, upsertArgs }
-  );
-
-  if (rUpsert.isErr()) {
-    logger.warn(
-      {
-        workspaceId: auth.workspace()?.sId,
-        fileId: file.sId,
-        error: rUpsert.error,
-      },
-      "Project context Core upsert failed; file may still be used raw. Syncing content fragment."
-    );
-  }
-
+  // TODO(projects) once the source of truth for the project's files is GCS, we can remove this.
   const fragmentRes =
     await ContentFragmentResource.upsertLatestProjectFileFragment(
       auth,
@@ -487,6 +448,87 @@ export async function removeFileFromProject(
 }
 
 /**
+ * Rename a project file by its relative path.
+ *
+ * Renames the GCS object and, if a FileResource is linked to the path, updates
+ * its fileName and mountFilePath to stay in sync.
+ */
+export async function renameProjectFile(
+  auth: Authenticator,
+  {
+    space,
+    relativeFilePath,
+    newFileName,
+  }: {
+    space: SpaceResource;
+    relativeFilePath: string;
+    newFileName: string;
+  }
+): Promise<Result<void, Error>> {
+  const owner = auth.getNonNullableWorkspace();
+  const oldGcsPath = `${getProjectFilesBasePath({ workspaceId: owner.sId, projectId: space.sId })}${relativeFilePath}`;
+
+  const fileResources = await FileResource.fetchByMountFilePaths(auth, [
+    oldGcsPath,
+  ]);
+
+  const renameResult = await renameGCSMountFile(
+    auth,
+    { useCase: "project", projectId: space.sId },
+    { relativeFilePath, newFileName }
+  );
+  if (renameResult.isErr()) {
+    return renameResult;
+  }
+
+  if (fileResources.length > 0) {
+    await fileResources[0].renameMountFile(
+      newFileName,
+      renameResult.value.newGcsPath
+    );
+  }
+
+  return new Ok(undefined);
+}
+
+/**
+ * Delete a project file by its relative path.
+ *
+ * When a FileResource is linked to the path (user-uploaded files), delegates to
+ * removeFileFromProject which handles ContentFragment cleanup and Core artifact removal.
+ * For path-only files (agent-created, no FileResource), delegates to the GCS primitive.
+ */
+export async function deleteProjectFile(
+  auth: Authenticator,
+  {
+    space,
+    relativeFilePath,
+  }: {
+    space: SpaceResource;
+    relativeFilePath: string;
+  }
+): Promise<Result<void, Error>> {
+  const owner = auth.getNonNullableWorkspace();
+  const gcsPath = `${getProjectFilesBasePath({ workspaceId: owner.sId, projectId: space.sId })}${relativeFilePath}`;
+
+  const fileResources = await FileResource.fetchByMountFilePaths(auth, [
+    gcsPath,
+  ]);
+  if (fileResources.length > 0) {
+    return removeFileFromProject(auth, {
+      space,
+      fileId: fileResources[0].sId,
+    });
+  }
+
+  return deleteGCSMountFile(
+    auth,
+    { useCase: "project", projectId: space.sId },
+    { relativeFilePath }
+  );
+}
+
+/**
  * Removes a project-context content node reference from a project space.
  *
  * - Deletes associated ContentFragmentModel rows for this (space,nodeId,nodeDataSourceViewId)
@@ -494,40 +536,60 @@ export async function removeFileFromProject(
  * - If some fragments are referenced by messages, we keep them but detach them from the space
  *   and mark them expired so conversation rendering can display an appropriate placeholder.
  */
-export async function removeContentNodeFromProject(
+export async function removeContentNodesFromProject(
   auth: Authenticator,
   {
     space,
-    nodeId,
-    nodeDataSourceViewId,
+    nodes,
   }: {
     space: SpaceResource;
-    nodeId: string;
-    nodeDataSourceViewId: string; // data source view sId
+    nodes: Array<{
+      nodeId: string;
+      nodeDataSourceViewId: string; // data source view sId
+    }>;
   }
 ): Promise<Result<void, Error>> {
-  const dsView = await DataSourceViewResource.fetchById(
-    auth,
-    nodeDataSourceViewId
-  );
-  if (!dsView) {
-    return new Err(new Error("Data source view not found."));
+  if (nodes.length === 0) {
+    return new Ok(undefined);
   }
 
   const workspaceId = auth.getNonNullableWorkspace().id;
 
-  const projectFragmentIds = await ContentFragmentModel.findAll({
+  const uniqueDataSourceViewIds = Array.from(
+    new Set(nodes.map((n) => n.nodeDataSourceViewId))
+  );
+  const dataSourceViews = await DataSourceViewResource.fetchByIds(
+    auth,
+    uniqueDataSourceViewIds
+  );
+  const dataSourceViewModelIdById = new Map(
+    dataSourceViews.map((dsv) => [dsv.sId, dsv.id])
+  );
+
+  const pairs = nodes.flatMap((n) => {
+    const dsvModelId = dataSourceViewModelIdById.get(n.nodeDataSourceViewId);
+    return dsvModelId !== undefined
+      ? [{ nodeId: n.nodeId, nodeDataSourceViewModelId: dsvModelId }]
+      : [];
+  });
+  if (pairs.length === 0) {
+    return new Ok(undefined);
+  }
+
+  const projectFragmentModelIds = await ContentFragmentModel.findAll({
     attributes: ["id"],
     where: {
       workspaceId,
       spaceId: space.id,
       fileId: null,
-      nodeId,
-      nodeDataSourceViewId: dsView.id,
+      [Op.or]: pairs.map((p) => ({
+        nodeId: p.nodeId,
+        nodeDataSourceViewId: p.nodeDataSourceViewModelId,
+      })),
     },
   }).then((rows) => rows.map((r) => r.id));
 
-  if (projectFragmentIds.length === 0) {
+  if (projectFragmentModelIds.length === 0) {
     return new Ok(undefined);
   }
 
@@ -535,33 +597,30 @@ export async function removeContentNodeFromProject(
     attributes: ["contentFragmentId"],
     where: {
       workspaceId,
-      contentFragmentId: {
-        [Op.in]: projectFragmentIds,
-      },
+      contentFragmentId: { [Op.in]: projectFragmentModelIds },
     },
   });
 
-  const referencedIds = new Set(
+  const referencedModelIds = new Set(
     removeNulls(messagesReferencing.map((m) => m.contentFragmentId))
   );
-  const orphanIds = projectFragmentIds.filter((id) => !referencedIds.has(id));
+  const orphanIds = projectFragmentModelIds.filter(
+    (id) => !referencedModelIds.has(id)
+  );
 
   if (orphanIds.length > 0) {
     await ContentFragmentModel.destroy({
-      where: {
-        workspaceId,
-        id: { [Op.in]: orphanIds },
-      },
+      where: { workspaceId, id: { [Op.in]: orphanIds } },
     });
   }
 
-  if (referencedIds.size > 0) {
+  if (referencedModelIds.size > 0) {
     await ContentFragmentModel.update(
       { spaceId: null },
       {
         where: {
           workspaceId,
-          id: { [Op.in]: Array.from(referencedIds) },
+          id: { [Op.in]: Array.from(referencedModelIds) },
         },
       }
     );

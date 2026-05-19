@@ -1,6 +1,5 @@
 import type { Authenticator } from "@app/lib/auth";
 import { BaseResource } from "@app/lib/resources/base_resource";
-import { ProjectTodoTakeawaySourcesModel } from "@app/lib/resources/storage/models/project_todo_takeaway_sources";
 import {
   TakeawaySourcesModel,
   TakeawaysModel,
@@ -10,13 +9,13 @@ import type { ReadonlyAttributesType } from "@app/lib/resources/storage/types";
 import type { ModelStaticWorkspaceAware } from "@app/lib/resources/storage/wrappers/workspace_models";
 import { getResourceIdFromSId, makeSId } from "@app/lib/resources/string_ids";
 import { withTransaction } from "@app/lib/utils/sql_utils";
+import type {
+  ProjectTaskSourceInfo,
+  ProjectTaskSourceType,
+} from "@app/types/project_task";
 import type { ModelId } from "@app/types/shared/model_id";
 import { Ok, type Result } from "@app/types/shared/result";
-import type {
-  TodoVersionedActionItem,
-  TodoVersionedKeyDecision,
-  TodoVersionedNotableFact,
-} from "@app/types/takeaways";
+import type { TaskVersionedActionItem } from "@app/types/takeaways";
 import type {
   Attributes,
   CreationAttributes,
@@ -25,6 +24,19 @@ import type {
   WhereOptions,
 } from "sequelize";
 import { Op } from "sequelize";
+
+export type TakeawaySourceDocument = {
+  title: string;
+  text: string;
+  id: string;
+  type: ProjectTaskSourceType;
+  uri: string;
+};
+
+export type TakeawaysWithSource = {
+  takeaway: TakeawaysResource;
+  source: ProjectTaskSourceInfo;
+};
 
 type TakeawaysVersionCreationAttributes = CreationAttributes<TakeawaysModel> & {
   takeawaysId: ModelId;
@@ -90,12 +102,13 @@ export class TakeawaysResource extends BaseResource<TakeawaysModel> {
   // in place. The version number is determined by the existing snapshot count + 1.
   async updateWithVersion(
     auth: Authenticator,
-    updates: Pick<
-      CreationAttributes<TakeawaysModel>,
-      "actionItems" | "notableFacts" | "keyDecisions"
-    >,
+    updates: Pick<CreationAttributes<TakeawaysModel>, "actionItems">,
     transaction?: Transaction
   ): Promise<TakeawaysResource> {
+    if (this.workspaceId !== auth.getNonNullableWorkspace().id) {
+      throw new Error("Workspace mismatch in updateWithVersion.");
+    }
+
     return withTransaction(async (t) => {
       await this.saveVersion(t);
       await this.update(updates, t);
@@ -123,8 +136,6 @@ export class TakeawaysResource extends BaseResource<TakeawaysModel> {
       version: existingCount + 1,
       spaceId: this.spaceId,
       actionItems: this.actionItems,
-      notableFacts: this.notableFacts,
-      keyDecisions: this.keyDecisions,
     };
     await TakeawaysVersionModel.create(versionData, { transaction });
   }
@@ -150,8 +161,7 @@ export class TakeawaysResource extends BaseResource<TakeawaysModel> {
 
   // Deletes all takeaway rows for a specific space, along with their source
   // entries, version snapshots, and the join-table rows that reference those
-  // sources. Must be called before deleting project todos for the same space
-  // because ProjectTodoTakeawaySourcesModel holds RESTRICT FKs on both sides.
+  // sources.
   static async deleteAllForSpace(
     auth: Authenticator,
     { spaceModelId }: { spaceModelId: ModelId }
@@ -167,22 +177,6 @@ export class TakeawaysResource extends BaseResource<TakeawaysModel> {
     ).map((r) => r.id);
 
     if (takeawayIds.length > 0) {
-      const takeawaySourceIds = (
-        await TakeawaySourcesModel.findAll({
-          attributes: ["id"],
-          where: { workspaceId, takeawaysId: { [Op.in]: takeawayIds } },
-        })
-      ).map((r) => r.id);
-
-      if (takeawaySourceIds.length > 0) {
-        await ProjectTodoTakeawaySourcesModel.destroy({
-          where: {
-            workspaceId,
-            takeawaySourceId: { [Op.in]: takeawaySourceIds },
-          },
-        });
-      }
-
       await TakeawaySourcesModel.destroy({
         where: { workspaceId, takeawaysId: { [Op.in]: takeawayIds } },
       });
@@ -202,20 +196,6 @@ export class TakeawaysResource extends BaseResource<TakeawaysModel> {
   static async deleteAllForWorkspace(auth: Authenticator): Promise<void> {
     const workspaceId = auth.getNonNullableWorkspace().id;
 
-    // Delete join-table rows first to avoid RESTRICT FK violations.
-    const takeawaySourceIds = (
-      await TakeawaySourcesModel.findAll({
-        attributes: ["id"],
-        where: { workspaceId },
-      })
-    ).map((r) => r.id);
-
-    if (takeawaySourceIds.length > 0) {
-      await ProjectTodoTakeawaySourcesModel.destroy({
-        where: { workspaceId, takeawaySourceId: takeawaySourceIds },
-      });
-    }
-
     await TakeawaySourcesModel.destroy({ where: { workspaceId } });
     await TakeawaysVersionModel.destroy({ where: { workspaceId } });
     await TakeawaysModel.destroy({ where: { workspaceId } });
@@ -226,24 +206,6 @@ export class TakeawaysResource extends BaseResource<TakeawaysModel> {
     { transaction }: { transaction?: Transaction }
   ): Promise<Result<undefined, Error>> {
     const workspaceId = auth.getNonNullableWorkspace().id;
-
-    const takeawaySourceIds = (
-      await TakeawaySourcesModel.findAll({
-        attributes: ["id"],
-        where: { workspaceId, takeawaysId: this.id },
-        transaction,
-      })
-    ).map((r) => r.id);
-
-    if (takeawaySourceIds.length > 0) {
-      await ProjectTodoTakeawaySourcesModel.destroy({
-        where: {
-          workspaceId,
-          takeawaySourceId: { [Op.in]: takeawaySourceIds },
-        },
-        transaction,
-      });
-    }
 
     await TakeawaySourcesModel.destroy({
       where: { workspaceId, takeawaysId: this.id },
@@ -266,14 +228,14 @@ export class TakeawaysResource extends BaseResource<TakeawaysModel> {
 
   // ── Conversation-scoped helpers ──────────────────────────────────────────────
 
-  // Returns the latest takeaway snapshot for every conversation that has
+  // Returns the latest takeaway snapshot for every source that has
   // produced a takeaway in the given space. Each entry pairs the
-  // TakeawaysResource with the conversation sId that produced it.
-  // Used by the merge workflow to iterate over all conversations to process.
+  // TakeawaysResource with the source sId that produced it.
+  // Used by the merge workflow to iterate over all sources to process.
   static async fetchLatestBySpaceId(
     auth: Authenticator,
     { spaceModelId }: { spaceModelId: ModelId }
-  ): Promise<{ takeaway: TakeawaysResource; conversationSId: string }[]> {
+  ): Promise<TakeawaysWithSource[]> {
     const workspaceId = auth.getNonNullableWorkspace().id;
 
     const rows = await TakeawaysModel.findAll({
@@ -289,43 +251,52 @@ export class TakeawaysResource extends BaseResource<TakeawaysModel> {
       where: {
         workspaceId,
         takeawaysId: { [Op.in]: takeawayIds },
-        sourceType: "conversation",
       },
     });
 
-    // One source per takeaway (a takeaway is produced by one conversation).
-    const conversationSIdById = new Map<ModelId, string>(
-      sources.map((s) => [s.takeawaysId, s.sourceId])
+    // One source per takeaway (a takeaway is produced by one source).
+    const sourceByTakeawaysId = new Map<ModelId, ProjectTaskSourceInfo>(
+      sources.map((s) => [
+        s.takeawaysId,
+        {
+          sourceType: s.sourceType,
+          sourceId: s.sourceId,
+          sourceTitle: s.sourceTitle,
+          sourceUrl: s.sourceUrl,
+        },
+      ])
     );
 
-    const result: { takeaway: TakeawaysResource; conversationSId: string }[] =
-      [];
+    const result: TakeawaysWithSource[] = [];
     for (const row of rows) {
-      const conversationSId = conversationSIdById.get(row.id);
-      if (!conversationSId) {
-        // Takeaway exists for this space but has no conversation source — skip.
+      const source = sourceByTakeawaysId.get(row.id);
+      if (!source) {
+        // Takeaway exists for this space but has no source — skip.
         continue;
       }
       result.push({
         takeaway: new this(TakeawaysModel, row.get()),
-        conversationSId,
+        source,
       });
     }
 
     return result;
   }
 
-  // Returns the takeaway for a given conversation, or null if none exists.
-  // Looks up the conversation via TakeawaySourcesModel.
-  static async fetchLatestByConversationId(
+  // Return the take away for a give source id and type, or null if none exists.
+  static async fetchLatestBySourceIdAndType(
     auth: Authenticator,
-    { conversationId }: { conversationId: string },
+    {
+      sourceId,
+      sourceType,
+    }: { sourceId: string; sourceType: ProjectTaskSourceType },
     transaction?: Transaction
   ): Promise<TakeawaysResource | null> {
     const source = await TakeawaySourcesModel.findOne({
       where: {
         workspaceId: auth.getNonNullableWorkspace().id,
-        sourceId: conversationId,
+        sourceId,
+        sourceType,
       },
       transaction,
     });
@@ -335,24 +306,38 @@ export class TakeawaysResource extends BaseResource<TakeawaysModel> {
     return TakeawaysResource._fetchById(auth, source.takeawaysId, transaction);
   }
 
-  // Creates or updates the takeaway for a conversation. If no takeaway exists
-  // for this conversation yet, a new TakeawaysModel row and source link are
-  // created. Otherwise the existing row is updated in place with a version
-  // snapshot appended to TakeawaysVersionModel.
-  static async makeNewForConversation(
+  // Returns the takeaway for a given conversation, or null if none exists.
+  // Looks up the conversation via TakeawaySourcesModel.
+  static async fetchLatestByConversationId(
+    auth: Authenticator,
+    { conversationId }: { conversationId: string },
+    transaction?: Transaction
+  ): Promise<TakeawaysResource | null> {
+    return this.fetchLatestBySourceIdAndType(
+      auth,
+      {
+        sourceId: conversationId,
+        sourceType: "project_conversation",
+      },
+      transaction
+    );
+  }
+
+  static async makeNewForDocument(
     auth: Authenticator,
     {
-      conversationId,
       spaceId,
+      document,
       actionItems,
-      notableFacts,
-      keyDecisions,
     }: {
-      conversationId: string;
       spaceId: string;
-      actionItems: TodoVersionedActionItem[];
-      notableFacts: TodoVersionedNotableFact[];
-      keyDecisions: TodoVersionedKeyDecision[];
+      document: {
+        id: string;
+        type: ProjectTaskSourceType;
+        title: string | null;
+        uri: string | null;
+      };
+      actionItems: TaskVersionedActionItem[];
     },
     transaction?: Transaction
   ): Promise<TakeawaysResource> {
@@ -364,7 +349,11 @@ export class TakeawaysResource extends BaseResource<TakeawaysModel> {
 
     return withTransaction(async (t) => {
       const source = await TakeawaySourcesModel.findOne({
-        where: { workspaceId, sourceId: conversationId },
+        where: {
+          workspaceId,
+          sourceId: document.id,
+          sourceType: document.type,
+        },
         transaction: t,
       });
 
@@ -379,16 +368,12 @@ export class TakeawaysResource extends BaseResource<TakeawaysModel> {
             `TakeawaysModel row missing for takeawaysId ${source.takeawaysId}`
           );
         }
-        return existing.updateWithVersion(
-          auth,
-          { actionItems, notableFacts, keyDecisions },
-          t
-        );
+        return existing.updateWithVersion(auth, { actionItems }, t);
       }
 
       const takeaway = await TakeawaysResource.makeNew(
         auth,
-        { spaceId: spaceModelId, actionItems, notableFacts, keyDecisions },
+        { spaceId: spaceModelId, actionItems },
         t
       );
 
@@ -396,13 +381,48 @@ export class TakeawaysResource extends BaseResource<TakeawaysModel> {
         {
           workspaceId,
           takeawaysId: takeaway.id,
-          sourceType: "conversation",
-          sourceId: conversationId,
+          sourceType: document.type,
+          sourceId: document.id,
+          sourceTitle: document.title,
+          sourceUrl: document.uri,
         },
         { transaction: t }
       );
 
       return takeaway;
     }, transaction);
+  }
+
+  // Creates or updates the takeaway for a conversation. If no takeaway exists
+  // for this conversation yet, a new TakeawaysModel row and source link are
+  // created. Otherwise the existing row is updated in place with a version
+  // snapshot appended to TakeawaysVersionModel.
+  static async makeNewForConversation(
+    auth: Authenticator,
+    {
+      conversationId,
+      spaceId,
+      actionItems,
+    }: {
+      conversationId: string;
+      spaceId: string;
+      actionItems: TaskVersionedActionItem[];
+    },
+    transaction?: Transaction
+  ): Promise<TakeawaysResource> {
+    return this.makeNewForDocument(
+      auth,
+      {
+        spaceId,
+        document: {
+          id: conversationId,
+          type: "project_conversation",
+          title: null,
+          uri: null,
+        },
+        actionItems,
+      },
+      transaction
+    );
   }
 }

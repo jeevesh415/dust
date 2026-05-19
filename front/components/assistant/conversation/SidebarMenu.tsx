@@ -32,6 +32,7 @@ import { useMoveConversationToProject } from "@app/hooks/useMoveConversationToPr
 import { useSendNotification } from "@app/hooks/useNotification";
 import { useProjectsSectionCollapsed } from "@app/hooks/useProjectsSectionCollapsed";
 import { useSearchProjects } from "@app/hooks/useSearchProjects";
+import { useStarredProjectsSectionCollapsed } from "@app/hooks/useStarredProjectsSectionCollapsed";
 import { useYAMLUpload } from "@app/hooks/useYAMLUpload";
 import { useAuth, useFeatureFlags } from "@app/lib/auth/AuthContext";
 import { CONVERSATIONS_UPDATED_EVENT } from "@app/lib/notifications/events";
@@ -40,6 +41,7 @@ import { SKILL_ICON } from "@app/lib/skill";
 import { getSpaceIcon } from "@app/lib/spaces";
 import { useUnifiedAgentConfigurations } from "@app/lib/swr/assistants";
 import { TRACKING_AREAS, withTracking } from "@app/lib/tracking";
+import { getConversationDotStatus } from "@app/lib/utils/conversation_dot_status";
 import { hasHealthyProviders } from "@app/lib/utils/providersHealth";
 import {
   getAgentBuilderRoute,
@@ -47,11 +49,17 @@ import {
   getProjectRoute,
   getSkillBuilderRoute,
 } from "@app/lib/utils/router";
+import { formatWakeUpSidebarLabel } from "@app/lib/utils/wakeup_description";
 import type { ConversationWithoutContentType } from "@app/types/assistant/conversation";
-import type { ProjectType, SpaceType } from "@app/types/space";
+import {
+  type ConversationListItemType,
+  getConversationDisplayTitle,
+} from "@app/types/assistant/conversation";
+import type { ProjectType } from "@app/types/space";
 import type { WorkspaceType } from "@app/types/user";
 import { isBuilder } from "@app/types/user";
 import {
+  ActionTimeIcon,
   Avatar,
   BoltIcon,
   BoltOffIcon,
@@ -60,6 +68,7 @@ import {
   ChatBubbleBottomCenterPlusIcon,
   Checkbox,
   CheckDoubleIcon,
+  Chip,
   cn,
   DocumentIcon,
   DropdownMenu,
@@ -73,6 +82,7 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
   FolderOpenIcon,
+  Icon,
   Label,
   ListCheckIcon,
   MagicIcon,
@@ -87,15 +97,17 @@ import {
   RobotIcon,
   SearchInput,
   Spinner,
+  StarIcon,
   TrashIcon,
   XMarkIcon,
 } from "@dust-tt/sparkle";
-import moment from "moment";
+import { AnimatePresence, motion } from "framer-motion";
 import {
   memo,
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -116,7 +128,7 @@ type GroupLabel =
   | "Older";
 
 interface SearchProjectItemProps {
-  space: SpaceType;
+  space: ProjectType;
   owner: WorkspaceType;
   isMember: boolean;
   activeSpaceId: string | null;
@@ -131,6 +143,8 @@ function SearchProjectItem({
   const router = useAppRouter();
   const { setSidebarOpen } = useContext(SidebarContext);
 
+  const isArchived = !!space.archivedAt;
+
   return (
     <NavigationListItem
       selected={activeSpaceId === space.sId}
@@ -141,6 +155,11 @@ function SearchProjectItem({
         setSidebarOpen(false);
         await router.push(getProjectRoute(owner.sId, space.sId));
       }}
+      suffix={
+        isArchived ? (
+          <Chip size="mini" color="white" label="Archived" />
+        ) : undefined
+      }
     />
   );
 }
@@ -167,8 +186,8 @@ interface SearchResultsProps {
   hideTriggeredConversations: boolean;
   setHideTriggeredConversations: (hide: boolean) => void;
   isMultiSelect: boolean;
-  selectedConversations: ConversationWithoutContentType[];
-  toggleConversationSelection: (c: ConversationWithoutContentType) => void;
+  selectedConversations: ConversationListItemType[];
+  toggleConversationSelection: (c: ConversationListItemType) => void;
 }
 
 function SearchResults({
@@ -254,7 +273,7 @@ function SearchResults({
     <div className="h-full overflow-y-auto">
       <NavigationList className="px-2">
         <NavigationListCollapsibleSection
-          label="Projects"
+          label="Pods"
           type="collapse"
           open={projectsSectionOpen}
           onOpenChange={setProjectsSectionOpen}
@@ -433,9 +452,6 @@ export function AgentSidebarMenu({
     loadMore,
     isLoadingMore,
   } = useConversations({ workspaceId: owner.sId });
-  const onConversationBranched = useCallback(() => {
-    void mutateConversations();
-  }, [mutateConversations]);
 
   const hasSpaceConversations = hasFeature("projects");
 
@@ -469,7 +485,7 @@ export function AgentSidebarMenu({
 
   const [isMultiSelect, setIsMultiSelect] = useState(false);
   const [selectedConversations, setSelectedConversations] = useState<
-    ConversationWithoutContentType[]
+    ConversationListItemType[]
   >([]);
   const doDelete = useDeleteConversation(owner);
 
@@ -478,6 +494,11 @@ export function AgentSidebarMenu({
 
   const { isProjectsSectionCollapsed, setProjectsSectionCollapsed } =
     useProjectsSectionCollapsed();
+
+  const {
+    isStarredProjectsSectionCollapsed,
+    setStarredProjectsSectionCollapsed,
+  } = useStarredProjectsSectionCollapsed();
 
   const isRestrictedFromAgentCreation =
     hasFeature("disallow_agent_creation_to_users") && !isBuilder(owner);
@@ -537,7 +558,7 @@ export function AgentSidebarMenu({
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: ignored using `--suppress`
   const toggleConversationSelection = useCallback(
-    (c: ConversationWithoutContentType) => {
+    (c: ConversationListItemType) => {
       if (selectedConversations.includes(c)) {
         setSelectedConversations((prev) => prev.filter((id) => id !== c));
       } else {
@@ -639,9 +660,7 @@ export function AgentSidebarMenu({
 
   const hasTriggeredConversations = useMemo(
     () =>
-      conversations.some(
-        (c: ConversationWithoutContentType) => c.triggerId !== null
-      ),
+      conversations.some((c: ConversationListItemType) => c.triggerId !== null),
     [conversations]
   );
 
@@ -656,16 +675,76 @@ export function AgentSidebarMenu({
 
   const sidebarTitleFilter = hasSpaceConversations ? "" : titleFilter;
 
+  const starredSection = useMemo(() => {
+    if (!hasSpaceConversations) {
+      return null;
+    }
+    const starredSummary = summary.filter(({ space }) => space.isStarred);
+    const starredCountInSummary = starredSummary.length;
+
+    if (starredCountInSummary === 0) {
+      return null;
+    }
+
+    const showCount =
+      isStarredProjectsSectionCollapsed && starredCountInSummary > 0;
+
+    const VISIBLE_STARRED = 5;
+    const hiddenStarredSummary = starredSummary.slice(VISIBLE_STARRED);
+    const hiddenOverflowCount = hiddenStarredSummary.reduce(
+      (sum, s) => sum + s.unreadConversations.length,
+      0
+    );
+    const hiddenOverflowHasActivity = hiddenStarredSummary.some(
+      (s) =>
+        s.unreadConversations.length > 0 ||
+        s.nonParticipantUnreadConversations.length > 0
+    );
+
+    return (
+      <NavigationList className="px-2">
+        <NavigationListCollapsibleSection
+          label={showCount ? `Starred (${starredCountInSummary})` : "Starred"}
+          icon={StarIcon}
+          type="collapse"
+          visibleItems={VISIBLE_STARRED}
+          overflowCount={hiddenOverflowCount}
+          overflowHasActivity={hiddenOverflowHasActivity}
+          open={!isStarredProjectsSectionCollapsed}
+          onOpenChange={(open) => setStarredProjectsSectionCollapsed(!open)}
+        >
+          {renderProjectsList({
+            owner,
+            summary: starredSummary,
+            titleFilter: sidebarTitleFilter,
+            moveConversationToProject,
+          })}
+        </NavigationListCollapsibleSection>
+      </NavigationList>
+    );
+  }, [
+    hasSpaceConversations,
+    summary,
+    owner,
+    sidebarTitleFilter,
+    moveConversationToProject,
+    isStarredProjectsSectionCollapsed,
+    setStarredProjectsSectionCollapsed,
+  ]);
+
   // biome-ignore lint/correctness/useExhaustiveDependencies: ignored using `--suppress`
   const projectsSection = useMemo(() => {
     if (!hasSpaceConversations) {
       return null;
     }
-    const projectCountInSummary = summary.length;
+    const nonStarredSummary = summary.filter(
+      (project) => !project.space.isStarred
+    );
+    const projectCountInSummary = nonStarredSummary.length;
     const showCount = isProjectsSectionCollapsed && projectCountInSummary > 0;
 
     const VISIBLE_PROJECTS = 4;
-    const hiddenSummary = summary.slice(VISIBLE_PROJECTS);
+    const hiddenSummary = nonStarredSummary.slice(VISIBLE_PROJECTS);
     const hiddenOverflowCount = hiddenSummary.reduce(
       (sum, s) => sum + s.unreadConversations.length,
       0
@@ -679,7 +758,7 @@ export function AgentSidebarMenu({
     return (
       <NavigationList className="px-2">
         <NavigationListCollapsibleSection
-          label={showCount ? `Projects (${projectCountInSummary})` : "Projects"}
+          label={showCount ? `Pods (${projectCountInSummary})` : "Pods"}
           type="collapse"
           visibleItems={VISIBLE_PROJECTS}
           overflowCount={hiddenOverflowCount}
@@ -687,8 +766,8 @@ export function AgentSidebarMenu({
           open={!isProjectsSectionCollapsed}
           onOpenChange={(open) => setProjectsSectionCollapsed(!open)}
           action={
-            summary.length > 0 ? (
-              <>
+            <>
+              {nonStarredSummary.length > 0 && (
                 <Button
                   size="xs"
                   icon={PlusIcon}
@@ -700,25 +779,25 @@ export function AgentSidebarMenu({
                     setIsCreateProjectModalOpen(true);
                   }}
                 />
-                <ProjectsBrowsePopover owner={owner} />
-              </>
-            ) : null
+              )}
+              <ProjectsBrowsePopover owner={owner} />
+            </>
           }
         >
           {isSummaryLoading ? (
             <div className="flex items-center justify-center">
               <Spinner size="xs" />
             </div>
-          ) : summary.length > 0 ? (
+          ) : nonStarredSummary.length > 0 ? (
             renderProjectsList({
               owner,
-              summary,
+              summary: nonStarredSummary,
               titleFilter: sidebarTitleFilter,
               moveConversationToProject,
             })
           ) : (
             <NavigationListItem
-              label="Create a Project"
+              label="Create a Pod"
               icon={PlusIcon}
               onClick={() => setIsCreateProjectModalOpen(true)}
             />
@@ -747,8 +826,8 @@ export function AgentSidebarMenu({
         selectedConversations={selectedConversations}
         toggleConversationSelection={toggleConversationSelection}
         activeConversationId={activeConversationId}
-        onConversationBranched={onConversationBranched}
         owner={owner}
+        starredSection={starredSection}
         projectsSection={projectsSection}
         hasTriggeredConversations={hasTriggeredConversations}
         hideTriggeredConversations={hideTriggeredConversations}
@@ -768,8 +847,8 @@ export function AgentSidebarMenu({
     selectedConversations,
     toggleConversationSelection,
     activeConversationId,
-    onConversationBranched,
     owner,
+    starredSection,
     projectsSection,
     hasTriggeredConversations,
     hideTriggeredConversations,
@@ -974,37 +1053,26 @@ export function AgentSidebarMenu({
                         {isBuilder(owner) && (
                           <>
                             <DropdownMenuLabel>Skills</DropdownMenuLabel>
-                            {hasFeature("sandbox_tools") ? (
-                              <DropdownMenuSub>
-                                <DropdownMenuSubTrigger
-                                  icon={PlusIcon}
-                                  label="New skill"
-                                />
-                                <DropdownMenuSubContent>
-                                  <DropdownMenuItem
-                                    href={getSkillBuilderRoute(
-                                      owner.sId,
-                                      "new"
-                                    )}
-                                    icon={SKILL_ICON}
-                                    label="From scratch"
-                                  />
-                                  <DropdownMenuItem
-                                    icon={FolderOpenIcon}
-                                    label="From existing"
-                                    onClick={() =>
-                                      setIsImportSkillDialogOpen(true)
-                                    }
-                                  />
-                                </DropdownMenuSubContent>
-                              </DropdownMenuSub>
-                            ) : (
-                              <DropdownMenuItem
-                                href={getSkillBuilderRoute(owner.sId, "new")}
+                            <DropdownMenuSub>
+                              <DropdownMenuSubTrigger
                                 icon={PlusIcon}
                                 label="New skill"
                               />
-                            )}
+                              <DropdownMenuSubContent>
+                                <DropdownMenuItem
+                                  href={getSkillBuilderRoute(owner.sId, "new")}
+                                  icon={SKILL_ICON}
+                                  label="From scratch"
+                                />
+                                <DropdownMenuItem
+                                  icon={FolderOpenIcon}
+                                  label="From existing"
+                                  onClick={() =>
+                                    setIsImportSkillDialogOpen(true)
+                                  }
+                                />
+                              </DropdownMenuSubContent>
+                            </DropdownMenuSub>
                             <DropdownMenuItem
                               href={getSkillBuilderRoute(owner.sId, "manage")}
                               icon={SKILL_ICON}
@@ -1078,15 +1146,14 @@ export function AgentSidebarMenu({
   );
 }
 
-interface InboxConversationListProps {
-  inboxConversations: ConversationWithoutContentType[];
-  dateLabel: string;
+interface UnreadConversationsSectionProps {
+  label: string;
+  conversations: ConversationListItemType[];
   isMultiSelect: boolean;
   isMarkingAllAsRead: boolean;
   onMarkAllAsRead: (conversationIds: string[]) => void;
-  onConversationBranched?: () => Promise<void> | void;
-  selectedConversations: ConversationWithoutContentType[];
-  toggleConversationSelection: (c: ConversationWithoutContentType) => void;
+  selectedConversations: ConversationListItemType[];
+  toggleConversationSelection: (c: ConversationListItemType) => void;
   activeConversationId: string | null;
   owner: WorkspaceType;
   titleFilter: string;
@@ -1102,29 +1169,30 @@ const ConversationListContainer = ({
   return <div className="sm:flex sm:flex-col sm:gap-0.5">{children}</div>;
 };
 
-interface InboxSectionProps
-  extends Omit<InboxConversationListProps, "dateLabel"> {}
+const GRID_ANIMATE = { gridTemplateRows: "1fr", opacity: 1 };
+const GRID_EXIT = { gridTemplateRows: "0fr", opacity: 0 };
+const GRID_STYLE = { display: "grid" } as const;
 
-function InboxSection({
-  inboxConversations,
+function UnreadConversationsSection({
+  label,
+  conversations,
   isMultiSelect,
   isMarkingAllAsRead,
   titleFilter,
   onMarkAllAsRead,
-  onConversationBranched,
   selectedConversations,
   toggleConversationSelection,
   activeConversationId,
   owner,
-}: InboxSectionProps) {
-  const totalCount = inboxConversations.length;
+}: UnreadConversationsSectionProps) {
+  const totalCount = conversations.length;
 
   const shouldShowMarkAllAsReadButton =
     totalCount > 0 && titleFilter.length === 0 && !isMultiSelect;
 
   return (
     <NavigationListCollapsibleSection
-      label={`Inbox (${totalCount})`}
+      label={`${label} (${totalCount})`}
       className="border-b border-t border-border bg-background/50 px-2 pb-2 dark:border-border-night dark:bg-background-night/50"
       defaultOpen
       actionOnHover={false}
@@ -1135,26 +1203,35 @@ function InboxSection({
             variant="ghost"
             icon={CheckDoubleIcon}
             tooltip="Mark all as read"
-            onClick={() =>
-              onMarkAllAsRead(inboxConversations.map((c) => c.sId))
-            }
+            onClick={() => onMarkAllAsRead(conversations.map((c) => c.sId))}
             isLoading={isMarkingAllAsRead}
           />
         ) : null
       }
     >
-      {inboxConversations.map((conversation) => (
-        <ConversationListItem
-          key={conversation.sId}
-          conversation={conversation}
-          isMultiSelect={isMultiSelect}
-          onConversationBranched={onConversationBranched}
-          selectedConversations={selectedConversations}
-          toggleConversationSelection={toggleConversationSelection}
-          activeConversationId={activeConversationId}
-          owner={owner}
-        />
-      ))}
+      <AnimatePresence initial={false}>
+        {conversations.map((conversation) => (
+          <motion.div
+            key={conversation.sId}
+            style={GRID_STYLE}
+            animate={GRID_ANIMATE}
+            exit={GRID_EXIT}
+            transition={{ ease: "easeOut", duration: 0.1 }}
+          >
+            <div className="overflow-hidden">
+              <ConversationListItem
+                key={conversation.sId}
+                conversation={conversation}
+                isMultiSelect={isMultiSelect}
+                selectedConversations={selectedConversations}
+                toggleConversationSelection={toggleConversationSelection}
+                activeConversationId={activeConversationId}
+                owner={owner}
+              />
+            </div>
+          </motion.div>
+        ))}
+      </AnimatePresence>
     </NavigationListCollapsibleSection>
   );
 }
@@ -1164,13 +1241,12 @@ const ConversationList = ({
   dateLabel,
   ...props
 }: {
-  conversations: ConversationWithoutContentType[];
+  conversations: ConversationListItemType[];
   dateLabel: string;
   isMultiSelect: boolean;
-  selectedConversations: ConversationWithoutContentType[];
-  toggleConversationSelection: (c: ConversationWithoutContentType) => void;
+  selectedConversations: ConversationListItemType[];
+  toggleConversationSelection: (c: ConversationListItemType) => void;
   activeConversationId: string | null;
-  onConversationBranched?: () => Promise<void> | void;
   owner: WorkspaceType;
 }) => {
   if (!conversations.length) {
@@ -1198,36 +1274,32 @@ const ConversationList = ({
   );
 };
 
-function getConversationDotStatus(
-  conversation: ConversationWithoutContentType
-): "blocked" | "unread" | "idle" {
-  if (conversation.actionRequired) {
-    return "blocked";
-  }
-  if (conversation.hasError) {
-    return conversation.unread ? "blocked" : "idle";
-  }
-  if (conversation.unread) {
-    return "unread";
-  }
-  return "idle";
+interface WakeUpSuffixProps {
+  nextWakeupAt: number;
+}
+
+function WakeUpSuffix({ nextWakeupAt }: WakeUpSuffixProps) {
+  return (
+    <span className="copy-xs flex items-center gap-1 text-muted-foreground dark:text-muted-foreground-night">
+      <Icon visual={ActionTimeIcon} size="xs" />
+      {formatWakeUpSidebarLabel(nextWakeupAt)}
+    </span>
+  );
 }
 
 const ConversationListItem = memo(
   ({
     conversation,
     isMultiSelect,
-    onConversationBranched,
     selectedConversations,
     toggleConversationSelection,
     activeConversationId,
     owner,
   }: {
-    conversation: ConversationWithoutContentType;
+    conversation: ConversationListItemType;
     isMultiSelect: boolean;
-    onConversationBranched?: () => Promise<void> | void;
-    selectedConversations: ConversationWithoutContentType[];
-    toggleConversationSelection: (c: ConversationWithoutContentType) => void;
+    selectedConversations: ConversationListItemType[];
+    toggleConversationSelection: (c: ConversationListItemType) => void;
     activeConversationId: string | null;
     owner: WorkspaceType;
   }) => {
@@ -1239,11 +1311,21 @@ const ConversationListItem = memo(
       handleMenuOpenChange,
     } = useConversationMenu();
 
-    const conversationLabel =
-      conversation.title ??
-      (moment(conversation.created).isSame(moment(), "day")
-        ? "New Conversation"
-        : `Conversation from ${new Date(conversation.created).toLocaleDateString()}`);
+    const [showTypingAnimation, setShowTypingAnimation] = useState(false);
+    const titleRef = useRef<string | null>(conversation.title); // Used to detect when the title changes to show the typing animation.
+
+    useLayoutEffect(() => {
+      if (titleRef.current === null && conversation.title !== null) {
+        setShowTypingAnimation(true);
+      }
+      titleRef.current = conversation.title;
+    }, [conversation.title]);
+
+    const handleTypingAnimationComplete = useCallback(() => {
+      setShowTypingAnimation(false);
+    }, []);
+
+    const conversationLabel = getConversationDisplayTitle(conversation);
 
     const handleDragStart = useCallback(
       (e: React.DragEvent) => {
@@ -1285,9 +1367,18 @@ const ConversationListItem = memo(
       </div>
     ) : (
       <NavigationListItem
+        key={conversation.sId}
         selected={activeConversationId === conversation.sId}
         status={getConversationDotStatus(conversation)}
         label={conversationLabel}
+        labelAnimation={
+          showTypingAnimation
+            ? "typing"
+            : conversation.isRunningAgentLoop
+              ? "streaming"
+              : "none"
+        }
+        onTypingAnimationComplete={handleTypingAnimationComplete}
         href={getConversationRoute(owner.sId, conversation.sId)}
         shallow
         draggable={!conversation.spaceId}
@@ -1297,13 +1388,17 @@ const ConversationListItem = memo(
             ? "cursor-grab active:cursor-grabbing"
             : undefined
         }
+        suffix={
+          conversation.nextWakeupAt ? (
+            <WakeUpSuffix nextWakeupAt={conversation.nextWakeupAt} />
+          ) : undefined
+        }
         moreMenu={
           <ConversationMenu
             activeConversationId={conversation.sId}
             conversation={conversation}
-            onConversationBranched={onConversationBranched}
             owner={owner}
-            trigger={<NavigationListItemAction />}
+            trigger={() => <NavigationListItemAction />}
             isConversationDisplayed={activeConversationId === conversation.sId}
             isOpen={isMenuOpen}
             onOpenChange={handleMenuOpenChange}
@@ -1325,16 +1420,14 @@ const ConversationListItem = memo(
 );
 
 interface NavigationListWithInboxProps {
-  conversations: ConversationWithoutContentType[];
+  conversations: ConversationListItemType[];
   titleFilter: string;
   isMultiSelect: boolean;
-  selectedConversations: ConversationWithoutContentType[];
-  toggleConversationSelection: (
-    conversation: ConversationWithoutContentType
-  ) => void;
+  selectedConversations: ConversationListItemType[];
+  toggleConversationSelection: (conversation: ConversationListItemType) => void;
   activeConversationId: string | null;
-  onConversationBranched?: () => Promise<void> | void;
   owner: WorkspaceType;
+  starredSection?: React.ReactNode;
   projectsSection?: React.ReactNode;
   hasTriggeredConversations: boolean;
   hideTriggeredConversations: boolean;
@@ -1354,8 +1447,8 @@ function NavigationListWithInbox({
   selectedConversations,
   toggleConversationSelection,
   activeConversationId,
-  onConversationBranched,
   owner,
+  starredSection,
   projectsSection,
   hasTriggeredConversations,
   hideTriggeredConversations,
@@ -1368,7 +1461,11 @@ function NavigationListWithInbox({
   isLoadingMore,
 }: NavigationListWithInboxProps) {
   const scrollContainerRef = useRef<HTMLDivElement>(null);
-  const { readConversations, inboxConversations } = useMemo(() => {
+  const {
+    readConversations,
+    inboxConversations,
+    skillSuggestionConversations,
+  } = useMemo(() => {
     return getGroupConversationsByUnreadAndActionRequired(
       conversations,
       titleFilter
@@ -1384,7 +1481,7 @@ function NavigationListWithInbox({
         conversations: readConversations,
         titleFilter,
       })
-    : ({} as Record<GroupLabel, ConversationWithoutContentType[]>);
+    : ({} as Record<GroupLabel, ConversationListItemType[]>);
 
   const conversationsContent = (
     <>
@@ -1394,7 +1491,6 @@ function NavigationListWithInbox({
           conversations={conversationsByDate[dateLabel as GroupLabel]}
           dateLabel={dateLabel}
           isMultiSelect={isMultiSelect}
-          onConversationBranched={onConversationBranched}
           selectedConversations={selectedConversations}
           toggleConversationSelection={toggleConversationSelection}
           activeConversationId={activeConversationId}
@@ -1420,20 +1516,57 @@ function NavigationListWithInbox({
       ref={scrollContainerRef}
       className="dd-privacy-mask h-full w-full overflow-y-auto"
     >
-      {inboxConversations.length > 0 && (
-        <InboxSection
-          inboxConversations={inboxConversations}
-          isMultiSelect={isMultiSelect}
-          isMarkingAllAsRead={isMarkingAllAsRead}
-          titleFilter={titleFilter}
-          onMarkAllAsRead={markAllAsRead}
-          onConversationBranched={onConversationBranched}
-          selectedConversations={selectedConversations}
-          toggleConversationSelection={toggleConversationSelection}
-          activeConversationId={activeConversationId}
-          owner={owner}
-        />
-      )}
+      <AnimatePresence initial={false}>
+        {skillSuggestionConversations.length > 0 && (
+          <motion.div
+            key="skill-suggestions"
+            style={GRID_STYLE}
+            animate={GRID_ANIMATE}
+            exit={GRID_EXIT}
+            transition={{ duration: 0.2, ease: "easeOut" }}
+          >
+            <div className="overflow-hidden">
+              <UnreadConversationsSection
+                label="Skill suggestions"
+                conversations={skillSuggestionConversations}
+                isMultiSelect={isMultiSelect}
+                isMarkingAllAsRead={isMarkingAllAsRead}
+                titleFilter={titleFilter}
+                onMarkAllAsRead={markAllAsRead}
+                selectedConversations={selectedConversations}
+                toggleConversationSelection={toggleConversationSelection}
+                activeConversationId={activeConversationId}
+                owner={owner}
+              />
+            </div>
+          </motion.div>
+        )}
+        {inboxConversations.length > 0 && (
+          <motion.div
+            key="inbox"
+            style={GRID_STYLE}
+            animate={{ gridTemplateRows: "1fr" }}
+            exit={{ gridTemplateRows: "0fr" }}
+            transition={{ duration: 0.2, ease: "easeOut" }}
+          >
+            <div className="overflow-hidden">
+              <UnreadConversationsSection
+                label="Inbox"
+                conversations={inboxConversations}
+                isMultiSelect={isMultiSelect}
+                isMarkingAllAsRead={isMarkingAllAsRead}
+                titleFilter={titleFilter}
+                onMarkAllAsRead={markAllAsRead}
+                selectedConversations={selectedConversations}
+                toggleConversationSelection={toggleConversationSelection}
+                activeConversationId={activeConversationId}
+                owner={owner}
+              />
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+      {starredSection}
       {projectsSection}
       <NavigationList className="px-2">
         <NavigationListCollapsibleSection

@@ -1,9 +1,10 @@
 use crate::blocklist::{is_globally_blocked_domain, is_unsafe_ip};
 use crate::config::Config;
 use crate::dns::DnsResolver;
+use crate::gcs::GcsPolicyProvider;
 use crate::handshake::{read_handshake, Handshake, HandshakeError, ALLOW_RESPONSE, DENY_RESPONSE};
-use crate::jwt::{JwtValidationError, JwtValidator, ValidatedSandboxToken};
-use crate::policy::TemporaryAllowlist;
+use crate::jwt::{JwtValidationError, JwtValidator, ValidatedToken};
+use crate::policy::DefaultAllowlist;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,7 +22,8 @@ const UPSTREAM_CONNECT_TIMEOUT_SECONDS: u64 = 5;
 #[derive(Clone)]
 pub struct ConnectionState {
     jwt_validator: JwtValidator,
-    temporary_allowlist: TemporaryAllowlist,
+    default_allowlist: Option<DefaultAllowlist>,
+    policy_provider: GcsPolicyProvider,
     dns_resolver: DnsResolver,
     unsafe_skip_ssrf_check: bool,
 }
@@ -40,7 +42,7 @@ pub enum DenyReason {
     ExpiredJwt,
     InvalidClaims,
     GlobalBlocklist,
-    NotInTemporaryAllowlist,
+    PolicyDenied,
     DnsResolutionFailed,
     UnsafeResolvedIp,
     UpstreamConnectFailed,
@@ -48,10 +50,11 @@ pub enum DenyReason {
 }
 
 impl ConnectionState {
-    pub fn new(config: &Config) -> Self {
+    pub fn new(config: &Config, policy_provider: GcsPolicyProvider) -> Self {
         Self {
             jwt_validator: JwtValidator::new(&config.jwt_secret),
-            temporary_allowlist: config.temporary_allowlist.clone(),
+            default_allowlist: config.default_allowlist.clone(),
+            policy_provider,
             dns_resolver: DnsResolver::new(),
             unsafe_skip_ssrf_check: config.unsafe_skip_ssrf_check,
         }
@@ -70,7 +73,7 @@ impl DenyReason {
             Self::ExpiredJwt => "expired_jwt",
             Self::InvalidClaims => "invalid_claims",
             Self::GlobalBlocklist => "global_blocklist",
-            Self::NotInTemporaryAllowlist => "not_in_temporary_allowlist",
+            Self::PolicyDenied => "policy_denied",
             Self::DnsResolutionFailed => "dns_resolution_failed",
             Self::UnsafeResolvedIp => "unsafe_resolved_ip",
             Self::UpstreamConnectFailed => "upstream_connect_failed",
@@ -145,6 +148,20 @@ async fn handle_connection_inner(
     };
     drop(raw_token);
 
+    let sb_id = match token.sb_id.as_deref() {
+        Some(sb_id) if token.action.is_none() => sb_id,
+        _ => {
+            deny(
+                stream,
+                DenyReason::InvalidClaims,
+                Some(&token),
+                Some(&request),
+            )
+            .await;
+            return Err(DenyReason::InvalidClaims);
+        }
+    };
+
     if request.domain.is_empty() {
         // TODO(sandbox-egress): Track empty_domain separately from malformed_handshake because
         // this is the expected deny path for non-HTTP/non-TLS connections where dsbx cannot
@@ -170,18 +187,25 @@ async fn handle_connection_inner(
         return Err(DenyReason::GlobalBlocklist);
     }
 
-    if !state
-        .temporary_allowlist
-        .allows(&request.domain, &token.sb_id)
+    let default_allows = state
+        .default_allowlist
+        .as_ref()
+        .is_some_and(|allowlist| allowlist.allows(&request.domain));
+
+    if !default_allows
+        && !state
+            .policy_provider
+            .evaluate(token.w_id.as_deref(), sb_id, &request.domain)
+            .await
     {
         deny(
             stream,
-            DenyReason::NotInTemporaryAllowlist,
+            DenyReason::PolicyDenied,
             Some(&token),
             Some(&request),
         )
         .await;
-        return Err(DenyReason::NotInTemporaryAllowlist);
+        return Err(DenyReason::PolicyDenied);
     }
 
     let upstream_addresses = match timeout(
@@ -195,7 +219,7 @@ async fn handle_connection_inner(
         Ok(Ok(addresses)) => addresses,
         Err(_) => {
             warn!(
-                sb_id = %token.sb_id,
+                sb_id = sb_id,
                 domain = %request.domain,
                 original_dest_port = request.original_dest_port,
                 dns_timeout_seconds = DNS_TIMEOUT_SECONDS,
@@ -213,7 +237,7 @@ async fn handle_connection_inner(
         Ok(Err(error)) => {
             warn!(
                 error = %error,
-                sb_id = %token.sb_id,
+                sb_id = sb_id,
                 domain = %request.domain,
                 original_dest_port = request.original_dest_port,
                 "dns resolution failed"
@@ -267,7 +291,7 @@ async fn handle_connection_inner(
         Ok(Ok(upstream)) => upstream,
         Err(_) => {
             warn!(
-                sb_id = %token.sb_id,
+                sb_id = sb_id,
                 domain = %request.domain,
                 original_dest_port = request.original_dest_port,
                 upstream_addr = %upstream_addr,
@@ -286,7 +310,7 @@ async fn handle_connection_inner(
         Ok(Err(error)) => {
             warn!(
                 error = %error,
-                sb_id = %token.sb_id,
+                sb_id = sb_id,
                 domain = %request.domain,
                 original_dest_port = request.original_dest_port,
                 upstream_addr = %upstream_addr,
@@ -311,7 +335,7 @@ async fn handle_connection_inner(
     }
 
     info!(
-        sb_id = %token.sb_id,
+        sb_id = sb_id,
         domain = %request.domain,
         original_dest_port = request.original_dest_port,
         upstream_addr = %upstream_addr,
@@ -323,7 +347,7 @@ async fn handle_connection_inner(
     match copy_bidirectional(stream, &mut upstream).await {
         Ok((from_client_bytes, from_upstream_bytes)) => {
             info!(
-                sb_id = %token.sb_id,
+                sb_id = sb_id,
                 domain = %request.domain,
                 original_dest_port = request.original_dest_port,
                 upstream_addr = %upstream_addr,
@@ -336,7 +360,7 @@ async fn handle_connection_inner(
         Err(error) => {
             warn!(
                 error = %error,
-                sb_id = %token.sb_id,
+                sb_id = sb_id,
                 domain = %request.domain,
                 original_dest_port = request.original_dest_port,
                 upstream_addr = %upstream_addr,
@@ -350,7 +374,7 @@ async fn handle_connection_inner(
 async fn deny(
     stream: &mut TlsStream<TcpStream>,
     reason: DenyReason,
-    token: Option<&ValidatedSandboxToken>,
+    token: Option<&ValidatedToken>,
     request: Option<&RequestMetadata>,
 ) {
     // TODO(sandbox-egress): Emit allow/deny/JWT/GCS/upstream metrics once service telemetry
@@ -367,13 +391,13 @@ async fn deny(
 
 fn log_deny(
     reason: DenyReason,
-    token: Option<&ValidatedSandboxToken>,
+    token: Option<&ValidatedToken>,
     request: Option<&RequestMetadata>,
     upstream_addr: Option<SocketAddr>,
 ) {
     warn!(
         deny_reason = %reason,
-        sb_id = token.map(|token| token.sb_id.as_str()),
+        sb_id = token.and_then(|token| token.sb_id.as_deref()),
         domain = request.map(|request| request.domain.as_str()),
         original_dest_port = request.map(|request| request.original_dest_port),
         upstream_addr = upstream_addr.map(|address| address.to_string()),

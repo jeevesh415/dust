@@ -1,4 +1,6 @@
 import type { Authenticator } from "@app/lib/auth";
+import { hasFeatureFlag } from "@app/lib/auth";
+import { listPrivateConversationsFromES } from "@app/lib/conversation_search/search";
 import { ConversationMCPServerViewModel } from "@app/lib/models/agent/actions/conversation_mcp_server_view";
 import {
   AgentMessageModel,
@@ -10,11 +12,11 @@ import {
   UserConversationReadsModel,
   UserMessageModel,
 } from "@app/lib/models/agent/conversation";
-import "@app/lib/models/agent/conversation_fork";
-import { REINFORCEMENT_METADATA_KEYS } from "@app/lib/reinforced_agent/types";
+import { ConversationForkModel } from "@app/lib/models/agent/conversation_fork";
 import { REINFORCED_SKILLS_METADATA_KEYS } from "@app/lib/reinforcement/types";
 import { BaseResource } from "@app/lib/resources/base_resource";
 import { ConversationBranchResource } from "@app/lib/resources/conversation_branch_resource";
+import { DataSourceViewResource } from "@app/lib/resources/data_source_view_resource";
 import type { MCPServerViewResource } from "@app/lib/resources/mcp_server_view_resource";
 import {
   createResourcePermissionsFromSpacesWithMap,
@@ -24,27 +26,45 @@ import { RunResource } from "@app/lib/resources/run_resource";
 import { SpaceResource } from "@app/lib/resources/space_resource";
 import { frontSequelize } from "@app/lib/resources/storage";
 import { ContentFragmentModel } from "@app/lib/resources/storage/models/content_fragment";
+import { UserModel } from "@app/lib/resources/storage/models/user";
 import type { ReadonlyAttributesType } from "@app/lib/resources/storage/types";
 import type { ModelStaticWorkspaceAware } from "@app/lib/resources/storage/wrappers/workspace_models";
 import { getResourceIdFromSId, makeSId } from "@app/lib/resources/string_ids";
 import type { ResourceFindOptions } from "@app/lib/resources/types";
 import { UserResource } from "@app/lib/resources/user_resource";
+import { concurrentExecutor } from "@app/lib/utils/async_utils";
 import { withTransaction } from "@app/lib/utils/sql_utils";
+import logger from "@app/logger/logger";
+import { launchIndexConversationEsWorkflow } from "@app/temporal/es_indexation/client";
 import type { LightAgentConfigurationType } from "@app/types/assistant/agent";
 import type {
+  ConversationForkedChildType,
   ConversationForkedFromType,
+  ConversationForkingDataType,
+  ConversationListItemType,
   ConversationMCPServerViewType,
+  ConversationMetadata,
+  ConversationUrlAccessMode,
   ConversationVisibility,
   ConversationWithoutContentType,
   ParticipantActionType,
 } from "@app/types/assistant/conversation";
-import { ConversationError } from "@app/types/assistant/conversation";
+import {
+  ConversationError,
+  getConversationDisplayTitle,
+  getConversationUrlAccessMode,
+} from "@app/types/assistant/conversation";
+import type { ContentFragmentVersion } from "@app/types/content_fragment";
 import type { ModelId } from "@app/types/shared/model_id";
 import type { Result } from "@app/types/shared/result";
 import { Err, Ok } from "@app/types/shared/result";
+import { assertNever } from "@app/types/shared/utils/assert_never";
 import { normalizeError } from "@app/types/shared/utils/error_utils";
+import { removeNulls } from "@app/types/shared/utils/general";
 import type { UserType } from "@app/types/user";
 import assert from "assert";
+import isEqual from "lodash/isEqual";
+import omit from "lodash/omit";
 import uniq from "lodash/uniq";
 import type {
   Attributes,
@@ -59,13 +79,44 @@ export type FetchConversationOptions = {
   includeDeleted?: boolean;
   excludeTest?: boolean; // Explicitly exclude test conversations
   dangerouslySkipPermissionFiltering?: boolean;
+  includeForkingData?: boolean;
   updatedSince?: number; // Filter conversations updated after this timestamp (milliseconds)
 };
+
+type SpaceConversationsFilter = "all" | "group" | "with_me";
 
 interface UserParticipation {
   actionRequired: boolean;
   updated: number;
 }
+
+export type ConversationAccessType =
+  | "allowed"
+  | "conversation_not_found"
+  | "conversation_access_restricted"
+  | "conversation_access_restricted_by_private_by_default_url_restriction";
+
+const shouldByPassPrivateByDefaultUrlRestriction = (auth: Authenticator) => {
+  // Dust super users (poke admins) can always access conversations regardless of participant
+  // restrictions — they need this to debug triggered conversations that have no human participant.
+  if (auth.isDustSuperUser()) {
+    return true;
+  }
+  const authMethod = auth.authMethod();
+  switch (authMethod) {
+    case "api_key":
+    case "system_api_key":
+    case "internal":
+      // Support api key and internalAdminForWorkspace auth methods.
+      return true;
+    case "oauth":
+    case "session":
+    case "sandbox_token":
+      return false;
+    default:
+      assertNever(authMethod);
+  }
+};
 
 // Attributes are marked as read-only to reflect the stateless nature of our Resource.
 // This design will be moved up to BaseResource once we transition away from Sequelize.
@@ -81,12 +132,12 @@ export class ConversationResource extends BaseResource<ConversationModel> {
   // User-specific fields (populated when conversations are listed for a user).
   private userParticipation?: UserParticipation;
   private userLastReadAt: Date | null = null;
-  private forkedFromData?: ConversationForkedFromType;
+  private _forkingData?: ConversationForkingDataType;
 
   constructor(
     model: ModelStaticWorkspaceAware<ConversationModel>,
     blob: Attributes<ConversationModel>,
-    private readonly _space: SpaceResource | null
+    private _space: SpaceResource | null
   ) {
     super(ConversationModel, blob);
   }
@@ -101,7 +152,7 @@ export class ConversationResource extends BaseResource<ConversationModel> {
           {
             association: "parentConversation" as const,
             required: true,
-            attributes: ["sId"],
+            attributes: ["sId", "title"],
           },
           {
             association: "sourceMessage" as const,
@@ -149,6 +200,7 @@ export class ConversationResource extends BaseResource<ConversationModel> {
 
     return {
       parentConversationId: fork.parentConversation.sId,
+      parentConversationTitle: fork.parentConversation.title,
       sourceMessageId: fork.sourceMessage.sId,
       branchedAt: fork.branchedAt.getTime(),
       user: new UserResource(
@@ -158,12 +210,40 @@ export class ConversationResource extends BaseResource<ConversationModel> {
     };
   }
 
+  private static isPrivateConversationUrlsByDefaultEnabled(
+    auth: Authenticator
+  ): boolean {
+    return (
+      auth.getNonNullableWorkspace().metadata
+        ?.privateConversationUrlsByDefault === true
+    );
+  }
+
+  private static getConversationUrlAccessModeForPrivateByDefault(conversation: {
+    metadata: ConversationMetadata;
+  }): ConversationUrlAccessMode {
+    return (
+      getConversationUrlAccessMode(conversation.metadata) ?? "participants_only"
+    );
+  }
+
+  private static shouldApplyPrivateByDefaultUrlRestriction(conversation: {
+    spaceId: ModelId | null;
+    depth: number;
+  }): boolean {
+    // Project and sub-conversations ignore the private by default url restriction.
+    return conversation.spaceId === null && conversation.depth === 0;
+  }
+
   private static fromModel(
     conversation: ConversationModel,
     space: SpaceResource | null
   ): ConversationResource {
     const resource = new this(this.model, conversation.get(), space);
-    resource.forkedFromData = this.getForkedFromData(conversation);
+    const forkedFrom = this.getForkedFromData(conversation);
+    if (forkedFrom) {
+      resource._forkingData = { forkedFrom };
+    }
 
     return resource;
   }
@@ -175,10 +255,14 @@ export class ConversationResource extends BaseResource<ConversationModel> {
       transaction,
       excludeTest,
       updatedAfter,
+      includeForkingData,
+      loadSpaces,
     }: {
       transaction?: Transaction;
       excludeTest?: boolean;
       updatedAfter?: Date;
+      includeForkingData?: boolean;
+      loadSpaces?: boolean;
     } = {}
   ): Promise<ConversationResource[]> {
     if (ids.length === 0) {
@@ -199,16 +283,173 @@ export class ConversationResource extends BaseResource<ConversationModel> {
         visibility: { [Op.notIn]: excludedVisibilities },
         ...(updatedAfter ? { updatedAt: { [Op.gte]: updatedAfter } } : {}),
       } as WhereOptions<ConversationModel>,
-      include: this.getForkedFromInclude(),
+      ...(includeForkingData ? { include: this.getForkedFromInclude() } : {}),
       transaction,
     });
 
+    let spaceIdToSpaceMap: Map<ModelId, SpaceResource> = new Map();
+    if (loadSpaces) {
+      const uniqueSpaceIds = uniq(
+        removeNulls(conversations.map((c) => c.spaceId))
+      );
+      const spaces =
+        uniqueSpaceIds.length === 0
+          ? []
+          : await SpaceResource.fetchByModelIds(auth, uniqueSpaceIds, {
+              transaction,
+            });
+      spaceIdToSpaceMap = new Map(spaces.map((s) => [s.id, s]));
+    }
+
     // Note: no permission filtering here. Callers must ensure the auth is allowed.
-    return conversations.map((c) => this.fromModel(c, null));
+    return conversations.map((c) =>
+      this.fromModel(
+        c,
+        loadSpaces && c.spaceId
+          ? (spaceIdToSpaceMap.get(c.spaceId) ?? null)
+          : null
+      )
+    );
   }
 
-  get forkedFromInfo(): ConversationForkedFromType | undefined {
-    return this.forkedFromData;
+  get forkingData(): ConversationForkingDataType | undefined {
+    return this._forkingData;
+  }
+
+  private static async listSerializedChildForks(
+    auth: Authenticator,
+    conversation: ConversationResource
+  ): Promise<ConversationForkedChildType[]> {
+    const workspace = auth.getNonNullableWorkspace();
+
+    const forks = await ConversationForkModel.findAll({
+      where: {
+        workspaceId: workspace.id,
+        parentConversationId: conversation.id,
+      },
+      order: [
+        ["branchedAt", "ASC"],
+        ["id", "ASC"],
+      ],
+      include: [
+        {
+          model: ConversationModel,
+          as: "childConversation",
+          required: true,
+          attributes: ["sId", "title", "createdAt"],
+        },
+        {
+          model: MessageModel,
+          as: "sourceMessage",
+          required: true,
+          attributes: ["sId"],
+        },
+        {
+          model: UserModel,
+          as: "createdByUser",
+          required: true,
+          attributes: [
+            "id",
+            "sId",
+            "createdAt",
+            "provider",
+            "username",
+            "email",
+            "firstName",
+            "lastName",
+            "imageUrl",
+            "lastLoginAt",
+          ],
+        },
+      ],
+    });
+
+    if (forks.length === 0) {
+      return [];
+    }
+
+    const childConversationIds = forks.flatMap((fork) => {
+      assert(
+        fork.childConversation,
+        "Forked child conversation must be loaded for parent lineage."
+      );
+
+      return [fork.childConversation.sId];
+    });
+
+    const readableChildConversationIds = new Set(
+      (await this.fetchByIds(auth, childConversationIds)).map(
+        (childConversation) => childConversation.sId
+      )
+    );
+
+    return forks.flatMap((fork) => {
+      assert(
+        fork.childConversation,
+        "Forked child conversation must be loaded for parent lineage."
+      );
+      assert(
+        fork.sourceMessage,
+        "Forked source message must be loaded for parent lineage."
+      );
+      assert(
+        fork.createdByUser,
+        "Forked creator must be loaded for parent lineage."
+      );
+
+      if (!readableChildConversationIds.has(fork.childConversation.sId)) {
+        return [];
+      }
+
+      const branchedAtMs = fork.branchedAt.getTime();
+      const sourceMessageId = fork.sourceMessage.sId;
+      const user = new UserResource(
+        UserResource.model,
+        fork.createdByUser.get()
+      ).toJSON();
+
+      return [
+        {
+          childConversationId: fork.childConversation.sId,
+          childConversationTitle: getConversationDisplayTitle({
+            created: fork.childConversation.createdAt.getTime(),
+            forkingData: {
+              forkedFrom: {
+                parentConversationId: conversation.sId,
+                parentConversationTitle: conversation.title,
+                sourceMessageId,
+                branchedAt: branchedAtMs,
+                user,
+              },
+            },
+            title: fork.childConversation.title,
+          }),
+          sourceMessageId,
+          branchedAt: branchedAtMs,
+          user,
+        },
+      ];
+    });
+  }
+
+  async fetchForkingData(
+    auth: Authenticator
+  ): Promise<ConversationForkingDataType | undefined> {
+    const forkedChildren = await ConversationResource.listSerializedChildForks(
+      auth,
+      this
+    );
+
+    if (!this.forkingData?.forkedFrom && forkedChildren.length === 0) {
+      return undefined;
+    }
+
+    return {
+      ...(this.forkingData?.forkedFrom && {
+        forkedFrom: this.forkingData.forkedFrom,
+      }),
+      ...(forkedChildren.length > 0 && { forkedChildren }),
+    };
   }
 
   get space(): SpaceResource | null {
@@ -243,25 +484,44 @@ export class ConversationResource extends BaseResource<ConversationModel> {
       );
     }
 
+    if ((blob.spaceId ?? null) !== (space?.id ?? null)) {
+      throw new Error("Space resource must match space id.");
+    }
+
     const requestedSpaceIds =
       space && !blob.requestedSpaceIds.includes(space.id)
         ? [...blob.requestedSpaceIds, space.id]
         : blob.requestedSpaceIds;
 
+    // Default `useFileSystem` to true when the caller hasn't pinned a value. Pinning the flag on
+    // the conversation gives stable behavior across its lifetime:
+    // existing conversations (no flag set) keep the legacy behavior.
+    const metadata: ConversationMetadata = blob.metadata
+      ? { ...blob.metadata }
+      : {};
+    if (metadata.useFileSystem === undefined) {
+      metadata.useFileSystem = true;
+    }
+
     const conversation = await this.model.create(
       {
         ...blob,
+        metadata,
         requestedSpaceIds,
         workspaceId: workspace.id,
       },
       { transaction }
     );
 
-    return new ConversationResource(
+    const resource = new ConversationResource(
       ConversationResource.model,
       conversation.get(),
       space
     );
+
+    await this.triggerEsIndexing(auth, resource.sId);
+
+    return resource;
   }
 
   static async countForWorkspace(
@@ -305,6 +565,55 @@ export class ConversationResource extends BaseResource<ConversationModel> {
     const result = new Map<ModelId, number>();
     for (const row of rows) {
       result.set(row.conversationId, parseInt(row.get("count") as string, 10));
+    }
+    return result;
+  }
+
+  /**
+   * Returns counts of distinct workspace users who authored a user message (non-null
+   * {@link UserMessageModel.userId}) per conversation.
+   */
+  static async getDistinctUserCountsByConversationIds(
+    workspaceId: ModelId,
+    conversationIds: ModelId[]
+  ): Promise<Map<ModelId, number>> {
+    const result = new Map<ModelId, number>();
+    if (conversationIds.length === 0) {
+      return result;
+    }
+
+    const rows = await MessageModel.findAll({
+      attributes: [
+        "conversationId",
+        [
+          fn("COUNT", fn("DISTINCT", col("userMessage.userId"))),
+          "distinctUserCount",
+        ],
+      ],
+      include: [
+        {
+          model: UserMessageModel,
+          as: "userMessage",
+          attributes: [],
+          required: true,
+          where: {
+            userId: { [Op.ne]: null },
+          },
+        },
+      ],
+      where: {
+        workspaceId,
+        conversationId: { [Op.in]: conversationIds },
+        userMessageId: { [Op.ne]: null },
+      },
+      group: ["message.conversationId"],
+    });
+
+    for (const row of rows) {
+      result.set(
+        row.conversationId,
+        parseInt(row.get("distinctUserCount") as string, 10)
+      );
     }
     return result;
   }
@@ -391,7 +700,9 @@ export class ConversationResource extends BaseResource<ConversationModel> {
         ...options.where,
         workspaceId: workspace.id,
       },
-      include: this.getForkedFromInclude(),
+      ...(fetchConversationOptions?.includeForkingData
+        ? { include: this.getForkedFromInclude() }
+        : {}),
       limit: options.limit,
       order: options.order,
     });
@@ -449,7 +760,161 @@ export class ConversationResource extends BaseResource<ConversationModel> {
       )
     );
 
-    return spaceBasedAccessible;
+    if (spaceBasedAccessible.length === 0) {
+      return [];
+    }
+
+    if (
+      !this.isPrivateConversationUrlsByDefaultEnabled(auth) ||
+      shouldByPassPrivateByDefaultUrlRestriction(auth)
+    ) {
+      return spaceBasedAccessible;
+    }
+
+    const user = auth.user();
+    if (!user) {
+      throw new Error(
+        "User not found while auth method is not api key, system api key, or internal"
+      );
+    }
+
+    const participantRestrictedConversations = spaceBasedAccessible.filter(
+      (conversation) =>
+        this.shouldApplyPrivateByDefaultUrlRestriction(conversation) &&
+        this.getConversationUrlAccessModeForPrivateByDefault(conversation) ===
+          "participants_only"
+    );
+
+    // No participant-restricted conversations, return the space-based accessible conversations.
+    if (participantRestrictedConversations.length === 0) {
+      return spaceBasedAccessible;
+    }
+
+    // For all participant-restricted conversations, check if the user is a participant.
+    const participations = await ConversationParticipantModel.findAll({
+      where: {
+        workspaceId: workspace.id,
+        userId: user.id,
+        conversationId: {
+          [Op.in]: participantRestrictedConversations.map((c) => c.id),
+        },
+      },
+      attributes: ["conversationId"],
+    });
+
+    const participantConversationIds = new Set(
+      participations.map((p) => p.conversationId)
+    );
+
+    // Return the space-based accessible conversations that are not participant-restricted.
+    // Or are participant-restricted and the user is a participant.
+    return spaceBasedAccessible.filter(
+      (conversation) =>
+        !this.shouldApplyPrivateByDefaultUrlRestriction(conversation) ||
+        this.getConversationUrlAccessModeForPrivateByDefault(conversation) ===
+          "workspace_members" ||
+        participantConversationIds.has(conversation.id)
+    );
+  }
+
+  private static async canUserAccessPrivateByDefaultConversation(
+    auth: Authenticator,
+    conversation: ConversationModel
+  ): Promise<boolean> {
+    if (!this.isPrivateConversationUrlsByDefaultEnabled(auth)) {
+      return true;
+    }
+
+    if (!this.shouldApplyPrivateByDefaultUrlRestriction(conversation)) {
+      return true;
+    }
+
+    if (
+      this.getConversationUrlAccessModeForPrivateByDefault(conversation) ===
+      "workspace_members"
+    ) {
+      return true;
+    }
+
+    if (shouldByPassPrivateByDefaultUrlRestriction(auth)) {
+      return true;
+    }
+
+    const user = auth.user();
+    if (!user) {
+      return false;
+    }
+
+    const participationCount = await ConversationParticipantModel.count({
+      where: {
+        workspaceId: auth.getNonNullableWorkspace().id,
+        conversationId: conversation.id,
+        userId: user.id,
+      },
+    });
+
+    return participationCount > 0;
+  }
+
+  private static async isConversationReadableFromRequestedSpaces(
+    auth: Authenticator,
+    conversation: ConversationModel
+  ): Promise<boolean> {
+    const spaces = await SpaceResource.fetchByModelIds(
+      auth,
+      conversation.requestedSpaceIds
+    );
+
+    const spaceIdToGroupsMap = createSpaceIdToGroupsMap(auth, spaces);
+
+    return auth.canRead(
+      createResourcePermissionsFromSpacesWithMap(
+        spaceIdToGroupsMap,
+        conversation.requestedSpaceIds
+      )
+    );
+  }
+
+  static async canAccess(
+    auth: Authenticator,
+    sId: string
+  ): Promise<ConversationAccessType> {
+    const workspace = auth.getNonNullableWorkspace();
+    const { where } = this.getOptions();
+    const conversation = await this.model.findOne({
+      where: {
+        sId,
+        workspaceId: workspace.id,
+        ...where,
+      },
+    });
+    if (!conversation) {
+      return "conversation_not_found";
+    }
+
+    try {
+      if (
+        !(await this.isConversationReadableFromRequestedSpaces(
+          auth,
+          conversation
+        ))
+      ) {
+        return "conversation_access_restricted";
+      }
+    } catch (_error) {
+      return "conversation_not_found";
+    }
+
+    if (
+      !(await this.canUserAccessPrivateByDefaultConversation(
+        auth,
+        conversation
+      ))
+    ) {
+      return "conversation_access_restricted_by_private_by_default_url_restriction";
+    }
+
+    return "allowed";
   }
 
   private static triggerModelIdToSId({
@@ -476,6 +941,45 @@ export class ConversationResource extends BaseResource<ConversationModel> {
       this.triggerId,
       this.workspaceId
     );
+  }
+
+  async listParticipantsForConversation(): Promise<
+    Array<{
+      userId: string;
+      actionRequired: boolean;
+    }>
+  > {
+    const participants = await ConversationParticipantModel.findAll({
+      where: {
+        conversationId: this.id,
+        workspaceId: this.workspaceId,
+      },
+      attributes: ["userId", "actionRequired"],
+      include: [{ model: UserModel, attributes: ["sId"] }],
+    });
+
+    return participants.flatMap((p) => {
+      if (!p.user) {
+        return [];
+      }
+      return [{ userId: p.user.sId, actionRequired: p.actionRequired }];
+    });
+  }
+
+  static async triggerEsIndexing(
+    auth: Authenticator,
+    conversationId: string
+  ): Promise<void> {
+    if (!(await hasFeatureFlag(auth, "conversation_search_indexing"))) {
+      return;
+    }
+    const result = await launchIndexConversationEsWorkflow({
+      conversationId,
+      workspaceId: auth.getNonNullableWorkspace().sId,
+    });
+    if (result.isErr()) {
+      throw result.error;
+    }
   }
 
   static async fetchParticipationMapForUser(
@@ -601,46 +1105,25 @@ export class ConversationResource extends BaseResource<ConversationModel> {
     return conversations;
   }
 
-  static async canAccess(
+  /**
+   * Hydrates participation + read state so {@link ConversationResource#toListItem}
+   * matches sidebar rows (same fields as inbox Elasticsearch lists, minus volatile ES-only bits).
+   * Conversations the user cannot access are omitted from the map.
+   */
+  static async fetchListItemsBySIds(
     auth: Authenticator,
-    sId: string
-  ): Promise<
-    "allowed" | "conversation_not_found" | "conversation_access_restricted"
-  > {
-    const workspace = auth.getNonNullableWorkspace();
-    const { where } = this.getOptions();
-    const conversation = await this.model.findOne({
-      where: {
-        sId,
-        workspaceId: workspace.id,
-        ...where,
-      },
-    });
-    if (!conversation) {
-      return "conversation_not_found";
+    sIds: string[]
+  ): Promise<Map<string, ConversationListItemType>> {
+    if (sIds.length === 0) {
+      return new Map();
     }
-    const spaces = await SpaceResource.fetchByModelIds(
-      auth,
-      conversation.requestedSpaceIds
-    );
-    try {
-      const spaceIdToGroupsMap = createSpaceIdToGroupsMap(auth, spaces);
-      if (
-        !auth.canRead(
-          createResourcePermissionsFromSpacesWithMap(
-            spaceIdToGroupsMap,
-            conversation.requestedSpaceIds
-          )
-        )
-      ) {
-        return "conversation_access_restricted";
-      }
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
-      // biome-ignore lint/correctness/noUnusedVariables: ignored using `--suppress`
-    } catch (error) {
-      return "conversation_not_found";
+    const uniqueSIds = [...new Set(sIds)];
+    const conversations = await this.fetchByIds(auth, uniqueSIds);
+    if (conversations.length === 0) {
+      return new Map();
     }
-    return "allowed";
+    await this.enrichWithParticipationAndReadState(auth, conversations);
+    return new Map(conversations.map((c) => [c.sId, c.toListItem()]));
   }
 
   static async listAll(
@@ -838,63 +1321,6 @@ export class ConversationResource extends BaseResource<ConversationModel> {
   }
 
   /**
-   * Lists conversations updated since a given date that involve a specific agent.
-   * Returns an array of conversation sIds.
-   */
-  static async listRecentConversationsForAgent(
-    auth: Authenticator,
-    {
-      agentConfigurationId,
-      updatedSince,
-    }: {
-      agentConfigurationId: string;
-      updatedSince: Date;
-    }
-  ): Promise<string[]> {
-    const workspaceId = auth.getNonNullableWorkspace().id;
-
-    // Step 1: Get distinct conversation IDs that have messages from this agent.
-    const messagesWithAgent = await MessageModel.findAll({
-      attributes: [
-        [
-          Sequelize.fn("DISTINCT", Sequelize.col("conversationId")),
-          "conversationId",
-        ],
-      ],
-      where: { workspaceId },
-      include: [
-        {
-          model: AgentMessageModel,
-          as: "agentMessage",
-          required: true,
-          attributes: [],
-          where: { workspaceId, agentConfigurationId },
-        },
-      ],
-      raw: true,
-    });
-
-    if (messagesWithAgent.length === 0) {
-      return [];
-    }
-
-    // Step 2: Filter to conversations updated since the given date.
-    const conversationIds = messagesWithAgent.map((m) => m.conversationId);
-    const conversations = await this.baseFetchWithAuthorization(
-      auth,
-      {},
-      {
-        where: {
-          id: { [Op.in]: conversationIds },
-          updatedAt: { [Op.gte]: updatedSince },
-        },
-      }
-    );
-
-    return conversations.map((c) => c.sId);
-  }
-
-  /**
    * For each agent, returns the sIds of qualifying conversations in the window
    * createdAt >= cutoffDate. With excludeHumanOutOfTheLoop, removes conversations where
    * triggerId IS NOT NULL and no user messages are present.
@@ -957,17 +1383,17 @@ export class ConversationResource extends BaseResource<ConversationModel> {
       conversations.map((c) => [c.id, c.sId])
     );
 
-    const agentToConvSIds = new Map<string, Set<string>>();
+    const agentToConvIds = new Map<string, Set<string>>();
     for (const p of participations) {
       const convSId = sIdById.get(p.message!.conversationId);
       if (!convSId) {
         continue;
       }
       const agentId = p.agentConfigurationId;
-      if (!agentToConvSIds.has(agentId)) {
-        agentToConvSIds.set(agentId, new Set());
+      if (!agentToConvIds.has(agentId)) {
+        agentToConvIds.set(agentId, new Set());
       }
-      agentToConvSIds.get(agentId)!.add(convSId);
+      agentToConvIds.get(agentId)!.add(convSId);
     }
 
     let qualifyingConvSIds: Set<string>;
@@ -1012,7 +1438,7 @@ export class ConversationResource extends BaseResource<ConversationModel> {
       }
     }
 
-    for (const [agentId, convSIds] of agentToConvSIds) {
+    for (const [agentId, convSIds] of agentToConvIds) {
       const qualifying = [...convSIds].filter((sId) =>
         qualifyingConvSIds.has(sId)
       );
@@ -1027,14 +1453,13 @@ export class ConversationResource extends BaseResource<ConversationModel> {
   static async fetchConversationWithoutContent(
     auth: Authenticator,
     sId: string,
-    options?: FetchConversationOptions & {
-      dangerouslySkipPermissionFiltering?: boolean;
-    }
+    options?: FetchConversationOptions
   ): Promise<Result<ConversationWithoutContentType, ConversationError>> {
     const conversation = await this.fetchById(auth, sId, {
       includeDeleted: options?.includeDeleted,
       dangerouslySkipPermissionFiltering:
         options?.dangerouslySkipPermissionFiltering,
+      includeForkingData: options?.includeForkingData,
     });
 
     if (!conversation) {
@@ -1046,27 +1471,29 @@ export class ConversationResource extends BaseResource<ConversationModel> {
         auth,
         conversation.id
       );
+    const forkingData = options?.includeForkingData
+      ? await conversation.fetchForkingData(auth)
+      : undefined;
 
     return new Ok({
-      id: conversation.id,
-      created: conversation.createdAt.getTime(),
-      updated: conversation.updatedAt.getTime(),
-      sId: conversation.sId,
-      title: conversation.title,
-      triggerId: conversation.triggerSId,
       actionRequired,
-      unread: lastReadAt === null || conversation.updatedAt > lastReadAt,
-      lastReadMs: lastReadAt?.getTime() ?? null,
+      branchId: null,
+      created: conversation.createdAt.getTime(),
+      depth: conversation.depth,
       hasError: conversation.hasError,
+      id: conversation.id,
+      lastReadMs: lastReadAt?.getTime() ?? null,
+      metadata: conversation.metadata,
       requestedGroupIds: [],
       requestedSpaceIds: conversation.getRequestedSpaceIdsFromModel(),
+      sId: conversation.sId,
       spaceId: conversation.space?.sId ?? null,
-      depth: conversation.depth,
-      metadata: conversation.metadata,
-      branchId: null,
-      ...(conversation.forkedFromInfo && {
-        forkedFrom: conversation.forkedFromInfo,
-      }),
+      title: conversation.title,
+      triggerId: conversation.triggerSId,
+      unread: lastReadAt === null || conversation.updatedAt > lastReadAt,
+      updated: conversation.updatedAt.getTime(),
+      isRunningAgentLoop: conversation.isRunningAgentLoop,
+      ...(forkingData && { forkingData }),
     });
   }
 
@@ -1082,6 +1509,9 @@ export class ConversationResource extends BaseResource<ConversationModel> {
     }
 
     await conversation.update(blob, transaction);
+
+    await this.triggerEsIndexing(auth, sId);
+
     return new Ok(undefined);
   }
 
@@ -1131,6 +1561,7 @@ export class ConversationResource extends BaseResource<ConversationModel> {
     {
       pagination,
       extraWhereClause,
+      restrictToConversationModelIds,
     }: {
       pagination: {
         limit: number;
@@ -1138,6 +1569,7 @@ export class ConversationResource extends BaseResource<ConversationModel> {
         orderDirection?: "asc" | "desc";
       };
       extraWhereClause?: WhereOptions<InferAttributes<ConversationModel>>;
+      restrictToConversationModelIds?: ModelId[];
     }
   ): Promise<{
     conversations: ConversationResource[];
@@ -1150,8 +1582,11 @@ export class ConversationResource extends BaseResource<ConversationModel> {
       lastValue: null,
     };
 
-    const participationMap = await this.fetchParticipationMapForUser(auth);
-    const conversationIds = Array.from(participationMap.keys());
+    const participationMap = await this.fetchParticipationMapForUser(
+      auth,
+      restrictToConversationModelIds
+    );
+    let conversationIds = Array.from(participationMap.keys());
 
     if (conversationIds.length === 0) {
       return emptyResult;
@@ -1231,6 +1666,169 @@ export class ConversationResource extends BaseResource<ConversationModel> {
     lastValue: string | null;
   }> {
     return this.fetchPrivateConversationsPaginated(auth, { pagination });
+  }
+
+  static async listPrivateConversationsForUserPaginatedFromES(
+    auth: Authenticator,
+    pagination: {
+      limit: number;
+      lastValue?: string;
+      orderDirection?: "asc" | "desc";
+    }
+  ): Promise<{
+    conversations: ConversationListItemType[];
+    hasMore: boolean;
+    lastValue: string | null;
+  }> {
+    const user = auth.user();
+    if (!user) {
+      return { conversations: [], hasMore: false, lastValue: null };
+    }
+
+    const hasFeature = await hasFeatureFlag(auth, "conversation_search_read");
+    if (!hasFeature) {
+      return this.listPrivateConversationsForUserPaginatedFromDB(
+        auth,
+        pagination
+      );
+    }
+
+    const workspace = auth.getNonNullableWorkspace();
+    const orderDirection = pagination.orderDirection ?? "desc";
+
+    const accessibleSpaces =
+      await SpaceResource.listWorkspaceSpacesAsMember(auth);
+    const accessibleSpaceIds = accessibleSpaces.map((s) => s.sId);
+
+    const esResult = await listPrivateConversationsFromES({
+      accessibleSpaceIds,
+      lastValue: pagination.lastValue,
+      limit: pagination.limit,
+      orderDirection,
+      userId: user.sId,
+      workspaceId: workspace.sId,
+    });
+
+    if (esResult.isErr()) {
+      logger.error(
+        { workspaceId: workspace.sId, error: esResult.error },
+        "[conversation_search] ES query failed, falling back to DB"
+      );
+      return this.listPrivateConversationsForUserPaginatedFromDB(
+        auth,
+        pagination
+      );
+    }
+
+    const { items, hasMore, lastValue } = esResult.value;
+
+    if (items.length === 0) {
+      return { conversations: [], hasMore, lastValue };
+    }
+
+    // Hydrate lastReadMs / unread from DB with one bounded query. `last_read_at` is not stored in
+    // ES because every mark-as-read would force a full document re-index (write amplification).
+    const dbConversations = await this.fetchByIds(
+      auth,
+      items.map((i) => i.sId)
+    );
+    const readMap = await this.fetchReadMapForUser(
+      auth,
+      dbConversations.map((c) => c.id)
+    );
+    const idToModelId = new Map(dbConversations.map((c) => [c.sId, c.id]));
+
+    const hydratedItems = items.map((item) => {
+      const modelId = idToModelId.get(item.sId);
+      const lastReadAt =
+        modelId !== undefined ? readMap.get(modelId) : undefined;
+
+      const lastReadMs = lastReadAt ? lastReadAt.getTime() : null;
+
+      return {
+        ...item,
+        lastReadMs,
+        unread: lastReadMs === null || item.updated > lastReadMs,
+      };
+    });
+
+    // Shadow-validate ES structural fields against DB in the background so it doesn't add
+    // latency to the response.
+    void (async () => {
+      try {
+        await this.enrichWithParticipationAndReadState(auth, dbConversations);
+        const dbMap = new Map(dbConversations.map((c) => [c.sId, c]));
+
+        for (const esItem of hydratedItems) {
+          const dbResource = dbMap.get(esItem.sId);
+          if (!dbResource) {
+            logger.warn(
+              { workspaceId: workspace.sId, userId: user.sId, sId: esItem.sId },
+              "[conversation_search] ES returned conversation absent from DB (stale index)"
+            );
+            continue;
+          }
+
+          const dbItem = dbResource.toListItem();
+          // nextWakeupAt is ES-only. DB list items also derive title fallbacks for untitled
+          // conversations, which would require rehydrating fork data to compare here.
+          const keysToOmit =
+            dbResource.title === null
+              ? ["nextWakeupAt", "title"]
+              : ["nextWakeupAt"];
+          const esCleaned = omit(esItem, keysToOmit);
+          const dbCleaned = omit(dbItem, keysToOmit);
+          if (!isEqual(esCleaned, dbCleaned)) {
+            const divergingKeys = (
+              Object.keys({ ...esCleaned, ...dbCleaned }) as Array<
+                keyof typeof esCleaned
+              >
+            ).filter((k) => !isEqual(esCleaned[k], dbCleaned[k]));
+            logger.warn(
+              {
+                workspaceId: workspace.sId,
+                userId: user.sId,
+                sId: esItem.sId,
+                divergingKeys,
+                esItem,
+                dbItem,
+              },
+              "[conversation_search] ES item diverges from DB"
+            );
+          }
+        }
+      } catch (err) {
+        logger.error(
+          { workspaceId: workspace.sId, userId: user.sId, err },
+          "[conversation_search] Shadow validation failed"
+        );
+      }
+    })();
+
+    return { conversations: hydratedItems, hasMore, lastValue };
+  }
+
+  static async listPrivateConversationsForUserPaginatedFromDB(
+    auth: Authenticator,
+    pagination: {
+      limit: number;
+      lastValue?: string;
+      orderDirection?: "asc" | "desc";
+    }
+  ): Promise<{
+    conversations: ConversationListItemType[];
+    hasMore: boolean;
+    lastValue: string | null;
+  }> {
+    const result = await this.listPrivateConversationsForUserPaginated(
+      auth,
+      pagination
+    );
+    return {
+      conversations: result.conversations.map((c) => c.toListItem()),
+      hasMore: result.hasMore,
+      lastValue: result.lastValue,
+    };
   }
 
   static async listSpaceUnreadConversationsAndActivityForUser(
@@ -1396,6 +1994,8 @@ export class ConversationResource extends BaseResource<ConversationModel> {
       spaceId,
       options,
       pagination,
+      restrictToConversationModelIds,
+      filter = "all",
     }: {
       spaceId: string;
       options?: FetchConversationOptions;
@@ -1404,6 +2004,8 @@ export class ConversationResource extends BaseResource<ConversationModel> {
         lastValue?: string;
         orderDirection?: "asc" | "desc";
       };
+      restrictToConversationModelIds?: ModelId[];
+      filter?: SpaceConversationsFilter;
     }
   ): Promise<{
     conversations: ConversationResource[];
@@ -1427,6 +2029,9 @@ export class ConversationResource extends BaseResource<ConversationModel> {
     const whereClause: WhereOptions<InferAttributes<ConversationModel>> = {
       ...filterWhere,
       spaceId: spaceModelId,
+      ...(restrictToConversationModelIds && {
+        id: { [Op.in]: restrictToConversationModelIds },
+      }),
     };
 
     if (pagination.lastValue) {
@@ -1450,22 +2055,162 @@ export class ConversationResource extends BaseResource<ConversationModel> {
       }
     }
 
-    // Fetch limit + 1 to determine if there are more results
-    const fetchLimit = pagination.limit + 1;
+    const chunkSize = Math.max(pagination.limit + 1, 30);
+    const filteredConversations: ConversationResource[] = [];
+    let fetchCursor = pagination.lastValue;
+    let hasMoreRawConversations = true;
 
-    const conversations = await this.baseFetchWithAuthorization(auth, options, {
-      where: whereClause,
-      order: [["updatedAt", orderDirection === "desc" ? "DESC" : "ASC"]],
-      limit: fetchLimit,
-    });
+    while (
+      filteredConversations.length <= pagination.limit &&
+      hasMoreRawConversations
+    ) {
+      const batchWhereClause: WhereOptions<InferAttributes<ConversationModel>> =
+        {
+          ...whereClause,
+        };
 
-    let hasMore = false;
-    let resultConversations = conversations;
+      if (fetchCursor) {
+        const cursorMs = parseInt(fetchCursor, 10);
+        if (!Number.isNaN(cursorMs)) {
+          const operator = orderDirection === "desc" ? Op.lt : Op.gt;
+          const cursorConstraint = { [operator]: new Date(cursorMs) };
+          const existingUpdatedAt = batchWhereClause.updatedAt;
 
-    if (conversations.length > pagination.limit) {
-      hasMore = true;
-      resultConversations = conversations.slice(0, pagination.limit);
+          if (
+            existingUpdatedAt &&
+            typeof existingUpdatedAt === "object" &&
+            !Array.isArray(existingUpdatedAt)
+          ) {
+            batchWhereClause.updatedAt = {
+              ...existingUpdatedAt,
+              ...cursorConstraint,
+            };
+          } else {
+            batchWhereClause.updatedAt = cursorConstraint;
+          }
+        }
+      }
+
+      const conversationsBatch = await this.baseFetchWithAuthorization(
+        auth,
+        options,
+        {
+          where: batchWhereClause,
+          order: [["updatedAt", orderDirection === "desc" ? "DESC" : "ASC"]],
+          limit: chunkSize,
+        }
+      );
+
+      hasMoreRawConversations = conversationsBatch.length === chunkSize;
+
+      if (conversationsBatch.length === 0) {
+        break;
+      }
+
+      let matchingConversations = conversationsBatch;
+
+      if (filter === "with_me") {
+        const user = auth.user();
+        if (!user) {
+          matchingConversations = [];
+        } else {
+          const participations = await ConversationParticipantModel.findAll({
+            where: {
+              workspaceId: auth.getNonNullableWorkspace().id,
+              userId: user.id,
+              conversationId: {
+                [Op.in]: conversationsBatch.map((c) => c.id),
+              },
+              action: "posted",
+            },
+            attributes: ["conversationId"],
+          });
+
+          const matchingConversationIds = new Set(
+            participations.map((p) => p.conversationId)
+          );
+          matchingConversations = conversationsBatch.filter((conversation) =>
+            matchingConversationIds.has(conversation.id)
+          );
+        }
+      }
+
+      if (filter === "group") {
+        const workspaceId = auth.getNonNullableWorkspace().id;
+        const batchConversationIds = conversationsBatch.map((c) => c.id);
+
+        const participants = await ConversationParticipantModel.findAll({
+          where: {
+            workspaceId,
+            conversationId: {
+              [Op.in]: batchConversationIds,
+            },
+            action: {
+              [Op.in]: ["posted", "subscribed"],
+            },
+          },
+          attributes: ["conversationId", "userId"],
+        });
+
+        const participantUserIdsByConversation = new Map<
+          ModelId,
+          Set<ModelId>
+        >();
+        for (const participant of participants) {
+          const existingUserIds =
+            participantUserIdsByConversation.get(participant.conversationId) ??
+            new Set<ModelId>();
+          existingUserIds.add(participant.userId);
+          participantUserIdsByConversation.set(
+            participant.conversationId,
+            existingUserIds
+          );
+        }
+
+        const groupConversationIdsFromParticipants = new Set<ModelId>(
+          [...participantUserIdsByConversation.entries()].flatMap(
+            ([conversationId, participantUserIds]) =>
+              participantUserIds.size >= 2 ? [conversationId] : []
+          )
+        );
+
+        const candidateIdsForMessagePass = batchConversationIds.filter(
+          (id) => !groupConversationIdsFromParticipants.has(id)
+        );
+
+        const distinctAuthorsByConversation =
+          candidateIdsForMessagePass.length === 0
+            ? new Map<ModelId, number>()
+            : await this.getDistinctUserCountsByConversationIds(
+                workspaceId,
+                candidateIdsForMessagePass
+              );
+
+        const groupConversationIds = new Set<ModelId>(
+          groupConversationIdsFromParticipants
+        );
+        for (const [conversationId, count] of distinctAuthorsByConversation) {
+          if (count > 1) {
+            groupConversationIds.add(conversationId);
+          }
+        }
+
+        matchingConversations = conversationsBatch.filter((conversation) =>
+          groupConversationIds.has(conversation.id)
+        );
+      }
+
+      filteredConversations.push(...matchingConversations);
+
+      const lastConversationInBatch =
+        conversationsBatch[conversationsBatch.length - 1];
+      fetchCursor = lastConversationInBatch.updatedAt.getTime().toString();
     }
+
+    const hasMore = filteredConversations.length > pagination.limit;
+    const resultConversations = hasMore
+      ? filteredConversations.slice(0, pagination.limit)
+      : filteredConversations;
 
     await this.enrichWithParticipationAndReadState(auth, resultConversations);
 
@@ -1550,59 +2295,10 @@ export class ConversationResource extends BaseResource<ConversationModel> {
           depth: c.depth,
           metadata: c.metadata,
           branchId: null,
+          isRunningAgentLoop: c.isRunningAgentLoop,
         };
       })
     );
-  }
-
-  static async listReinforcementConversations(
-    auth: Authenticator,
-    agentConfigurationId: string
-  ): Promise<ConversationWithoutContentType[]> {
-    const workspace = auth.getNonNullableWorkspace();
-
-    const conversations = await ConversationModel.findAll({
-      where: {
-        workspaceId: workspace.id,
-        [Op.and]: [
-          where(
-            fn(
-              "jsonb_extract_path_text",
-              col("metadata"),
-              REINFORCEMENT_METADATA_KEYS.reinforcedAgent
-            ),
-            "true"
-          ),
-          where(
-            fn(
-              "jsonb_extract_path_text",
-              col("metadata"),
-              REINFORCEMENT_METADATA_KEYS.reinforcedAgentConfigurationId
-            ),
-            agentConfigurationId
-          ),
-        ],
-      },
-      order: [["createdAt", "DESC"]],
-    });
-
-    return conversations.map((c) => ({
-      id: c.id,
-      created: c.createdAt.getTime(),
-      updated: c.updatedAt.getTime(),
-      sId: c.sId,
-      title: c.title,
-      triggerId: ConversationResource.triggerIdToSId(c.triggerId, workspace.id),
-      actionRequired: false,
-      unread: false,
-      lastReadMs: Date.now(),
-      hasError: c.hasError,
-      requestedSpaceIds: c.requestedSpaceIds.map(String),
-      spaceId: null,
-      depth: c.depth,
-      metadata: c.metadata,
-      branchId: null,
-    }));
   }
 
   static async listSkillReinforcementConversations(
@@ -1662,6 +2358,7 @@ export class ConversationResource extends BaseResource<ConversationModel> {
       depth: c.depth,
       metadata: c.metadata,
       branchId: null,
+      isRunningAgentLoop: c.isRunningAgentLoop,
     }));
   }
 
@@ -1686,6 +2383,8 @@ export class ConversationResource extends BaseResource<ConversationModel> {
         },
       }
     );
+
+    await this.triggerEsIndexing(auth, conversation.sId);
 
     return new Ok(updated);
   }
@@ -1714,6 +2413,8 @@ export class ConversationResource extends BaseResource<ConversationModel> {
       }
     );
 
+    await this.triggerEsIndexing(auth, conversation.sId);
+
     return new Ok(updated);
   }
 
@@ -1737,6 +2438,38 @@ export class ConversationResource extends BaseResource<ConversationModel> {
       }
     );
 
+    await this.triggerEsIndexing(auth, conversation.sId);
+
+    return new Ok(updated[0]);
+  }
+
+  static async setIsRunningAgentLoop(
+    auth: Authenticator,
+    {
+      conversation,
+      isRunningAgentLoop,
+      transaction,
+    }: {
+      conversation: ConversationWithoutContentType;
+      isRunningAgentLoop: boolean;
+      transaction?: Transaction;
+    }
+  ) {
+    const updated = await ConversationModel.update(
+      { isRunningAgentLoop },
+      {
+        where: {
+          id: conversation.id,
+          workspaceId: auth.getNonNullableWorkspace().id,
+        },
+        // Do not update `updatedAt.
+        silent: true,
+        transaction,
+      }
+    );
+
+    await this.triggerEsIndexing(auth, conversation.sId);
+
     return new Ok(updated[0]);
   }
 
@@ -1745,9 +2478,15 @@ export class ConversationResource extends BaseResource<ConversationModel> {
     {
       conversation,
       transaction,
+      lastReadAt,
     }: {
       conversation: ConversationWithoutContentType;
       transaction?: Transaction;
+      // Optional override; defaults to now. Callers can pass a timestamp in the
+      // future to keep the conversation marked as read through an imminent
+      // `markAsUpdated` bump (e.g. a static agent reply that the user just
+      // triggered and does not need to be re-notified about).
+      lastReadAt?: Date;
     }
   ) {
     if (!auth.user()) {
@@ -1758,10 +2497,11 @@ export class ConversationResource extends BaseResource<ConversationModel> {
         conversationId: conversation.id,
         userId: auth.getNonNullableUser().id,
         workspaceId: auth.getNonNullableWorkspace().id,
-        lastReadAt: new Date(),
+        lastReadAt: lastReadAt ?? new Date(),
       },
       { transaction }
     );
+
     return new Ok(updated);
   }
 
@@ -1783,6 +2523,7 @@ export class ConversationResource extends BaseResource<ConversationModel> {
         workspaceId: auth.getNonNullableWorkspace().id,
       },
     });
+
     return new Ok(undefined);
   }
 
@@ -1818,6 +2559,69 @@ export class ConversationResource extends BaseResource<ConversationModel> {
       actionRequired: participant?.actionRequired ?? false,
       lastReadAt: conversationRead?.lastReadAt ?? null,
     };
+  }
+
+  /**
+   * Filters the provided conversations to those "visible" to the current user.
+   *
+   * A conversation is visible when:
+   *   - It is a private conversation (spaceId = null) where the user is a participant
+   *     (same rules as `fetchPrivateConversationsPaginated`), or
+   *   - It lives in a project space where the user is a member
+   *     (same rules as `listConversationsInSpacePaginated`).
+   *
+   * Returns the visible subset of the input conversations.
+   */
+  static async filterVisibleConversations(
+    auth: Authenticator,
+    conversations: ConversationResource[]
+  ): Promise<ConversationResource[]> {
+    const user = auth.user();
+    if (!user || conversations.length === 0) {
+      return [];
+    }
+
+    const modelIds = conversations.map((c) => c.id);
+    const visibleModelIds = new Set<ModelId>();
+
+    // 1. Private conversations (spaceId = null): visible if user is participant.
+    const { conversations: privateConvs } =
+      await this.fetchPrivateConversationsPaginated(auth, {
+        // limit page size to the number of convs we are searching for to have a single page
+        pagination: { limit: modelIds.length },
+        restrictToConversationModelIds: modelIds,
+      });
+    for (const c of privateConvs) {
+      visibleModelIds.add(c.id);
+    }
+
+    // 2. Space conversations: visible if in a project space where user is member.
+    const uniqueSpaceIds = uniq(
+      conversations
+        .map((c) => c.spaceId)
+        .filter((id): id is number => id !== null)
+    );
+
+    if (uniqueSpaceIds.length > 0) {
+      const spaces = await SpaceResource.fetchByModelIds(auth, uniqueSpaceIds);
+      for (const space of spaces) {
+        if (!space.isProject() || !space.isMember(auth)) {
+          continue;
+        }
+        const { conversations: spaceConvs } =
+          await this.listConversationsInSpacePaginated(auth, {
+            spaceId: space.sId,
+            // limit page size to the number of convs we are searching for to have a single page
+            pagination: { limit: modelIds.length },
+            restrictToConversationModelIds: modelIds,
+          });
+        for (const c of spaceConvs) {
+          visibleModelIds.add(c.id);
+        }
+      }
+    }
+
+    return conversations.filter((c) => visibleModelIds.has(c.id));
   }
 
   static async isConversationParticipant(
@@ -1918,7 +2722,74 @@ export class ConversationResource extends BaseResource<ConversationModel> {
       }
     }, transaction);
 
+    if (status !== "none") {
+      await this.triggerEsIndexing(auth, conversation.sId);
+    }
+
     return status;
+  }
+
+  /**
+   * Resolve the parent agent message that spawned the given agent message in
+   * this conversation via run_agent / agent_handover.
+   *
+   * Walks the agent message → its parent user message (in the same conversation)
+   * → that user message's `agenticOriginMessageId` (the parent agent message,
+   * possibly in another conversation).
+   *
+   * Returns null when the agent message has no agentic origin (root
+   * conversation) or when the parent message can no longer be found.
+   */
+  async findAgenticParent(
+    auth: Authenticator,
+    { agentMessageId }: { agentMessageId: string }
+  ): Promise<MessageModel | null> {
+    const owner = auth.getNonNullableWorkspace();
+
+    const agentMessage = await MessageModel.findOne({
+      where: {
+        workspaceId: owner.id,
+        conversationId: this.id,
+        sId: agentMessageId,
+      },
+      attributes: ["parentId"],
+    });
+
+    if (!agentMessage?.parentId) {
+      return null;
+    }
+
+    const parentMessage = await MessageModel.findOne({
+      where: {
+        workspaceId: owner.id,
+        conversationId: this.id,
+        id: agentMessage.parentId,
+      },
+      attributes: [],
+      include: [
+        {
+          model: UserMessageModel,
+          as: "userMessage",
+          required: true,
+          attributes: ["agenticOriginMessageId"],
+        },
+      ],
+    });
+
+    const agenticOriginMessageId =
+      parentMessage?.userMessage?.agenticOriginMessageId;
+    if (!agenticOriginMessageId) {
+      return null;
+    }
+
+    const agenticOriginMessage = await MessageModel.findOne({
+      where: {
+        workspaceId: owner.id,
+        sId: agenticOriginMessageId,
+      },
+    });
+
+    return agenticOriginMessage;
   }
 
   /**
@@ -2011,13 +2882,127 @@ export class ConversationResource extends BaseResource<ConversationModel> {
     return pendingMessages;
   }
 
-  async getLatestAgentMessageRun(
+  static async hasMessageForContentFragmentSeries(
+    auth: Authenticator,
+    {
+      conversation,
+      contentFragmentId,
+      contentFragmentVersion,
+      transaction,
+    }: {
+      conversation: ConversationWithoutContentType;
+      contentFragmentId: string;
+      contentFragmentVersion?: ContentFragmentVersion;
+      transaction?: Transaction;
+    }
+  ): Promise<boolean> {
+    const owner = auth.getNonNullableWorkspace();
+    let where: WhereOptions<MessageModel> = {
+      conversationId: conversation.id,
+      workspaceId: owner.id,
+    };
+
+    if (conversation.branchId) {
+      const branch = await ConversationBranchResource.fetchById(
+        auth,
+        conversation.branchId
+      );
+      if (!branch || !branch.canRead(auth)) {
+        throw new Error("Unexpected: conversation branch not found.");
+      }
+
+      const previousMessage = await MessageModel.findOne({
+        attributes: ["rank"],
+        where: {
+          id: branch.previousMessageId,
+          workspaceId: owner.id,
+        },
+        transaction,
+      });
+      if (!previousMessage) {
+        throw new Error("Unexpected: branch previous message not found.");
+      }
+
+      where = {
+        ...where,
+        [Op.or]: [
+          {
+            branchId: branch.id,
+          },
+          {
+            branchId: null,
+            rank: { [Op.lte]: previousMessage.rank },
+          },
+        ],
+      };
+    } else {
+      where = {
+        ...where,
+        branchId: null,
+      };
+    }
+
+    const message = await MessageModel.findOne({
+      attributes: ["id"],
+      where,
+      include: [
+        {
+          model: ContentFragmentModel,
+          as: "contentFragment",
+          attributes: [],
+          required: true,
+          where: {
+            workspaceId: owner.id,
+            sId: contentFragmentId,
+            ...(contentFragmentVersion
+              ? { version: contentFragmentVersion }
+              : {}),
+          },
+        },
+      ],
+      transaction,
+    });
+
+    return !!message;
+  }
+
+  static async updateCompactionMessageRunIds(
+    auth: Authenticator,
+    {
+      compactionMessageModelId,
+      runIds,
+    }: {
+      compactionMessageModelId: ModelId;
+      runIds: string[];
+    }
+  ): Promise<void> {
+    const workspaceId = auth.getNonNullableWorkspace().id;
+    const sanitizedRunIds = runIds.map((runId) => runId.replaceAll("'", "''"));
+
+    await CompactionMessageModel.update(
+      {
+        runIds: fn(
+          "ARRAY",
+          literal(
+            `SELECT DISTINCT unnest(COALESCE("runIds", '{}') || ARRAY['${sanitizedRunIds.join("','")}']::text[])`
+          )
+        ),
+      },
+      {
+        where: {
+          id: compactionMessageModelId,
+          workspaceId,
+        },
+      }
+    );
+  }
+
+  // Return the latest run from a successful compaction message.
+  async getLatestCompactionMessageRun(
     auth: Authenticator
-  ): Promise<RunResource | null> {
+  ): Promise<{ rank: number; run: RunResource } | null> {
     const owner = auth.getNonNullableWorkspace();
 
-    // Include in-progress ("created") agent messages so that context usage is available even while
-    // the agent is still running (it accumulates runIds step by step).
     const message = await MessageModel.findOne({
       where: {
         conversationId: this.id,
@@ -2025,15 +3010,72 @@ export class ConversationResource extends BaseResource<ConversationModel> {
       },
       include: [
         {
-          model: AgentMessageModel,
-          as: "agentMessage",
+          model: CompactionMessageModel,
+          as: "compactionMessage",
           required: true,
           where: {
-            status: ["succeeded", "gracefully_stopped", "created"],
+            status: "succeeded",
           },
         },
       ],
       order: [["rank", "DESC"]],
+    });
+
+    if (!message?.compactionMessage?.runIds?.length) {
+      return null;
+    }
+
+    // The runIds array ordering is not guaranteed to be chronological. Fetch all runs and pick
+    // the most recently created one.
+    const runs = await RunResource.listByDustRunIds(auth, {
+      dustRunIds: message.compactionMessage.runIds,
+    });
+
+    if (runs.length === 0) {
+      return null;
+    }
+
+    return {
+      rank: message.rank,
+      run: runs.reduce((latest, r) =>
+        r.createdAt > latest.createdAt ? r : latest
+      ),
+    };
+  }
+
+  // Return the latest run from an agent message. We accept all statuses as they all have valid
+  // runIds that represent the actual latest run.
+  async getLatestAgentMessageRun(
+    auth: Authenticator,
+    {
+      maxRank,
+      transaction,
+    }: {
+      maxRank?: number;
+      transaction?: Transaction;
+    } = {}
+  ): Promise<{ rank: number; run: RunResource } | null> {
+    const owner = auth.getNonNullableWorkspace();
+    const where: WhereOptions<MessageModel> = {
+      conversationId: this.id,
+      workspaceId: owner.id,
+      ...(maxRank !== undefined ? { rank: { [Op.lte]: maxRank } } : {}),
+    };
+
+    const message = await MessageModel.findOne({
+      where,
+      include: [
+        {
+          model: AgentMessageModel,
+          as: "agentMessage",
+          required: true,
+        },
+      ],
+      order: [
+        ["rank", "DESC"],
+        ["version", "DESC"],
+      ],
+      transaction,
     });
 
     if (!message?.agentMessage?.runIds?.length) {
@@ -2050,9 +3092,12 @@ export class ConversationResource extends BaseResource<ConversationModel> {
       return null;
     }
 
-    return runs.reduce((latest, r) =>
-      r.createdAt > latest.createdAt ? r : latest
-    );
+    return {
+      rank: message.rank,
+      run: runs.reduce((latest, r) =>
+        r.createdAt > latest.createdAt ? r : latest
+      ),
+    };
   }
 
   static async resolveForkSourceMessage(
@@ -2174,6 +3219,32 @@ export class ConversationResource extends BaseResource<ConversationModel> {
     }
 
     return new Ok(message);
+  }
+
+  static async getMessageByIds(
+    auth: Authenticator,
+    conversation: ConversationWithoutContentType,
+    messageIds: string[]
+  ): Promise<MessageModel[]> {
+    return MessageModel.findAll({
+      where: {
+        conversationId: conversation.id,
+        workspaceId: auth.getNonNullableWorkspace().id,
+        sId: { [Op.in]: messageIds },
+      },
+      include: [
+        {
+          model: UserMessageModel,
+          as: "userMessage",
+          required: false,
+        },
+        {
+          model: AgentMessageModel,
+          as: "agentMessage",
+          required: false,
+        },
+      ],
+    });
   }
 
   /**
@@ -2338,7 +3409,7 @@ export class ConversationResource extends BaseResource<ConversationModel> {
       return new Err(new ConversationError("conversation_not_found"));
     }
 
-    await conversation.updateRequirements(requestedSpaceIds, transaction);
+    await conversation.updateRequirements(auth, requestedSpaceIds, transaction);
     return new Ok(undefined);
   }
 
@@ -2356,6 +3427,27 @@ export class ConversationResource extends BaseResource<ConversationModel> {
       },
       transaction
     );
+  }
+
+  static async updateUrlAccessMode(
+    auth: Authenticator,
+    sId: string,
+    accessMode: ConversationUrlAccessMode,
+    transaction?: Transaction
+  ) {
+    const conversation = await this.fetchById(auth, sId);
+    if (conversation == null) {
+      return new Err(new ConversationError("conversation_not_found"));
+    }
+
+    const metadata: ConversationMetadata = {
+      ...conversation.metadata,
+      urlAccessMode: accessMode,
+    };
+
+    await conversation.update({ metadata }, transaction);
+
+    return new Ok(undefined);
   }
 
   static async fetchMCPServerViews(
@@ -2504,32 +3596,120 @@ export class ConversationResource extends BaseResource<ConversationModel> {
     return new Ok(undefined);
   }
 
-  async updateTitle(title: string) {
-    return this.update({ title });
+  async updateTitle(auth: Authenticator, title: string) {
+    await this.update({ title });
+
+    await ConversationResource.triggerEsIndexing(auth, this.sId);
   }
 
-  async updateVisibilityToDeleted() {
-    return this.update({ visibility: "deleted" });
+  async updateVisibilityToDeleted(auth: Authenticator) {
+    await this.update({ visibility: "deleted" });
+
+    await ConversationResource.triggerEsIndexing(auth, this.sId);
   }
 
-  async updateVisibilityToUnlisted() {
-    return this.update({ visibility: "unlisted" });
+  async updateVisibilityToUnlisted(auth: Authenticator) {
+    await this.update({ visibility: "unlisted" });
+
+    await ConversationResource.triggerEsIndexing(auth, this.sId);
   }
 
   async updateRequirements(
+    auth: Authenticator,
     requestedSpaceIds: number[],
     transaction?: Transaction
   ) {
-    return this.update(
+    await this.update(
       {
         requestedSpaceIds: uniq(requestedSpaceIds),
       },
       transaction
     );
+
+    await ConversationResource.triggerEsIndexing(auth, this.sId);
   }
 
-  async updateSpaceId(space: SpaceResource, transaction?: Transaction) {
-    await this.update({ spaceId: space.id }, transaction);
+  async updateSpaceId(
+    auth: Authenticator,
+    space: SpaceResource | null,
+    transaction?: Transaction
+  ) {
+    await this.update({ spaceId: space?.id ?? null }, transaction);
+    // TODO(2026-04-30): BaseResource.update does not reload joins, so we
+    // manually refresh the space here.
+    this._space = space;
+
+    await ConversationResource.triggerEsIndexing(auth, this.sId);
+  }
+
+  /**
+   * Get the distinct agent configuration IDs and content fragment DataSourceView ids
+   * used in this conversation. This data is needed to rebuild the conversation's
+   * requestedSpaceIds when moving out of a project.
+   */
+  async fetchAgentConfigurationAndContentFragmentIds(
+    auth: Authenticator
+  ): Promise<{
+    agentConfigurationIds: string[];
+    contentFragmentDatasourceViewIds: string[];
+  }> {
+    const workspaceId = auth.getNonNullableWorkspace().id;
+
+    const agentMessages = await MessageModel.findAll({
+      where: {
+        conversationId: this.id,
+        workspaceId,
+        agentMessageId: { [Op.ne]: null },
+        branchId: { [Op.is]: null },
+      },
+      include: [
+        {
+          model: AgentMessageModel,
+          as: "agentMessage",
+          required: true,
+          attributes: ["agentConfigurationId"],
+        },
+      ],
+    });
+
+    const agentConfigurationIds = uniq(
+      agentMessages
+        .map((m) => m.agentMessage?.agentConfigurationId)
+        .filter((id): id is string => Boolean(id))
+    );
+
+    const cfMessages = await MessageModel.findAll({
+      where: {
+        conversationId: this.id,
+        workspaceId,
+        contentFragmentId: { [Op.ne]: null },
+        branchId: { [Op.is]: null },
+      },
+      include: [
+        {
+          model: ContentFragmentModel,
+          as: "contentFragment",
+          required: true,
+        },
+      ],
+    });
+
+    const contentFragmentDatasourceViewIds = uniq(
+      cfMessages
+        .map((m) => {
+          const modelId = m.contentFragment?.nodeDataSourceViewId;
+          if (modelId == null) {
+            return null;
+          }
+          return DataSourceViewResource.modelIdToSId({
+            id: modelId,
+            workspaceId,
+          });
+        })
+        .filter((sId): sId is string => sId !== null)
+    );
+
+    return { agentConfigurationIds, contentFragmentDatasourceViewIds };
   }
 
   static async markHasError(
@@ -2710,10 +3890,16 @@ export class ConversationResource extends BaseResource<ConversationModel> {
         },
         transaction,
       });
-      return new Ok(undefined);
     } catch (err) {
       return new Err(normalizeError(err));
     }
+
+    // Trigger ES cleanup via the same Temporal worker used for all ES writes.
+    // The activity will find the conversation absent from DB and call
+    // deleteConversationDocument itself.
+    await ConversationResource.triggerEsIndexing(auth, this.sId);
+
+    return new Ok(undefined);
   }
 
   getRequestedSpaceIdsFromModel() {
@@ -2788,6 +3974,12 @@ export class ConversationResource extends BaseResource<ConversationModel> {
       }))
     );
 
+    await concurrentExecutor(
+      conversations,
+      (c) => ConversationResource.triggerEsIndexing(auth, c.sId),
+      { concurrency: 8 }
+    );
+
     return new Ok(undefined);
   }
 
@@ -2857,28 +4049,39 @@ export class ConversationResource extends BaseResource<ConversationModel> {
     );
   }
 
-  toJSON(): ConversationWithoutContentType {
+  toListItem(): ConversationListItemType {
     return {
       actionRequired: this.userParticipation?.actionRequired ?? false,
       created: this.createdAt.getTime(),
-      updated: this.updatedAt.getTime(),
-      spaceId: this.space?.sId ?? null,
-      triggerId: this.triggerSId,
       hasError: this.hasError,
-      id: this.id,
-      // TODO(REQUESTED_SPACE_IDS 2025-10-24): Stop exposing this once all logic is centralized
-      // in baseFetchWithAuthorization.
+      lastReadMs: this.userLastReadAt?.getTime() ?? null,
+      metadata: this.metadata ?? {},
+      nextWakeupAt: null,
       requestedSpaceIds: this.getRequestedSpaceIdsFromModel(),
       sId: this.sId,
-      title: this.title,
+      spaceId: this.space?.sId ?? null,
+      title: getConversationDisplayTitle({
+        created: this.createdAt.getTime(),
+        forkingData: this.forkingData,
+        title: this.title,
+      }),
+      triggerId: this.triggerSId,
       unread:
-        this.userLastReadAt === null ||
-        (!!this.updatedAt && this.updatedAt > this.userLastReadAt),
-      lastReadMs: this.userLastReadAt?.getTime() ?? null,
+        this.userLastReadAt === null || this.updatedAt > this.userLastReadAt,
+      updated: this.updatedAt.getTime(),
+      isRunningAgentLoop: this.isRunningAgentLoop,
+    };
+  }
+
+  toJSON(): ConversationWithoutContentType {
+    return {
+      ...this.toListItem(),
+      // When listing with to JSON, return the title stored with the model.
+      title: this.title,
+      id: this.id,
       depth: this.depth,
-      metadata: this.metadata,
       branchId: null,
-      ...(this.forkedFromInfo && { forkedFrom: this.forkedFromInfo }),
+      ...(this.forkingData && { forkingData: this.forkingData }),
     };
   }
 }

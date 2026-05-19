@@ -4,7 +4,6 @@ import { frontSequelize } from "@app/lib/resources/storage";
 import { WorkspaceAwareModel } from "@app/lib/resources/storage/wrappers/workspace_models";
 import type {
   AgentSuggestionKind,
-  AgentSuggestionSource,
   AgentSuggestionState,
   SuggestionPayload,
 } from "@app/types/suggestions/agent_suggestion";
@@ -22,7 +21,6 @@ export class AgentSuggestionModel extends WorkspaceAwareModel<AgentSuggestionMod
   declare analysis: string | null;
 
   declare state: AgentSuggestionState;
-  declare source: AgentSuggestionSource;
   declare conversationId: ForeignKey<ConversationModel["id"]> | null;
 
   declare agentConfiguration: NonAttribute<AgentConfigurationModel>;
@@ -69,11 +67,6 @@ AgentSuggestionModel.init(
       comment:
         "Current state of the suggestion (e.g., pending, accepted, rejected...)",
     },
-    source: {
-      type: DataTypes.STRING,
-      allowNull: false,
-      comment: "Origin of the suggestion such as reinforcement or sidekick",
-    },
     conversationId: {
       type: DataTypes.BIGINT,
       allowNull: true,
@@ -99,8 +92,9 @@ AgentSuggestionModel.init(
         concurrently: true,
       },
       {
-        fields: ["workspaceId", "conversationId"],
+        fields: ["conversationId"],
         concurrently: true,
+        name: "agent_suggestions_conversation_id",
       },
     ],
   }

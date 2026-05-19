@@ -47,6 +47,7 @@ export async function submitSkillBuilderForm({
         icon: formData.icon,
         extendedSkillId: formData.extendedSkillId,
         isDefault: formData.isDefault,
+        ...(skillId ? { reinforcement: formData.reinforcement } : {}),
         tools: formData.tools.map((tool) => ({
           mcpServerViewId: tool.configuration.mcpServerViewId,
         })),
@@ -54,6 +55,7 @@ export async function submitSkillBuilderForm({
           fileId: f.fileId,
         })),
         attachedKnowledge: formData.attachedKnowledge ?? [],
+        additionalRequestedSpaceIds: formData.additionalSpaces,
       }),
     });
 

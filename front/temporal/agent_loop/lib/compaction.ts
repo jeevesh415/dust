@@ -1,13 +1,20 @@
-import type { LLMConfig } from "@app/lib/api/assistant/call_llm";
+import type { LLMConfig, LLMOutput } from "@app/lib/api/assistant/call_llm";
 import { runMultiActionsAgent } from "@app/lib/api/assistant/call_llm";
-import { updateCompactionMessageWithContentAndFinalStatus } from "@app/lib/api/assistant/conversation";
+import { updateCompactionMessageWithContentAndFinalStatus } from "@app/lib/api/assistant/conversation/compaction";
+import { replaceStandaloneAttachmentIds } from "@app/lib/api/assistant/conversation/compaction_attachment_id_replacements";
 import { getConversation } from "@app/lib/api/assistant/conversation/fetch";
 import { renderConversationAsText } from "@app/lib/api/assistant/conversation/render_as_text";
 import { PREVIOUS_INTERACTIONS_TO_PRESERVE } from "@app/lib/api/assistant/conversation_rendering";
 import { publishConversationEvent } from "@app/lib/api/assistant/streaming/events";
+import {
+  createGCSMountFile,
+  type GCSMountFileEntry,
+} from "@app/lib/api/files/gcs_mount/files";
 import { isProviderWhitelisted } from "@app/lib/assistant";
-import type { Authenticator } from "@app/lib/auth";
+import { type Authenticator, hasFeatureFlag } from "@app/lib/auth";
+import { ConversationResource } from "@app/lib/resources/conversation_resource";
 import logger from "@app/logger/logger";
+import type { CompactionSourceConversation } from "@app/types/assistant/compaction";
 import type {
   CompactionMessageType,
   ConversationType,
@@ -23,20 +30,21 @@ paying close attention to the user's explicit requests and the agents' previous 
 responses. This summary should be thorough enough that the conversation can continue without \
 losing important context.
 
-Before providing your final summary, wrap your analysis in <analysis> tags to organize your \
-thoughts and ensure you've covered all necessary points. In your analysis:
+While writing the summary make sure to consider for each messages so far:
 
-1. Chronologically analyze each message in the conversation. For each section identify:
-   - The user's explicit requests and intents
-   - The agents' approaches to addressing those requests
-   - Key decisions and information exchanged
-   - Specific details: data, names, references, or artifacts mentioned
-   - Any errors or issues encountered and how they were resolved
-   - Pay special attention to user feedback and corrections
+- The user's explicit requests and intents
+- The agents' approaches to addressing those requests
+- Key decisions and information exchanged
+- Specific details: data, names, references, or artifacts mentioned
+- Any errors or issues encountered and how they were resolved
+- Pay special attention to user feedback and corrections
 
-2. Double-check for accuracy and completeness.
+Double-check for accuracy and completeness.
 
-After your analysis, provide your detailed summary in <summary> tags with these sections:
+If skills were enabled during the conversation, briefly capture which skills were enabled, in what
+context they were useful, and any indication that they may need to be re-enabled later.
+
+Provide your detailed summary in <summary> tags with these sections:
 
 1. **Primary Request and Intent** — All explicit user requests and intents.
 2. **Key Topics and Concepts** — Main subjects, domains, or frameworks discussed.
@@ -47,13 +55,16 @@ conversation that are useful to the current work.
 5. **Issues and Resolutions** — Problems encountered, how they were resolved, and user feedback.
 6. **Pending Tasks** — Explicitly requested work that is still pending.
 7. **Current State** — What was being discussed or worked on immediately before this summary.
+8. **Previously Enabled Skills** — Which skills were enabled before compaction, why they were
+useful, and any useful re-enable context.
 
-Only the content of the <summary> block will be used to continue the conversation — the <analysis> \
-block is a scratchpad and will be discarded. Make sure the summary is self-contained and includes \
-all the context needed to continue without access to the original messages.
+Only the content of the <summary> block will be used to continue the conversation. Anything \
+outside is effectively a scratchpad and will be discarded. Make sure the summary is \
+self-contained and includes all the context needed to continue without access to the \
+original messages.
 
 IMPORTANT: Respond with TEXT ONLY. Do NOT attempt to use any tools. Your entire response must be \
-plain text: an <analysis> block followed by a <summary> block.`;
+plain text: potentially some scratchpad followed by a <summary> block.`;
 
 /**
  * Extract the <summary> block from the LLM response, stripping the <analysis> scratchpad.
@@ -63,8 +74,96 @@ function extractSummary(generation: string): string {
   if (summaryMatch) {
     return summaryMatch[1].trim();
   }
-  // Fallback: if no <summary> tags, return the full generation stripped of <analysis>.
-  return generation.replace(/<analysis>[\s\S]*?<\/analysis>/g, "").trim();
+  // Fallback: if no <summary> tags, return the full generation.
+  return generation.trim();
+}
+
+function filterConversationContentUpToRank(
+  conversation: ConversationType,
+  maxRank: number
+): ConversationType {
+  return {
+    ...conversation,
+    content: conversation.content.filter((versions) => {
+      const latestVersion = versions[versions.length - 1];
+      return latestVersion ? latestVersion.rank <= maxRank : false;
+    }),
+  };
+}
+
+function findCompactionMessage(
+  conversation: ConversationType,
+  compactionMessageId: string,
+  compactionMessageVersion: number
+): CompactionMessageType | undefined {
+  for (let i = conversation.content.length - 1; i >= 0; i--) {
+    const messageGroup = conversation.content[i];
+    for (const msg of messageGroup) {
+      if (
+        isCompactionMessageType(msg) &&
+        msg.sId === compactionMessageId &&
+        msg.version === compactionMessageVersion
+      ) {
+        return msg;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function formatCompactionHistoryTimestamp(date: Date): string {
+  return date
+    .toISOString()
+    .slice(0, 16)
+    .replace(/-/g, "")
+    .replace("T", "-")
+    .replace(":", "");
+}
+
+async function createCompactionHistoryFile(
+  auth: Authenticator,
+  {
+    targetConversation,
+    sourceConversation,
+    compactionMessage,
+    renderedMessages,
+  }: {
+    targetConversation: ConversationType;
+    sourceConversation: ConversationType;
+    compactionMessage: CompactionMessageType;
+    renderedMessages: string;
+  }
+): Promise<Result<GCSMountFileEntry, Error>> {
+  const generatedAt = new Date();
+  const relativeFilePath = `history/${formatCompactionHistoryTimestamp(generatedAt)}-compaction-${compactionMessage.sId}.history`;
+  const metadataLines = [
+    "# Conversation History Before Compaction",
+    "",
+    `Generated at: ${generatedAt.toISOString()}`,
+    `Conversation: ${sourceConversation.sId}`,
+    "",
+    "## Conversation",
+    "",
+  ];
+
+  const entryRes = await createGCSMountFile(
+    auth,
+    { useCase: "conversation", conversationId: targetConversation.sId },
+    {
+      relativeFilePath,
+      content: Buffer.from(
+        `${metadataLines.join("\n")}${renderedMessages}`,
+        "utf8"
+      ),
+      contentType: "text/plain",
+    }
+  );
+
+  if (entryRes.isErr()) {
+    return entryRes;
+  }
+  return new Ok(entryRes.value);
 }
 
 export async function runCompaction(
@@ -74,46 +173,34 @@ export async function runCompaction(
     compactionMessageId,
     compactionMessageVersion,
     model,
+    sourceConversation,
   }: {
     conversationId: string;
     compactionMessageId: string;
     compactionMessageVersion: number;
     model: SupportedModel;
+    sourceConversation?: CompactionSourceConversation;
   }
 ): Promise<Result<void, Error>> {
   const owner = auth.getNonNullableWorkspace();
 
-  const conversationRes = await getConversation(
+  const targetConversationRes = await getConversation(
     auth,
     conversationId,
     false,
     null,
     PREVIOUS_INTERACTIONS_TO_PRESERVE + 1 // X previous + the last one
   );
-  if (conversationRes.isErr()) {
-    return conversationRes;
+  if (targetConversationRes.isErr()) {
+    return targetConversationRes;
   }
-  const conversation = conversationRes.value;
+  const targetConversation = targetConversationRes.value;
 
-  let compactionMessage: CompactionMessageType | undefined;
-
-  for (
-    let i = conversation.content.length - 1;
-    i >= 0 && !compactionMessage;
-    i--
-  ) {
-    const messageGroup = conversation.content[i];
-    for (const msg of messageGroup) {
-      if (
-        isCompactionMessageType(msg) &&
-        msg.sId === compactionMessageId &&
-        msg.version === compactionMessageVersion
-      ) {
-        compactionMessage = msg;
-        break;
-      }
-    }
-  }
+  const compactionMessage = findCompactionMessage(
+    targetConversation,
+    compactionMessageId,
+    compactionMessageVersion
+  );
 
   if (!compactionMessage) {
     return new Err(new Error("Compaction message not found"));
@@ -127,8 +214,35 @@ export async function runCompaction(
     );
   }
 
+  let conversationToSummarize = targetConversation;
+  if (
+    sourceConversation &&
+    sourceConversation.conversationId !== conversationId
+  ) {
+    const sourceConversationRes = await getConversation(
+      auth,
+      sourceConversation.conversationId,
+      false,
+      null,
+      PREVIOUS_INTERACTIONS_TO_PRESERVE + 1
+    );
+    if (sourceConversationRes.isErr()) {
+      return sourceConversationRes;
+    }
+
+    conversationToSummarize = sourceConversationRes.value;
+  }
+
+  const renderSkillsAsUserMessages = await hasFeatureFlag(
+    auth,
+    "skills_as_user_messages"
+  );
+
   const summaryRes = await generateCompactionSummary(auth, {
-    conversation,
+    sourceConversation: conversationToSummarize,
+    sourceMessageRank: sourceConversation?.messageRank,
+    targetConversation: targetConversation,
+    compactionMessage,
     model,
   });
 
@@ -136,13 +250,61 @@ export async function runCompaction(
   let status: "succeeded" | "failed";
 
   if (summaryRes.isOk()) {
-    content = summaryRes.value;
-    status = "succeeded";
-
-    logger.info(
-      { workspaceId: owner.sId, conversationId, compactionMessageId, status },
-      "Compaction generation succeeded"
+    const summary = replaceStandaloneAttachmentIds(
+      summaryRes.value.summary,
+      sourceConversation?.attachmentIdReplacements
     );
+
+    // We generate the conversattion as text without `truncateTotalChars` to store as file.
+    let renderedMessages = renderConversationAsText(conversationToSummarize, {
+      includeTimestamps: true,
+      includeActions: true,
+      includeActionDetails: true,
+      skipRunningAgentMessages: true,
+    });
+
+    renderedMessages = replaceStandaloneAttachmentIds(
+      renderedMessages,
+      sourceConversation?.attachmentIdReplacements
+    );
+
+    const historyFileRes = await createCompactionHistoryFile(auth, {
+      targetConversation: targetConversation,
+      sourceConversation: conversationToSummarize,
+      compactionMessage,
+      renderedMessages,
+    });
+
+    if (historyFileRes.isOk()) {
+      content = `${summary}\n\n---\n\nFull conversation history before compaction: ${historyFileRes.value.path}`;
+      status = "succeeded";
+
+      logger.info(
+        {
+          workspaceId: owner.sId,
+          conversationId,
+          sourceConversationId: sourceConversation?.conversationId,
+          compactionMessageId,
+          historyFilePath: historyFileRes.value.path,
+          status,
+        },
+        "Compaction generation succeeded"
+      );
+    } else {
+      content = null;
+      status = "failed";
+
+      logger.error(
+        {
+          workspaceId: owner.sId,
+          conversationId,
+          sourceConversationId: sourceConversation?.conversationId,
+          compactionMessageId,
+          error: historyFileRes.error,
+        },
+        "Compaction history file creation failed"
+      );
+    }
   } else {
     content = null;
     status = "failed";
@@ -151,6 +313,7 @@ export async function runCompaction(
       {
         workspaceId: owner.sId,
         conversationId,
+        sourceConversationId: sourceConversation?.conversationId,
         compactionMessageId,
         error: summaryRes.error,
       },
@@ -159,8 +322,9 @@ export async function runCompaction(
   }
 
   const result = await updateCompactionMessageWithContentAndFinalStatus(auth, {
-    conversation,
+    conversation: targetConversation,
     compactionMessage,
+    clearEnabledSkillsOnSuccess: renderSkillsAsUserMessages,
     status,
     content,
   });
@@ -175,7 +339,7 @@ export async function runCompaction(
       messageId: compactionMessage.sId,
       message: compactionMessage,
     },
-    { conversationId }
+    { conversationId: targetConversation.sId }
   );
 
   return new Ok(undefined);
@@ -184,26 +348,51 @@ export async function runCompaction(
 async function generateCompactionSummary(
   auth: Authenticator,
   {
-    conversation,
+    sourceConversation,
+    sourceMessageRank,
+    targetConversation,
+    compactionMessage,
     model,
-  }: { conversation: ConversationType; model: SupportedModel }
-): Promise<Result<string, Error>> {
+  }: {
+    sourceConversation: ConversationType;
+    sourceMessageRank?: number;
+    targetConversation: ConversationType;
+    compactionMessage: CompactionMessageType;
+    model: SupportedModel;
+  }
+): Promise<Result<{ summary: string }, Error>> {
   const owner = auth.getNonNullableWorkspace();
+
+  const conversationToSummarize =
+    sourceMessageRank === undefined
+      ? sourceConversation
+      : filterConversationContentUpToRank(
+          sourceConversation,
+          sourceMessageRank
+        );
 
   // renderConversationAsText stops at the last succeeded compaction boundary by default and skips
   // running agent messages, producing exactly the messages that need to be summarized.
-  const renderedMessages = renderConversationAsText(conversation, {
+  const renderedMessages = renderConversationAsText(conversationToSummarize, {
     includeTimestamps: true,
     includeActions: true,
     includeActionDetails: true,
     skipRunningAgentMessages: true,
+    truncateTotalChars: 512000, // Simple heuristic to avoid context overflow with most models.
   });
 
-  // TODO(compaction): Ensure we don't exceeds the model context size here, as we have no guarantee
-  // that the current conversation is not exceeding it already.
   // TODO(compaction): We may want to be more mechanical about files available to the model in
-  // conversation and projects by including a lsit as part of the summary.
+  // conversation and projects by including a list as part of the summary.
   // TODO(compaction: We may want to add retries around the LLM call
+
+  logger.info(
+    {
+      workspaceId: owner.sId,
+      conversationId: conversationToSummarize.sId,
+      renderedMessagesLength: renderedMessages.length,
+    },
+    "Compaction generation started"
+  );
 
   const conv: ModelConversationTypeMultiActions = {
     messages: [
@@ -226,23 +415,49 @@ async function generateCompactionSummary(
     temperature: 0,
   };
 
-  const res = await runMultiActionsAgent(
-    auth,
-    config,
-    {
-      conversation: conv,
-      prompt: COMPACTION_PROMPT,
-      specifications: [],
-    },
-    {
-      context: {
-        operationType: "compaction",
-        conversationId: conversation.sId,
-        userId: auth.user()?.sId,
-        workspaceId: owner.sId,
+  const LLM_TIMEOUT_MS = 15 * 60 * 1000;
+  let timeoutHandle: NodeJS.Timeout | undefined;
+
+  const res = await Promise.race([
+    runMultiActionsAgent(
+      auth,
+      config,
+      {
+        conversation: conv,
+        prompt: COMPACTION_PROMPT,
+        specifications: [],
       },
-    }
-  );
+      {
+        context: {
+          operationType: "compaction",
+          conversationId: targetConversation.sId,
+          userId: auth.user()?.sId,
+          workspaceId: owner.sId,
+        },
+        onRunId: async (runId) => {
+          await ConversationResource.updateCompactionMessageRunIds(auth, {
+            compactionMessageModelId: compactionMessage.compactionMessageId,
+            runIds: [runId],
+          });
+        },
+      }
+    ),
+    new Promise<Result<LLMOutput, Error>>((resolve) => {
+      timeoutHandle = setTimeout(() => {
+        logger.error(
+          {
+            workspaceId: owner.sId,
+            conversationId: conversationToSummarize.sId,
+            compactionMessageId: compactionMessage.sId,
+            timeoutMs: LLM_TIMEOUT_MS,
+          },
+          "Compaction LLM call timed out"
+        );
+        resolve(new Err(new Error("Compaction LLM call timed out after 15m")));
+      }, LLM_TIMEOUT_MS);
+    }),
+  ]);
+  clearTimeout(timeoutHandle);
 
   if (res.isErr()) {
     return res;
@@ -258,5 +473,5 @@ async function generateCompactionSummary(
     return new Err(new Error("Compaction LLM returned empty summary"));
   }
 
-  return new Ok(summary);
+  return new Ok({ summary });
 }

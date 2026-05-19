@@ -9,12 +9,13 @@ import {
   AVAILABLE_INTERNAL_MCP_SERVER_NAMES,
   getAvailabilityOfInternalMCPServerById,
   getAvailabilityOfInternalMCPServerByName,
+  INTERNAL_MCP_SERVERS,
   isAutoInternalMCPServerName,
   isValidInternalMCPServerId,
 } from "@app/lib/actions/mcp_internal_actions/constants";
-import { isEnabledForWorkspace } from "@app/lib/actions/mcp_internal_actions/enabled";
+import { isDeepDiveDisabledByAdmin } from "@app/lib/api/assistant/global_agents/configurations/dust/utils";
 import type { MCPServerViewType } from "@app/lib/api/mcp";
-import type { Authenticator } from "@app/lib/auth";
+import { type Authenticator, getFeatureFlags } from "@app/lib/auth";
 import { DustError } from "@app/lib/error";
 import { AgentMCPServerConfigurationModel } from "@app/lib/models/agent/actions/mcp";
 import { MCPServerViewModel } from "@app/lib/models/agent/actions/mcp_server_view";
@@ -353,22 +354,29 @@ export class MCPServerViewResource extends ResourceWithSpace<MCPServerViewModel>
   private static async baseFetch(
     auth: Authenticator,
     options: ResourceFindOptions<MCPServerViewModel> = {},
-    { includeMetadata = true }: { includeMetadata?: boolean } = {}
+    {
+      includeMetadata = true,
+      transaction,
+    }: { includeMetadata?: boolean; transaction?: Transaction } = {}
   ) {
-    const views = await this.baseFetchWithAuthorization(auth, {
-      ...options,
-      where: {
-        ...options.where,
-        workspaceId: auth.getNonNullableWorkspace().id,
-      },
-      includes: [
-        ...(options.includes ?? []),
-        {
-          model: UserModel,
-          as: "editedByUser",
+    const views = await this.baseFetchWithAuthorization(
+      auth,
+      {
+        ...options,
+        where: {
+          ...options.where,
+          workspaceId: auth.getNonNullableWorkspace().id,
         },
-      ],
-    });
+        includes: [
+          ...(options.includes ?? []),
+          {
+            model: UserModel,
+            as: "editedByUser",
+          },
+        ],
+      },
+      transaction
+    );
 
     const filteredViews: MCPServerViewResource[] = [];
 
@@ -377,11 +385,15 @@ export class MCPServerViewResource extends ResourceWithSpace<MCPServerViewModel>
     if (options.includeDeleted) {
       filteredViews.push(...views);
     } else {
-      const systemSpace = await SpaceResource.fetchWorkspaceSystemSpace(auth);
+      const systemSpace = await SpaceResource.fetchWorkspaceSystemSpace(
+        auth,
+        transaction
+      );
 
       const remoteServers = await RemoteMCPServerResource.fetchByModelIds(
         auth,
-        removeNulls(views.map((v) => v.remoteMCPServerId))
+        removeNulls(views.map((v) => v.remoteMCPServerId)),
+        transaction
       );
       const remoteServerMap = new Map(remoteServers.map((s) => [s.id, s]));
 
@@ -414,7 +426,7 @@ export class MCPServerViewResource extends ResourceWithSpace<MCPServerViewModel>
     }
 
     if (includeMetadata && filteredViews.length > 0) {
-      await this.populateToolsMetadata(auth, filteredViews);
+      await this.populateToolsMetadata(auth, filteredViews, transaction);
     }
 
     return filteredViews;
@@ -425,7 +437,8 @@ export class MCPServerViewResource extends ResourceWithSpace<MCPServerViewModel>
    */
   private static async populateToolsMetadata(
     auth: Authenticator,
-    views: MCPServerViewResource[]
+    views: MCPServerViewResource[],
+    transaction?: Transaction
   ): Promise<void> {
     const workspaceId = auth.getNonNullableWorkspace().id;
 
@@ -434,24 +447,27 @@ export class MCPServerViewResource extends ResourceWithSpace<MCPServerViewModel>
     );
     const remoteServerIds = removeNulls(views.map((v) => v.remoteMCPServerId));
 
-    const [internalMetadata, remoteMetadata] = await Promise.all([
+    const internalMetadata =
       internalServerIds.length > 0
-        ? RemoteMCPServerToolMetadataModel.findAll({
+        ? await RemoteMCPServerToolMetadataModel.findAll({
             where: {
               workspaceId,
               internalMCPServerId: { [Op.in]: internalServerIds },
             },
+            transaction,
           })
-        : [],
+        : [];
+
+    const remoteMetadata =
       remoteServerIds.length > 0
-        ? RemoteMCPServerToolMetadataModel.findAll({
+        ? await RemoteMCPServerToolMetadataModel.findAll({
             where: {
               workspaceId,
               remoteMCPServerId: { [Op.in]: remoteServerIds },
             },
+            transaction,
           })
-        : [],
-    ]);
+        : [];
 
     const metadataByInternalId = new Map<
       string,
@@ -532,7 +548,10 @@ export class MCPServerViewResource extends ResourceWithSpace<MCPServerViewModel>
   static async fetchByModelIds(
     auth: Authenticator,
     ids: ModelId[],
-    { includeMetadata = true }: { includeMetadata?: boolean } = {}
+    {
+      includeMetadata = true,
+      transaction,
+    }: { includeMetadata?: boolean; transaction?: Transaction } = {}
   ) {
     const views = await this.baseFetch(
       auth,
@@ -543,7 +562,7 @@ export class MCPServerViewResource extends ResourceWithSpace<MCPServerViewModel>
           },
         },
       },
-      { includeMetadata }
+      { includeMetadata, transaction }
     );
 
     return views ?? [];
@@ -613,42 +632,48 @@ export class MCPServerViewResource extends ResourceWithSpace<MCPServerViewModel>
 
   static async listByMCPServers(
     auth: Authenticator,
-    mcpServerIds: string[]
+    mcpServerIds: string[],
+    transaction?: Transaction
   ): Promise<MCPServerViewResource[]> {
     const serverTypesAndIds = mcpServerIds.map((mcpServerId) => ({
       ...getServerTypeAndIdFromSId(mcpServerId),
       mcpServerId,
     }));
 
-    return this.baseFetch(auth, {
-      where: {
-        [Op.or]: [
-          {
-            serverType: "internal" as const,
-            internalMCPServerId: {
-              [Op.in]: serverTypesAndIds
-                .filter(({ serverType }) => serverType === "internal")
-                .map(({ mcpServerId }) => mcpServerId),
+    return this.baseFetch(
+      auth,
+      {
+        where: {
+          [Op.or]: [
+            {
+              serverType: "internal" as const,
+              internalMCPServerId: {
+                [Op.in]: serverTypesAndIds
+                  .filter(({ serverType }) => serverType === "internal")
+                  .map(({ mcpServerId }) => mcpServerId),
+              },
             },
-          },
-          {
-            serverType: "remote",
-            remoteMCPServerId: {
-              [Op.in]: serverTypesAndIds
-                .filter(({ serverType }) => serverType === "remote")
-                .map(({ id }) => id),
+            {
+              serverType: "remote",
+              remoteMCPServerId: {
+                [Op.in]: serverTypesAndIds
+                  .filter(({ serverType }) => serverType === "remote")
+                  .map(({ id }) => id),
+              },
             },
-          },
-        ],
+          ],
+        },
       },
-    });
+      { transaction }
+    );
   }
 
   static async listByMCPServer(
     auth: Authenticator,
-    mcpServerId: string
+    mcpServerId: string,
+    transaction?: Transaction
   ): Promise<MCPServerViewResource[]> {
-    return this.listByMCPServers(auth, [mcpServerId]);
+    return this.listByMCPServers(auth, [mcpServerId], transaction);
   }
 
   static async getByMCPServerAndSpace(
@@ -703,17 +728,50 @@ export class MCPServerViewResource extends ResourceWithSpace<MCPServerViewModel>
     return views.filter((view) => view.space.kind === "global");
   }
 
+  static async getMCPServerViewsForAutoInternalToolsAsMap<
+    T extends AutoInternalMCPServerNameType,
+  >(
+    auth: Authenticator,
+    names: readonly T[]
+  ): Promise<Map<T, MCPServerViewResource>> {
+    const workspaceId = auth.getNonNullableWorkspace().id;
+    const nameByInternalMCPServerId = new Map<string, T>(
+      names.map((name) => [
+        autoInternalMCPServerNameToSId({ name, workspaceId }),
+        name,
+      ])
+    );
+
+    const views = await this.listByMCPServers(auth, [
+      ...nameByInternalMCPServerId.keys(),
+    ]);
+
+    const map = new Map<T, MCPServerViewResource>();
+    for (const view of views) {
+      if (view.space.kind !== "global" || !view.internalMCPServerId) {
+        continue;
+      }
+      const name = nameByInternalMCPServerId.get(view.internalMCPServerId);
+      if (name) {
+        map.set(name, view);
+      }
+    }
+    return map;
+  }
+
   static async listMCPServerViewsAutoInternalForSpaces(
     auth: Authenticator,
     name: AutoInternalMCPServerNameType,
-    spaceModelIds: ModelId[]
+    spaceModelIds: ModelId[],
+    transaction?: Transaction
   ) {
     const views = await this.listByMCPServer(
       auth,
       autoInternalMCPServerNameToSId({
         name,
         workspaceId: auth.getNonNullableWorkspace().id,
-      })
+      }),
+      transaction
     );
 
     // We include the global space, which is omitted from the requested space IDs of an agent.
@@ -879,7 +937,7 @@ export class MCPServerViewResource extends ResourceWithSpace<MCPServerViewModel>
     transaction?: Transaction
   ): Promise<Result<number, Error>> {
     await destroyMCPServerViewDependencies(auth, {
-      mcpServerViewId: this.id,
+      mcpServerViewIds: [this.id],
       transaction,
     });
 
@@ -968,6 +1026,9 @@ export class MCPServerViewResource extends ResourceWithSpace<MCPServerViewModel>
   }> {
     return tracer.trace("ensureAllAutoToolsAreCreated", async () => {
       const names = AVAILABLE_INTERNAL_MCP_SERVER_NAMES;
+      const featureFlags = await getFeatureFlags(auth);
+      const isDeepDiveDisabled = await isDeepDiveDisabledByAdmin(auth);
+      const plan = auth.getNonNullablePlan();
 
       const autoInternalMCPServerIds: string[] = [];
       for (const name of names) {
@@ -975,7 +1036,11 @@ export class MCPServerViewResource extends ResourceWithSpace<MCPServerViewModel>
           continue;
         }
 
-        const isEnabled = await isEnabledForWorkspace(auth, name);
+        const isEnabled = !INTERNAL_MCP_SERVERS[name].isRestricted?.({
+          featureFlags,
+          isDeepDiveDisabled,
+          plan,
+        });
         const availability = getAvailabilityOfInternalMCPServerByName(name);
 
         if (isEnabled && availability !== "manual") {

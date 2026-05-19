@@ -1,4 +1,5 @@
 /** @ignoreswagger */
+// @migration-status: MIGRATED_TO_HONO
 import { withSessionAuthenticationForWorkspace } from "@app/lib/api/auth_wrappers";
 import type { Authenticator } from "@app/lib/auth";
 import { ConversationResource } from "@app/lib/resources/conversation_resource";
@@ -12,7 +13,7 @@ export type BulkActionsResponse = {
   success: boolean;
 };
 
-export const MarkAllAsReadBodySchema = z.object({
+const MarkAllAsReadBodySchema = z.object({
   action: z.enum(["mark_as_read"]),
   conversationIds: z.array(z.string()).min(1),
 });

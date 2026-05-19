@@ -9,6 +9,8 @@
     }
   ],
   "metadata": {
-    "groupId": "string"
+    "group_ids": "string",
+    "actor_type": "string",
+    "role": "string"
   }
 }

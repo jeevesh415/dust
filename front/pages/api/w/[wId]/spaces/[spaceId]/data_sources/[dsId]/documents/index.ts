@@ -1,4 +1,5 @@
 /** @ignoreswagger */
+// @migration-status: MIGRATED_TO_HONO
 import { withSessionAuthenticationForWorkspace } from "@app/lib/api/auth_wrappers";
 import { upsertDocument } from "@app/lib/api/data_sources";
 import { withResourceFetchingFromRoute } from "@app/lib/api/resource_wrappers";
@@ -10,9 +11,8 @@ import { PostDataSourceDocumentRequestBodySchema } from "@app/types/api/public/d
 import type { CoreAPILightDocument } from "@app/types/core/data_source";
 import type { DocumentType } from "@app/types/document";
 import type { WithAPIErrorResponse } from "@app/types/error";
-import { isLeft } from "fp-ts/lib/Either";
-import * as reporter from "io-ts-reporters";
 import type { NextApiRequest, NextApiResponse } from "next";
+import { fromError } from "zod-validation-error";
 
 // Next.js config requires literal values (static analysis). 16MB accommodates 5MB document content
 // (MAX_LARGE_DOCUMENT_TXT_LEN in connectors) plus ~3x JSON encoding overhead for escaping.
@@ -59,12 +59,12 @@ async function handler(
         });
       }
 
-      const bodyValidation = PostDataSourceDocumentRequestBodySchema.decode(
+      const bodyValidation = PostDataSourceDocumentRequestBodySchema.safeParse(
         req.body
       );
 
-      if (isLeft(bodyValidation)) {
-        const pathError = reporter.formatValidationErrors(bodyValidation.left);
+      if (!bodyValidation.success) {
+        const pathError = fromError(bodyValidation.error).toString();
         return apiError(req, res, {
           status_code: 400,
           api_error: {
@@ -86,7 +86,7 @@ async function handler(
         mime_type,
         title,
         document_id,
-      } = bodyValidation.right;
+      } = bodyValidation.data;
 
       const upsertResult = await upsertDocument({
         // Use document_id if provided (e.g., slugified for LLM-friendly node IDs),

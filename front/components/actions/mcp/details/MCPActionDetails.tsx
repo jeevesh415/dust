@@ -1,4 +1,7 @@
-import { ActionDetailsWrapper } from "@app/components/actions/ActionDetailsWrapper";
+import {
+  ActionDetailsWrapper,
+  ActionExecutionProvider,
+} from "@app/components/actions/ActionDetailsWrapper";
 import {
   makeQueryTextForDataSourceSearch,
   makeQueryTextForFind,
@@ -20,16 +23,19 @@ import {
   FilesystemPathDetails,
 } from "@app/components/actions/mcp/details/MCPDataSourcesFileSystemActionDetails";
 import { MCPDataWarehousesBrowseDetails } from "@app/components/actions/mcp/details/MCPDataWarehousesBrowseDetails";
-import { MCPDeepDiveActionDetails } from "@app/components/actions/mcp/details/MCPDeepDiveActionDetails";
 import { MCPExtractActionDetails } from "@app/components/actions/mcp/details/MCPExtractActionDetails";
 import { MCPGetDatabaseSchemaActionDetails } from "@app/components/actions/mcp/details/MCPGetDatabaseSchemaActionDetails";
 import { MCPImageGenerationActionDetails } from "@app/components/actions/mcp/details/MCPImageGenerationActionDetails";
 import { MCPListToolsActionDetails } from "@app/components/actions/mcp/details/MCPListToolsActionDetails";
 import { MCPRunAgentActionDetails } from "@app/components/actions/mcp/details/MCPRunAgentActionDetails";
 import { MCPSandboxActionDetails } from "@app/components/actions/mcp/details/MCPSandboxActionDetails";
+import { MCPSandboxAddEgressDomainDetails } from "@app/components/actions/mcp/details/MCPSandboxAddEgressDomainDetails";
 import { MCPSkillEnableActionDetails } from "@app/components/actions/mcp/details/MCPSkillEnableActionDetails";
 import { MCPTablesQueryActionDetails } from "@app/components/actions/mcp/details/MCPTablesQueryActionDetails";
-import { SearchResultDetails } from "@app/components/actions/mcp/details/MCPToolOutputDetails";
+import {
+  SearchResultDetails,
+  ToolGeneratedFileDetails,
+} from "@app/components/actions/mcp/details/MCPToolOutputDetails";
 import { MCPToolsetsEnableActionDetails } from "@app/components/actions/mcp/details/MCPToolsetsEnableActionDetails";
 import type {
   ActionDetailsDisplayContext,
@@ -88,21 +94,16 @@ import {
   GET_DATABASE_SCHEMA_TOOL_NAME,
   TABLE_QUERY_V2_SERVER_NAME,
 } from "@app/lib/api/actions/servers/query_tables_v2/metadata";
-import config from "@app/lib/api/config";
 import { isValidJSON } from "@app/lib/utils/json";
 import type { AgentMCPActionWithOutputType } from "@app/types/actions";
-import { isSupportedImageContentType } from "@app/types/files";
+import type { AgentMessageStatus } from "@app/types/assistant/conversation";
 import { asDisplayName } from "@app/types/shared/utils/string_utils";
 import type { LightWorkspaceType } from "@app/types/user";
 import {
   ActionDocumentTextIcon,
   ClockIcon,
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
   ContentBlockWrapper,
   ContentMessage,
-  cn,
   GlobeAltIcon,
   MagnifyingGlassIcon,
   Markdown,
@@ -113,12 +114,7 @@ export interface MCPActionDetailsProps {
   action: AgentMCPActionWithOutputType;
   owner: LightWorkspaceType;
   lastNotification: ProgressNotificationContentType | null;
-  messageStatus?:
-    | "created"
-    | "succeeded"
-    | "failed"
-    | "cancelled"
-    | "gracefully_stopped";
+  messageStatus?: AgentMessageStatus;
   displayContext: ActionDetailsDisplayContext;
 }
 
@@ -143,7 +139,19 @@ function getActionLabel({
   );
 }
 
-export function MCPActionDetails({
+export function MCPActionDetails(props: MCPActionDetailsProps) {
+  return (
+    <ActionExecutionProvider
+      executionDurationMs={props.action.executionDurationMs}
+      isExecuting={props.action.status === "running"}
+      startedAtMs={props.action.createdAt}
+    >
+      <MCPActionDetailsInner {...props} />
+    </ActionExecutionProvider>
+  );
+}
+
+function MCPActionDetailsInner({
   action,
   displayContext,
   owner,
@@ -164,7 +172,7 @@ export function MCPActionDetails({
     if (status === "denied") {
       const deniedMessage = {
         type: "text" as const,
-        text: "Tool execution rejected by the user.",
+        text: "Tool execution rejected or skipped by the user.",
       };
 
       if (baseOutput === null) {
@@ -189,8 +197,7 @@ export function MCPActionDetails({
   if (
     internalMCPServerName === "search" ||
     internalMCPServerName === "data_sources_file_system" ||
-    (internalMCPServerName === "project_manager" &&
-      toolName === "semantic_search")
+    (internalMCPServerName === "pod_manager" && toolName === "semantic_search")
   ) {
     switch (toolName) {
       case SEARCH_TOOL_NAME:
@@ -243,7 +250,7 @@ export function MCPActionDetails({
   if (
     (internalMCPServerName === "include_data" &&
       toolName === INCLUDE_TOOL_NAME) ||
-    (internalMCPServerName === "project_manager" &&
+    (internalMCPServerName === "pod_manager" &&
       toolName === "retrieve_recent_documents")
   ) {
     return (
@@ -315,11 +322,6 @@ export function MCPActionDetails({
     return <MCPRunAgentActionDetails {...toolOutputDetailsProps} />;
   }
 
-  // TODO(2026-02-03 aubin): remove the component entirely on Feb, 17. See comment in PR.
-  if (internalMCPServerName?.toString() === "deep_dive") {
-    return <MCPDeepDiveActionDetails {...toolOutputDetailsProps} />;
-  }
-
   if (internalMCPServerName === "agent_memory") {
     switch (toolName) {
       case AGENT_MEMORY_RETRIEVE_TOOL_NAME:
@@ -385,6 +387,9 @@ export function MCPActionDetails({
   }
 
   if (internalMCPServerName === "sandbox") {
+    if (toolName === "add_egress_domain") {
+      return <MCPSandboxAddEgressDomainDetails {...toolOutputDetailsProps} />;
+    }
     return <MCPSandboxActionDetails {...toolOutputDetailsProps} />;
   }
 
@@ -427,84 +432,31 @@ export function GenericActionDetails({
     >
       {displayContext !== "conversation" && (
         <div className="dd-privacy-mask flex flex-col gap-4 py-4 pl-6">
-          {displayContext === "sidebar-single-action" ? (
-            <>
-              <div>
-                <span className="font-medium text-foreground dark:text-foreground-night">
-                  Inputs
-                </span>
-                <RenderToolItemMarkdown text={inputs} type="input" />
+          <div>
+            <span className="font-medium text-foreground dark:text-foreground-night">
+              Inputs
+            </span>
+            <RenderToolItemMarkdown text={inputs} type="input" />
+          </div>
+          {action.output && (
+            <div>
+              <span className="font-medium text-foreground dark:text-foreground-night">
+                Output
+              </span>
+              <div className="my-2 flex flex-col gap-2">
+                {action.output
+                  .filter(
+                    (o) => isTextContent(o) || isResourceContentWithText(o)
+                  )
+                  .map((o, index) => (
+                    <RenderToolItemMarkdown
+                      key={index}
+                      text={getOutputText(o)}
+                      type="output"
+                    />
+                  ))}
               </div>
-              {action.output && (
-                <div>
-                  <span className="font-medium text-foreground dark:text-foreground-night">
-                    Output
-                  </span>
-                  <div className="my-2 flex flex-col gap-2">
-                    {action.output
-                      .filter(
-                        (o) => isTextContent(o) || isResourceContentWithText(o)
-                      )
-                      .map((o, index) => (
-                        <RenderToolItemMarkdown
-                          key={index}
-                          text={getOutputText(o)}
-                          type="output"
-                        />
-                      ))}
-                  </div>
-                </div>
-              )}
-            </>
-          ) : (
-            <>
-              <Collapsible defaultOpen={false}>
-                <CollapsibleTrigger>
-                  <div
-                    className={cn(
-                      "text-foreground dark:text-foreground-night",
-                      "flex flex-row items-center gap-x-2"
-                    )}
-                  >
-                    <span className="heading-base">Inputs</span>
-                  </div>
-                </CollapsibleTrigger>
-                <CollapsibleContent>
-                  <RenderToolItemMarkdown text={inputs} type="input" />
-                </CollapsibleContent>
-              </Collapsible>
-
-              {action.output && (
-                <Collapsible defaultOpen={false}>
-                  <CollapsibleTrigger>
-                    <div
-                      className={cn(
-                        "text-foreground dark:text-foreground-night",
-                        "flex flex-row items-center gap-x-2"
-                      )}
-                    >
-                      <span className="heading-base">Output</span>
-                    </div>
-                  </CollapsibleTrigger>
-                  <CollapsibleContent>
-                    <div className="my-2 flex flex-col gap-2">
-                      {action.output
-                        .filter(
-                          (o) =>
-                            isTextContent(o) || isResourceContentWithText(o)
-                        )
-                        .map((o, index) => (
-                          <RenderToolItemMarkdown
-                            key={index}
-                            text={getOutputText(o)}
-                            type="output"
-                          />
-                        ))}
-                    </div>
-                  </CollapsibleContent>
-                </Collapsible>
-              )}
-            </>
+            </div>
           )}
 
           {action.generatedFiles.filter((f) => !f.hidden).length > 0 && (
@@ -513,33 +465,13 @@ export function GenericActionDetails({
               <div className="flex flex-wrap gap-2">
                 {action.generatedFiles
                   .filter((f) => !f.hidden)
-                  .map((file) => {
-                    if (isSupportedImageContentType(file.contentType)) {
-                      return (
-                        <div
-                          key={file.fileId}
-                          className="h-24 w-24 flex-shrink-0"
-                        >
-                          <img
-                            className="h-full w-full rounded-xl object-cover"
-                            src={`${config.getApiBaseUrl()}/api/w/${owner.sId}/files/${file.fileId}`}
-                            alt={`${file.title}`}
-                          />
-                        </div>
-                      );
-                    }
-                    return (
-                      <div key={file.fileId}>
-                        <a
-                          href={`${config.getApiBaseUrl()}/api/w/${owner.sId}/files/${file.fileId}`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                        >
-                          {file.title}
-                        </a>
-                      </div>
-                    );
-                  })}
+                  .map((file) => (
+                    <ToolGeneratedFileDetails
+                      key={file.fileId}
+                      resource={file}
+                      owner={owner}
+                    />
+                  ))}
               </div>
             </>
           )}

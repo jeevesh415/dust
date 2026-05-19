@@ -9,6 +9,9 @@ export type SkillStatus = (typeof SKILL_STATUSES)[number];
 export const SKILL_REINFORCEMENT_MODES = ["auto", "on", "off"] as const;
 export type SkillReinforcementMode = (typeof SKILL_REINFORCEMENT_MODES)[number];
 
+export const SKILL_VIEWS = ["full", "summary"] as const;
+export type SkillViewType = (typeof SKILL_VIEWS)[number];
+
 export const SKILL_SOURCES = [
   "web_app",
   "github",
@@ -25,7 +28,7 @@ export const SkillSourceMetadataSchema = z.object({
 
 export type SkillSourceMetadata = z.infer<typeof SkillSourceMetadataSchema>;
 
-export const SkillSchema = z.object({
+export const SkillWithoutInstructionsAndToolsSchema = z.object({
   id: z.number(),
   sId: z.string(),
   createdAt: z.number().nullable(),
@@ -35,15 +38,14 @@ export const SkillSchema = z.object({
   name: z.string(),
   agentFacingDescription: z.string(),
   userFacingDescription: z.string(),
-  instructions: z.string().nullable(),
-  instructionsHtml: z.string().nullable(),
   icon: z.string().nullable(),
   source: z.enum(SKILL_SOURCES).nullable(),
   sourceMetadata: SkillSourceMetadataSchema.nullable(),
-  reinforcement: z.enum(SKILL_REINFORCEMENT_MODES).optional(),
+  reinforcement: z.enum(SKILL_REINFORCEMENT_MODES),
   lastReinforcementAnalysisAt: z.string().nullable().optional(),
+  selfImprovementLock: z.boolean(),
+  selfImprovementCostsCapMicroUsd: z.number().nullable(),
   requestedSpaceIds: z.array(z.string()),
-  tools: z.array(MCPServerViewSchema),
   fileAttachments: z.array(
     z.object({
       fileId: z.string(),
@@ -54,6 +56,16 @@ export const SkillSchema = z.object({
   isExtendable: z.boolean(),
   isDefault: z.boolean(),
   extendedSkillId: z.string().nullable(),
+});
+
+export type SkillWithoutInstructionsAndToolsType = z.infer<
+  typeof SkillWithoutInstructionsAndToolsSchema
+>;
+
+export const SkillSchema = SkillWithoutInstructionsAndToolsSchema.extend({
+  instructions: z.string().nullable(),
+  instructionsHtml: z.string().nullable(),
+  tools: z.array(MCPServerViewSchema),
 });
 
 export type SkillType = z.infer<typeof SkillSchema>;

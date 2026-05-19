@@ -1,21 +1,39 @@
+import { hasProcessedVersion } from "@app/lib/api/files/processing";
 import type { Authenticator } from "@app/lib/auth";
 import type { FileResource } from "@app/lib/resources/file_resource";
-import { pipeline } from "stream/promises";
+
+async function copyVersion(
+  auth: Authenticator,
+  sourceFile: FileResource,
+  targetFile: FileResource,
+  version: "original" | "processed"
+) {
+  await sourceFile
+    .getBucketForVersion(version)
+    .copyFile(
+      sourceFile.getCloudStoragePath(auth, version),
+      targetFile.getCloudStoragePath(auth, version),
+      targetFile.getBucketForVersion(version)
+    );
+}
 
 export async function copyContent(
   auth: Authenticator,
   sourceFile: FileResource,
-  targetFile: FileResource
+  targetFile: FileResource,
+  {
+    includeProcessedVersion = false,
+  }: { includeProcessedVersion?: boolean } = {}
 ) {
-  // Get a read stream from the source file's original version.
-  const readStream = sourceFile.getReadStream({
-    auth,
-    version: "original",
-  });
+  await copyVersion(auth, sourceFile, targetFile, "original");
 
-  // Write a copy of the source file's content to the new file.
-  await pipeline(
-    readStream,
-    targetFile.getWriteStream({ auth, version: "original" })
-  );
+  if (
+    !includeProcessedVersion ||
+    sourceFile.useCaseMetadata?.skipFileProcessing === true ||
+    !hasProcessedVersion(sourceFile.contentType)
+  ) {
+    return;
+  }
+
+  await copyVersion(auth, sourceFile, targetFile, "processed");
 }

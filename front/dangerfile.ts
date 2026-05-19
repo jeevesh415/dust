@@ -6,6 +6,9 @@ const migrationAckLabel = "migration-ack";
 const documentationAckLabel = "documentation-ack";
 const rawSqlAckLabel = "raw-sql-ack";
 const sparkleVersionAckLabel = "sparkle-version-ack";
+const sseAckLabel = "sse-ack";
+const skipMigrationCheckLabel = "skip-migration-check";
+const sandboxImageAckLabel = "sandbox-image-ack";
 
 const REMOVE_INDEX_WARNING =
   "\n\nBefore deleting an index, make sure it is actually not used by running:" +
@@ -49,6 +52,81 @@ function checkMigrationLabel() {
     failMigrationAck();
   } else {
     warnMigrationAck(migrationAckLabel);
+  }
+}
+
+function failSSEEndpointAck() {
+  fail(
+    "SSE endpoint files have been modified. These endpoints are served by " +
+      "both `front` and `front-sse` pods (via `/api/sse/` re-exports).\n\n" +
+      `Please add the \`${sseAckLabel}\` label to acknowledge ` +
+      "that a `front-sse` deploy is required alongside the `front` deploy."
+  );
+}
+
+function warnSSEEndpointAck(sseAckLabel: string) {
+  warn(
+    "SSE endpoint files have been modified and the PR has the `" +
+      sseAckLabel +
+      "` label. Don't forget to deploy `front-sse` alongside `front`."
+  );
+}
+
+function checkSSEEndpointLabel() {
+  if (!hasLabel(sseAckLabel)) {
+    failSSEEndpointAck();
+  } else {
+    warnSSEEndpointAck(sseAckLabel);
+  }
+}
+
+function failSSESharedFilesAck() {
+  fail(
+    "`front/lib/auth.ts` (Authenticator) has been modified. This code runs " +
+      "on `front-sse` pods as well.\n\n" +
+      `Please add the \`${sseAckLabel}\` label to acknowledge ` +
+      "that a `front-sse` deploy is required alongside the `front` deploy."
+  );
+}
+
+function warnSSESharedFilesAck(sseAckLabel: string) {
+  warn(
+    "`front/lib/auth.ts` (Authenticator) has been modified and the PR has the `" +
+      sseAckLabel +
+      "` label. Don't forget to deploy `front-sse` alongside `front`."
+  );
+}
+
+function checkSSESharedFilesLabel() {
+  if (!hasLabel(sseAckLabel)) {
+    failSSESharedFilesAck();
+  } else {
+    warnSSESharedFilesAck(sseAckLabel);
+  }
+}
+
+function failSSESharedModelsAck() {
+  fail(
+    "Models queried by SSE endpoints have been modified. These models are " +
+      "loaded by code that runs on `front-sse` pods as well.\n\n" +
+      `Please add the \`${sseAckLabel}\` label to acknowledge ` +
+      "that a `front-sse` deploy is required alongside the `front` deploy."
+  );
+}
+
+function warnSSESharedModelsAck(sseAckLabel: string) {
+  warn(
+    "Models queried by SSE endpoints have been modified and the PR has the `" +
+      sseAckLabel +
+      "` label. Don't forget to deploy `front-sse` alongside `front`."
+  );
+}
+
+function checkSSESharedModelsLabel() {
+  if (!hasLabel(sseAckLabel)) {
+    failSSESharedModelsAck();
+  } else {
+    warnSSESharedModelsAck(sseAckLabel);
   }
 }
 
@@ -241,6 +319,39 @@ async function checkWorkspaceAwareModels(filePaths: string[]) {
   }
 }
 
+function failSandboxImageAck() {
+  fail(
+    "Files in `front/lib/api/sandbox/image/` have been modified. " +
+      "Live sandboxes pin the registered (baseImage, version) tuple at " +
+      "creation time, so any image change must be paired with:\n" +
+      "  1. A bump to the corresponding image `tag` in the registry " +
+      "(e.g. `DUST_BASE_IMAGE_VERSION`).\n" +
+      "  2. After deploy, opening `/poke/kill` (Kill Switches) and " +
+      "requesting a kill of older versions for the affected image so " +
+      "existing conversations get fresh sandboxes.\n\n" +
+      `Please add the \`${sandboxImageAckLabel}\` label to acknowledge ` +
+      "that both steps will be done."
+  );
+}
+
+function warnSandboxImageAck() {
+  warn(
+    "Files in `front/lib/api/sandbox/image/` have been modified and the " +
+      `PR has the \`${sandboxImageAckLabel}\` label. After deploy, open ` +
+      "`/poke/kill` (Kill Switches) and trigger a kill request for the " +
+      "affected image so existing conversations recreate against the new " +
+      "version."
+  );
+}
+
+function checkSandboxImageLabel() {
+  if (!hasLabel(sandboxImageAckLabel)) {
+    failSandboxImageAck();
+  } else {
+    warnSandboxImageAck();
+  }
+}
+
 /**
  * Triggers related checks based on modified files
  */
@@ -250,6 +361,91 @@ function warnTriggersWorkflowChanges() {
     Be careful modifying workflows/activities signatures.
     This may break running schedules. If so, soft reset them from prodbox.`
   );
+}
+
+function failMigrationSync(file: string, counterpart: string) {
+  fail(
+    `\`${file}\` was modified but its migration counterpart \`${counterpart}\` was not. ` +
+      `Both sides of a migrated handler must be updated together (see BACK17). ` +
+      `Add the \`${skipMigrationCheckLabel}\` label if this is intentional.`
+  );
+}
+
+function warnMigrationSync(file: string, counterpart: string) {
+  warn(
+    `\`${file}\` was modified but its migration counterpart \`${counterpart}\` was not. ` +
+      `The \`${skipMigrationCheckLabel}\` label is set — ensure this is intentional.`
+  );
+}
+
+// Returns true if the Next handler at `nextLocalPath` (cwd-relative) is
+// marked as migrated to Hono via the `@migration-status: MIGRATED_TO_HONO`
+// marker.
+function isMigratedToHono(nextLocalPath: string): boolean {
+  let content: string;
+  try {
+    content = fs.readFileSync(nextLocalPath, "utf8");
+  } catch {
+    // File does not exist (or unreadable) — treat as not migrated.
+    return false;
+  }
+  return /^\s*\/\/\s*@migration-status:\s*MIGRATED_TO_HONO\s*$/m.test(content);
+}
+
+function checkHonoMigrationSync() {
+  const diffFiles = danger.git.modified_files.concat(danger.git.created_files);
+
+  // For each modified API file, derive its migration counterpart from the
+  // 1:1 path mapping (Next `pages/api/<path>` ↔ Hono `front-api/routes/<path>`)
+  // and check the counterpart is also in the diff.
+  //
+  // A pair is considered migrated when:
+  //   - both files exist on disk, AND
+  //   - the Next file carries `@migration-status: MIGRATED_TO_HONO`.
+  //
+  // Danger runs with cwd=`front/`; `danger.git.modified_files` is
+  // repo-root relative. We prepend `front/` when crossing that boundary.
+  const checks: { file: string; counterpart: string }[] = [];
+
+  for (const file of diffFiles) {
+    let nextRepoPath: string | null = null;
+    let honoRepoPath: string | null = null;
+
+    if (file.startsWith("front/pages/api/")) {
+      nextRepoPath = file;
+      honoRepoPath = file.replace(/^front\/pages\/api\//, "front-api/routes/");
+    } else if (file.startsWith("front-api/routes/")) {
+      honoRepoPath = file;
+      nextRepoPath = file.replace(/^front-api\/routes\//, "front/pages/api/");
+    } else {
+      continue;
+    }
+
+    const nextLocalPath = nextRepoPath.replace(/^front\//, "");
+    const honoLocalPath = `../${honoRepoPath}`;
+
+    if (!fs.existsSync(nextLocalPath) || !fs.existsSync(honoLocalPath)) {
+      continue;
+    }
+
+    if (!isMigratedToHono(nextLocalPath)) {
+      continue;
+    }
+
+    const counterpart = file === nextRepoPath ? honoRepoPath : nextRepoPath;
+    checks.push({ file, counterpart });
+  }
+
+  for (const { file, counterpart } of checks) {
+    if (diffFiles.includes(counterpart)) {
+      continue;
+    }
+    if (hasLabel(skipMigrationCheckLabel)) {
+      warnMigrationSync(file, counterpart);
+    } else {
+      failMigrationSync(file, counterpart);
+    }
+  }
 }
 
 async function checkDiffFiles() {
@@ -324,22 +520,30 @@ async function checkDiffFiles() {
     warnTriggersWorkflowChanges();
   }
 
+  // Sandbox image registry/build changes — bumping a registered image's
+  // version requires an operator kill request after deploy so existing
+  // conversations cycle onto the new image.
+  const modifiedSandboxImageFiles = diffFiles.filter((path) => {
+    return path.startsWith("front/lib/api/sandbox/image/");
+  });
+  if (modifiedSandboxImageFiles.length > 0) {
+    checkSandboxImageLabel();
+  }
+
   // SSE endpoint files — changes here require a front-sse deploy too.
   const sseEndpointFiles = [
     "front/pages/api/w/[wId]/assistant/conversations/[cId]/events.ts",
     "front/pages/api/w/[wId]/assistant/conversations/[cId]/messages/[mId]/events.ts",
     "front/pages/api/v1/w/[wId]/assistant/conversations/[cId]/events.ts",
     "front/pages/api/v1/w/[wId]/assistant/conversations/[cId]/messages/[mId]/events.ts",
+    "front/pages/api/w/[wId]/mcp/requests.ts",
+    "front/pages/api/v1/w/[wId]/mcp/requests.ts",
   ];
   const modifiedSseFiles = diffFiles.filter((path) =>
     sseEndpointFiles.includes(path)
   );
   if (modifiedSseFiles.length > 0) {
-    warn(
-      "SSE endpoint files have been modified. These endpoints are served by " +
-        "both `front` and `front-sse` pods (via `/api/sse/` re-exports). " +
-        "A `front-sse` deploy is required alongside the `front` deploy."
-    );
+    checkSSEEndpointLabel();
   }
 
   // Shared code used by front-sse — changes here require a front-sse deploy too.
@@ -348,12 +552,34 @@ async function checkDiffFiles() {
     sseSharedFiles.includes(path)
   );
   if (modifiedSseSharedFiles.length > 0) {
-    warn(
-      "`front/lib/auth.ts` (Authenticator) has been modified. This code runs " +
-        "on `front-sse` pods as well. A `front-sse` deploy is required " +
-        "alongside the `front` deploy."
-    );
+    checkSSESharedFilesLabel();
   }
+
+  const sseSharedModels = [
+    "front/lib/models/agent/conversation_branch.ts",
+    "front/lib/models/agent/conversation_fork.ts",
+    "front/lib/models/agent/conversation.ts",
+    "front/lib/models/plan.ts",
+    "front/lib/models/provider_credential.ts",
+    "front/lib/resources/storage/models/group_memberships.ts",
+    "front/lib/resources/storage/models/group_spaces.ts",
+    "front/lib/resources/storage/models/groups.ts",
+    "front/lib/resources/storage/models/keys.ts",
+    "front/lib/resources/storage/models/kill_switches.ts",
+    "front/lib/resources/storage/models/membership.ts",
+    "front/lib/resources/storage/models/spaces.ts",
+    "front/lib/resources/storage/models/user.ts",
+    "front/lib/resources/storage/models/workspace.ts",
+  ];
+  const modifiedSseSharedModels = diffFiles.filter((path) =>
+    sseSharedModels.includes(path)
+  );
+  if (modifiedSseSharedModels.length > 0) {
+    checkSSESharedModelsLabel();
+  }
+
+  // Hono migration sync check (self-gates on diff contents).
+  checkHonoMigrationSync();
 }
 
 void checkDiffFiles();

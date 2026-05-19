@@ -6,8 +6,9 @@
     }
   ],
   "metadata": {
-    "invitedEmails": "string",
+    "invited_emails": "string",
     "count": "string",
-    "source": "string"
+    "source": "string",
+    "actor_type": "string"
   }
 }

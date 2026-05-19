@@ -1,4 +1,5 @@
 import { useBlockedActionsContext } from "@app/components/assistant/conversation/BlockedActionsProvider";
+import { ContextUsageWarningBanner } from "@app/components/assistant/conversation/ContextUsageWarningBanner";
 import { useGenerationContext } from "@app/components/assistant/conversation/GenerationContextProvider";
 import { InputBar } from "@app/components/assistant/conversation/input_bar/InputBar";
 import type {
@@ -7,24 +8,33 @@ import type {
 } from "@app/components/assistant/conversation/types";
 import {
   isAgentMessageWithStreaming,
+  isCompactionMessage,
   isHandoverUserMessage,
   isHiddenMessage,
   isUserMessage,
 } from "@app/components/assistant/conversation/types";
+import { WakeUpBanner } from "@app/components/assistant/conversation/WakeUpBanner";
 import { ProjectJoinCTA } from "@app/components/spaces/ProjectJoinCTA";
-import { useCancelMessage, useConversation } from "@app/hooks/conversations";
-import { useFeatureFlags } from "@app/lib/auth/AuthContext";
+import {
+  useCancelMessage,
+  useConversation,
+  useConversationContextUsage,
+} from "@app/hooks/conversations";
+import { CONTEXT_USAGE_PERCENT_THRESHOLDS } from "@app/hooks/conversations/useConversationContextUsage";
 import { useUnifiedAgentConfigurations } from "@app/lib/swr/assistants";
 import { useIsMobile } from "@app/lib/swr/useIsMobile";
+import { useConversationWakeUps } from "@app/lib/swr/wakeups";
 import { GLOBAL_AGENTS_SID } from "@app/types/assistant/assistant";
 import {
   isRichAgentMention,
+  isRichUserMention,
   toRichAgentMentionType,
 } from "@app/types/assistant/mentions";
 import { pluralize } from "@app/types/shared/utils/string_utils";
 import {
   ArrowDownIcon,
   ArrowUpIcon,
+  BoltIcon,
   Button,
   ContentMessageAction,
   ContentMessageInline,
@@ -37,17 +47,22 @@ import {
   useVirtuosoLocation,
   useVirtuosoMethods,
 } from "@virtuoso.dev/message-list";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 const MAX_DISTANCE_FOR_SMOOTH_SCROLL = 2048;
+const DOUBLE_ESC_WINDOW_MS = 300;
 
-export const AgentInputBar = ({
-  context,
-}: {
+interface AgentInputBarProps {
   context: VirtuosoMessageListContext;
-}) => {
+}
+
+export const AgentInputBar = ({ context }: AgentInputBarProps) => {
   const [blockedActionIndex, setBlockedActionIndex] = useState<number>(0);
-  const [isStopping, setIsStopping] = useState<boolean>(false);
+  const [pendingAction, setPendingAction] = useState<
+    "stop" | "interrupt" | null
+  >(null);
+  const pendingActionRef = useRef(pendingAction);
+  pendingActionRef.current = pendingAction;
   const generationContext = useGenerationContext();
   const { getBlockedActions, hasPendingValidations, startPulsingAction } =
     useBlockedActionsContext();
@@ -65,8 +80,6 @@ export const AgentInputBar = ({
   const agentBuilderContext = context.agentBuilderContext;
 
   const isMobile = useIsMobile();
-  const { hasFeature } = useFeatureFlags();
-  const singleAgentInput = hasFeature("enable_steering");
   const { agentConfigurations } = useUnifiedAgentConfigurations({
     workspaceId: context.owner.sId,
   });
@@ -91,75 +104,106 @@ export const AgentInputBar = ({
   // Last agent mentioned by anyone in the conversation. Computed outside useMemo so the
   // result is a stable object reference (same mention object from the message list) that
   // won't cause unnecessary recomputation of autoMentions when allMessages array ref changes.
-  const lastAgentMentionInConversation = singleAgentInput
-    ? (allMessages
-        .filter(isUserMessage)
-        .filter((m) => !isHandoverUserMessage(m) && m.visibility !== "deleted")
-        .findLast((m) => m.richMentions.some(isRichAgentMention))
-        ?.richMentions.find(isRichAgentMention) ?? null)
-    : null;
+  const lastAgentMentionInConversation =
+    allMessages
+      .filter(isUserMessage)
+      .filter((m) => !isHandoverUserMessage(m) && m.visibility !== "deleted")
+      .findLast((m) => m.richMentions.some(isRichAgentMention))
+      ?.richMentions.find(isRichAgentMention) ?? null;
 
   const draftAgent = agentBuilderContext?.draftAgent;
 
+  const { contextUsage, contextUsagePercentage } = useConversationContextUsage({
+    conversationId: context.conversation?.sId ?? "",
+    workspaceId: context.owner.sId,
+    options: { disabled: !context.conversation },
+  });
+
+  const isCompactionInProgress = allMessages.some(
+    (message) => isCompactionMessage(message) && message.status === "created"
+  );
+  const compactionBlockMessage = isCompactionInProgress
+    ? "Wait for compaction to finish."
+    : contextUsagePercentage >=
+        CONTEXT_USAGE_PERCENT_THRESHOLDS["force_compaction"]
+      ? "Context is full, compact to continue."
+      : null;
+  const showContextUsageBanner =
+    contextUsage &&
+    !!contextUsagePercentage &&
+    contextUsagePercentage >= CONTEXT_USAGE_PERCENT_THRESHOLDS["show_warning"];
+
+  const { activeWakeUp } = useConversationWakeUps({
+    owner: context.owner,
+    conversationId: context.conversation?.sId ?? "",
+    disabled: !context.conversation,
+  });
+
+  const isActiveWakeUpOwner = activeWakeUp?.user.sId === context.user.sId;
+  const wakeUpBlockMessage =
+    activeWakeUp && !isActiveWakeUpOwner
+      ? `You cannot send a message to an agent awaiting a wake-up set by another user`
+      : null;
+
   const autoMentions = useMemo(() => {
+    // If the user's last message contains only human mentions (no agent),
+    // prefill with just those human mentions.
+    const mentionsFromLastUserMessage = lastUserMessage?.richMentions ?? [];
+
+    if (
+      mentionsFromLastUserMessage.length > 0 &&
+      mentionsFromLastUserMessage.every(isRichUserMention)
+    ) {
+      return mentionsFromLastUserMessage;
+    }
+
     // If we are in the agent builder, we show the draft agent as the sticky mention, all the time.
     // Especially since the draft agent have a new sId every time it is updated.
     if (draftAgent) {
       return [toRichAgentMentionType(draftAgent)];
     }
 
-    // In single-agent mode, find the last agent mentioned in the conversation.
+    // Find the last agent mentioned in the conversation.
     // First from the current user's messages, then from anyone's messages.
-    if (singleAgentInput) {
-      const currentUserAgentMention =
-        lastUserMessage?.richMentions.find(isRichAgentMention);
-      if (
-        currentUserAgentMention &&
-        accessibleAgentIds.has(currentUserAgentMention.id)
-      ) {
-        return [currentUserAgentMention];
-      }
+    const currentUserAgentMention =
+      lastUserMessage?.richMentions.find(isRichAgentMention);
+    if (
+      currentUserAgentMention &&
+      accessibleAgentIds.has(currentUserAgentMention.id)
+    ) {
+      return [currentUserAgentMention];
+    }
 
-      // @sidekick is not available in accessibleAgentIds so we need to skip it
-      if (agentBuilderContext) {
-        return lastAgentMentionInConversation
-          ? [lastAgentMentionInConversation]
-          : [];
-      }
+    // @sidekick is not available in accessibleAgentIds so we need to skip it
+    if (agentBuilderContext) {
+      return lastAgentMentionInConversation
+        ? [lastAgentMentionInConversation]
+        : [];
+    }
 
-      if (
-        lastAgentMentionInConversation &&
-        accessibleAgentIds.has(lastAgentMentionInConversation.id)
-      ) {
-        return [lastAgentMentionInConversation];
-      }
+    if (
+      lastAgentMentionInConversation &&
+      accessibleAgentIds.has(lastAgentMentionInConversation.id)
+    ) {
+      return [lastAgentMentionInConversation];
+    }
 
-      // Ultimate fallback: select the "dust" agent if available.
+    // Fall back to @dust only for new conversations. In existing conversations
+    // where messages are still loading, don't default — wait for messages.
+    if (!context.conversation) {
       const dustAgent = agentConfigurations.find(
         (a) => a.sId === GLOBAL_AGENTS_SID.DUST
       );
       if (dustAgent) {
         return [toRichAgentMentionType(dustAgent)];
       }
-
-      return [];
-    }
-
-    // Non-steering mode: prefill all mentions if they are all agent mentions.
-    const shouldPrefill =
-      lastUserMessage &&
-      lastUserMessage.richMentions.length > 0 &&
-      lastUserMessage.richMentions.every(isRichAgentMention);
-
-    if (shouldPrefill) {
-      return lastUserMessage.richMentions;
     }
 
     return [];
   }, [
+    context.conversation,
     draftAgent,
     lastUserMessage,
-    singleAgentInput,
     lastAgentMentionInConversation,
     accessibleAgentIds,
     agentConfigurations,
@@ -255,6 +299,9 @@ export const AgentInputBar = ({
   }, [methods, listOffset, visibleListHeight, bottomOffset]);
 
   const blockedActions = getBlockedActions(context.user.sId);
+  const hasUserAnswerRequired = blockedActions.some(
+    (action) => action.status === "blocked_user_answer_required"
+  );
 
   // Keep blockedActionIndex in sync when blockedActions array changes.
   useEffect(() => {
@@ -266,21 +313,72 @@ export const AgentInputBar = ({
 
   useEffect(() => {
     if (
-      isStopping &&
-      generationContext &&
+      pendingAction !== null &&
       !generationContext.generatingMessages.some(
         (m) => m.conversationId === context.conversation?.sId
       )
     ) {
-      setIsStopping(false);
+      setPendingAction(null);
     }
-  }, [isStopping, generationContext, context.conversation]);
+  }, [pendingAction, generationContext, context.conversation]);
 
-  if (!generationContext) {
-    throw new Error(
-      "AssistantInputBarVirtuoso must be used within a GenerationContextProvider"
-    );
-  }
+  const lastEscTimeRef = useRef<number>(0);
+  const handleKeyDownRef = useRef<(e: KeyboardEvent) => void>(() => {});
+
+  // Updated on every render so the stable listener below always reads fresh values.
+  handleKeyDownRef.current = (e: KeyboardEvent) => {
+    if (e.key !== "Escape") {
+      return;
+    }
+    const cId = context.conversation?.sId ?? "";
+    const msgs = generationContext.getConversationGeneratingMessages(cId);
+    if (msgs.length === 0) {
+      return;
+    }
+    const hasPending =
+      (generationContext.pendingSteeringByConversation[cId] ?? 0) > 0;
+
+    const doAction = (action: "cancel" | "interrupt") => {
+      if (!context.conversation || pendingActionRef.current !== null) {
+        return;
+      }
+      const pending: "stop" | "interrupt" =
+        action === "interrupt" ? "interrupt" : "stop";
+      pendingActionRef.current = pending;
+      setPendingAction(pending);
+      const messageIds = generationContext.generatingMessages
+        .filter((m) => m.conversationId === context.conversation?.sId)
+        .map((m) => m.messageId);
+      generationContext.clearPendingSteeringCount(context.conversation.sId);
+      void cancelMessage(messageIds, action).then(() => {
+        setPendingAction(null);
+        mutateConversation();
+      });
+    };
+
+    const now = Date.now();
+    const timeSinceLastEscMs = now - lastEscTimeRef.current;
+    if (timeSinceLastEscMs < DOUBLE_ESC_WINDOW_MS) {
+      e.preventDefault();
+      lastEscTimeRef.current = 0;
+      doAction("cancel");
+    } else {
+      // Potential single ESC — wait to see if a second ESC follows.
+      e.preventDefault();
+      lastEscTimeRef.current = now;
+      setTimeout(() => {
+        if (lastEscTimeRef.current === now) {
+          doAction(hasPending ? "interrupt" : "cancel");
+        }
+      }, DOUBLE_ESC_WINDOW_MS);
+    }
+  };
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => handleKeyDownRef.current(e);
+    document.addEventListener("keydown", handler);
+    return () => document.removeEventListener("keydown", handler);
+  }, []);
 
   if (
     context.isProjectMember === false &&
@@ -305,28 +403,40 @@ export const AgentInputBar = ({
       context.conversation?.sId ?? ""
     );
 
+  const conversationId = context.conversation?.sId ?? "";
+  const hasPendingMessages =
+    (generationContext.pendingSteeringByConversation[conversationId] ?? 0) > 0;
+
   const showStopButton = generatingMessages.length > 0;
   const showMessageNavigation = !agentBuilderContext;
   const showNavigationContainer = showStopButton || showMessageNavigation;
 
   const getStopButtonLabel = () => {
-    if (isStopping) {
-      return "Stopping...";
+    if (pendingAction === "interrupt") {
+      return "Skipping…";
     }
-
+    if (pendingAction === "stop") {
+      return "Stopping…";
+    }
+    if (hasPendingMessages) {
+      return "Skip";
+    }
     return generatingMessages.length > 1 ? "Stop all" : "Stop";
   };
 
-  const handleStopGeneration = async () => {
+  const getConversationMessageIds = () =>
+    generationContext.generatingMessages
+      .filter((m) => m.conversationId === context.conversation?.sId)
+      .map((m) => m.messageId);
+
+  const handleAction = async (action: "cancel" | "interrupt") => {
     if (!context.conversation) {
       return;
     }
-    setIsStopping(true); // We don't set it back to false immediately cause it takes a bit of time to cancel.
-    await cancelMessage(
-      generationContext.generatingMessages
-        .filter((m) => m.conversationId === context.conversation?.sId)
-        .map((m) => m.messageId)
-    );
+    setPendingAction(action === "interrupt" ? "interrupt" : "stop");
+    generationContext.clearPendingSteeringCount(context.conversation.sId);
+    await cancelMessage(getConversationMessageIds(), action);
+    setPendingAction(null);
     void mutateConversation();
   };
 
@@ -334,7 +444,7 @@ export const AgentInputBar = ({
     return (
       <div className="mx-auto flex flex-col w-full py-4 sm:max-w-conversation">
         <EmptyCTA
-          message="This conversation belongs to an archived project. No new messages can be sent."
+          message="This conversation belongs to an archived Pod. No new messages can be sent."
           action={null}
         />
       </div>
@@ -353,7 +463,7 @@ export const AgentInputBar = ({
             className="flex items-center gap-1 rounded-xl border border-border bg-white p-1 dark:border-border-night dark:bg-muted-night"
             style={{
               position: "absolute",
-              top: "-2em",
+              top: "-2rem",
             }}
           >
             {showStopButton && (
@@ -361,9 +471,13 @@ export const AgentInputBar = ({
                 <Button
                   variant="ghost"
                   label={getStopButtonLabel()}
-                  icon={StopIcon}
-                  onClick={handleStopGeneration}
-                  disabled={isStopping}
+                  icon={hasPendingMessages ? BoltIcon : StopIcon}
+                  onClick={
+                    hasPendingMessages
+                      ? () => handleAction("interrupt")
+                      : () => handleAction("cancel")
+                  }
+                  disabled={pendingAction !== null}
                   size="xs"
                 />
                 {showMessageNavigation && (
@@ -435,6 +549,21 @@ export const AgentInputBar = ({
           )}
         </ContentMessageInline>
       )}
+      {showContextUsageBanner && (
+        <ContextUsageWarningBanner
+          owner={context.owner}
+          conversationId={context.conversation?.sId ?? ""}
+          contextUsage={contextUsage}
+        />
+      )}
+      {!showContextUsageBanner && activeWakeUp && context.conversation && (
+        <WakeUpBanner
+          wakeUp={activeWakeUp}
+          owner={context.owner}
+          conversationId={context.conversation.sId}
+          isOwner={isActiveWakeUpOwner}
+        />
+      )}
       <InputBar
         owner={context.owner}
         user={context.user}
@@ -442,11 +571,12 @@ export const AgentInputBar = ({
         stickyMentions={autoMentions}
         conversation={context.conversation}
         draftKey={context.draftKey}
-        disableAutoFocus={isMobile}
+        disableAutoFocus={isMobile || hasUserAnswerRequired}
         disableUserMentions={!!agentBuilderContext}
         actions={agentBuilderContext?.actionsToShow}
         isSubmitting={agentBuilderContext?.isSubmitting === true}
         isAgentBuilder={!!agentBuilderContext}
+        submitBlockMessage={wakeUpBlockMessage ?? compactionBlockMessage}
       />
     </div>
   );

@@ -1,4 +1,4 @@
-import type { PlanType, SubscriptionType } from "@app/types/plan";
+import type { PlanType } from "@app/types/plan";
 import type { WorkspaceType } from "@app/types/user";
 
 // Current free plans:
@@ -23,6 +23,11 @@ export const ENT_PLAN_FAKE_CODE = "ENT_PLAN_FAKE_CODE";
 
 // Dust's own workspace plan.
 export const DUST_COMPANY_PLAN_CODE = "DUST_COMPANY";
+
+/** Plan codes excluded from reinforcement-related batch operations. */
+export const REINFORCEMENT_EXCLUDED_PLAN_CODES = new Set([
+  FREE_TRIAL_PHONE_PLAN_CODE,
+]);
 
 // If the plan code starts with ENT_, it's an entreprise plan
 export const isEntreprisePlanPrefix = (planCode: string) =>
@@ -66,10 +71,6 @@ export function isBusinessPlan(plan?: PlanType) {
 
 export function isProOrBusinessPlanCode(plan?: PlanType) {
   return isProPlan(plan) || isBusinessPlan(plan);
-}
-
-export function isMetronomeBilled(subscription: SubscriptionType): boolean {
-  return subscription.metronomeContractId != null;
 }
 
 /**

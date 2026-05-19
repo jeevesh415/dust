@@ -111,13 +111,17 @@ async function setupTest({
   startDate = "2024-06-01",
   endDate = "2024-06-30",
   timezone,
+  format,
+  role = "admin",
 }: {
   table?: string;
   startDate?: string;
   endDate?: string;
   timezone?: string;
+  format?: string;
+  role?: "user" | "builder" | "admin";
 } = {}) {
-  const result = await createPublicApiMockRequest();
+  const result = await createPublicApiMockRequest({ role });
 
   const query: Record<string, string> = {
     wId: result.workspace.sId,
@@ -128,13 +132,16 @@ async function setupTest({
   if (timezone) {
     query.timezone = timezone;
   }
+  if (format) {
+    query.format = format;
+  }
 
   result.req.query = query;
   return result;
 }
 
 describe("GET /api/v1/w/[wId]/analytics/export", () => {
-  it("returns 200 for regular (builder) API key", async () => {
+  it("returns 200 for admin API key", async () => {
     const { req, res } = await setupTest();
 
     await handler(req, res);
@@ -142,8 +149,35 @@ describe("GET /api/v1/w/[wId]/analytics/export", () => {
     expect(res._getStatusCode()).toBe(200);
   });
 
+  // TODO(api-key-scopes): once builder keys are migrated to admin scope and the
+  // temporary fallback in export.ts is removed, change this to expect 403.
+  it("returns 200 for builder API key (temporary backward-compat)", async () => {
+    const { req, res } = await setupTest({ role: "builder" });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+  });
+
+  it("returns 403 for read-only API key (insufficient scope)", async () => {
+    const { req, res } = await setupTest({ role: "user" });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(403);
+    expect(res._getJSONData()).toEqual({
+      error: {
+        type: "insufficient_key_scope",
+        message:
+          "Workspace analytics export requires an API key with admin scope.",
+      },
+    });
+  });
+
   it("returns 400 for missing required query params", async () => {
-    const { req, res, workspace } = await createPublicApiMockRequest();
+    const { req, res, workspace } = await createPublicApiMockRequest({
+      role: "admin",
+    });
     req.query = { wId: workspace.sId };
 
     await handler(req, res);
@@ -182,6 +216,7 @@ describe("GET /api/v1/w/[wId]/analytics/export", () => {
     for (const method of ["POST", "PUT", "DELETE", "PATCH"] as const) {
       const result = await createPublicApiMockRequest({
         method,
+        role: "admin",
       });
       result.req.query = {
         wId: result.workspace.sId,
@@ -282,5 +317,148 @@ describe("GET /api/v1/w/[wId]/analytics/export", () => {
     );
     expect(csv).toContain("msg-1");
     expect(csv).toContain("alice@example.com");
+  });
+
+  it("returns typed JSON when format=json for usage_metrics", async () => {
+    const { req, res } = await setupTest({
+      table: "usage_metrics",
+      format: "json",
+    });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    expect(res.getHeader("Content-Type")).toBe("application/json");
+    const data = res._getJSONData();
+    expect(Array.isArray(data)).toBe(true);
+    expect(data[0]).toEqual({
+      date: "2024-06-01",
+      messages: 12,
+      conversations: 3,
+      activeUsers: 2,
+    });
+  });
+
+  it("returns typed JSON for active_users", async () => {
+    const { req, res } = await setupTest({
+      table: "active_users",
+      format: "json",
+    });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    const data = res._getJSONData();
+    expect(data[0]).toEqual({
+      date: "2024-06-01",
+      dau: 5,
+      wau: 10,
+      mau: 20,
+    });
+  });
+
+  it("returns typed JSON for source", async () => {
+    const { req, res } = await setupTest({
+      table: "source",
+      format: "json",
+    });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    const data = res._getJSONData();
+    expect(data[0]).toEqual({
+      date: "2024-06-01",
+      source: "web",
+      messageCount: 10,
+    });
+  });
+
+  it("returns typed JSON for agents", async () => {
+    const { req, res } = await setupTest({
+      table: "agents",
+      format: "json",
+    });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    const data = res._getJSONData();
+    expect(data[0]).toEqual({
+      agentId: "agent-123",
+      name: "TestAgent",
+      messages: 5,
+    });
+  });
+
+  it("returns typed JSON for users", async () => {
+    const { req, res } = await setupTest({
+      table: "users",
+      format: "json",
+    });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    const data = res._getJSONData();
+    expect(data[0]).toEqual({
+      userName: "Alice",
+      messageCount: 7,
+    });
+  });
+
+  it("returns typed JSON for messages", async () => {
+    const { req, res } = await setupTest({
+      table: "messages",
+      format: "json",
+    });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    const data = res._getJSONData();
+    expect(data[0]).toEqual({
+      messageId: "msg-1",
+      createdAt: "2024-06-01 10:00:00",
+      assistantId: "agent-1",
+      assistantName: "TestAgent",
+      assistantSettings: "published",
+      conversationId: "conv-1",
+      userId: "user-1",
+      userEmail: "alice@example.com",
+      source: "web",
+    });
+  });
+
+  it("returns CSV by default (no format param)", async () => {
+    const { req, res } = await setupTest({ table: "usage_metrics" });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    expect(res.getHeader("Content-Type")).toBe("text/csv");
+  });
+
+  it("returns CSV when format=csv", async () => {
+    const { req, res } = await setupTest({
+      table: "usage_metrics",
+      format: "csv",
+    });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    expect(res.getHeader("Content-Type")).toBe("text/csv");
+  });
+
+  it("returns 400 for invalid format value", async () => {
+    const { req, res } = await setupTest({
+      table: "usage_metrics",
+      format: "xml",
+    });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(400);
   });
 });

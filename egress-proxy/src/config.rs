@@ -1,8 +1,11 @@
-use crate::policy::TemporaryAllowlist;
+use crate::policy::DefaultAllowlist;
 use anyhow::{anyhow, Result};
 use clap::Parser;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
+
+const DEFAULT_POLICY_BASE_URL: &str = "https://storage.googleapis.com/storage/v1";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -11,7 +14,10 @@ pub struct Config {
     pub tls_cert_path: PathBuf,
     pub tls_key_path: PathBuf,
     pub jwt_secret: String,
-    pub temporary_allowlist: TemporaryAllowlist,
+    pub default_allowlist: Option<DefaultAllowlist>,
+    pub policy_bucket: String,
+    pub policy_base_url: String,
+    pub policy_cache_ttl: Duration,
     pub unsafe_skip_ssrf_check: bool,
 }
 
@@ -34,7 +40,20 @@ struct RawConfig {
     jwt_secret: String,
 
     #[arg(long, env = "EGRESS_PROXY_ALLOWED_DOMAINS")]
-    allowed_domains: String,
+    allowed_domains: Option<String>,
+
+    #[arg(long, env = "EGRESS_PROXY_POLICY_BUCKET")]
+    policy_bucket: String,
+
+    #[arg(long, env = "EGRESS_PROXY_POLICY_CACHE_TTL_SECS", default_value = "60")]
+    policy_cache_ttl_secs: u64,
+
+    #[arg(
+        long,
+        env = "EGRESS_PROXY_POLICY_BASE_URL",
+        default_value = DEFAULT_POLICY_BASE_URL
+    )]
+    policy_base_url: String,
 
     #[arg(long, env = "EGRESS_PROXY_ENV", default_value = "production")]
     environment: String,
@@ -57,9 +76,25 @@ impl TryFrom<RawConfig> for Config {
             return Err(anyhow!("EGRESS_PROXY_JWT_SECRET must not be empty"));
         }
 
-        // TODO(sandbox-egress): Remove EGRESS_PROXY_ALLOWED_DOMAINS when a later PR replaces the
-        // temporary process-wide allowlist with GCS-backed per-sandbox policies.
-        let temporary_allowlist = TemporaryAllowlist::parse(&raw.allowed_domains)?;
+        let default_allowlist = match raw.allowed_domains {
+            Some(ref value) if !value.trim().is_empty() => Some(DefaultAllowlist::parse(value)?),
+            _ => None,
+        };
+
+        if raw.policy_bucket.trim().is_empty() {
+            return Err(anyhow!("EGRESS_PROXY_POLICY_BUCKET must not be empty"));
+        }
+
+        if raw.policy_cache_ttl_secs == 0 {
+            return Err(anyhow!(
+                "EGRESS_PROXY_POLICY_CACHE_TTL_SECS must be greater than 0"
+            ));
+        }
+
+        let policy_base_url = raw.policy_base_url.trim().trim_end_matches('/').to_string();
+        if policy_base_url.is_empty() {
+            return Err(anyhow!("EGRESS_PROXY_POLICY_BASE_URL must not be empty"));
+        }
 
         // TODO(sandbox-egress): Remove this test-only bypass once integration tests can exercise
         // forwarding through a non-private deterministic upstream.
@@ -76,7 +111,10 @@ impl TryFrom<RawConfig> for Config {
             tls_cert_path: raw.tls_cert,
             tls_key_path: raw.tls_key,
             jwt_secret: raw.jwt_secret,
-            temporary_allowlist,
+            default_allowlist,
+            policy_bucket: raw.policy_bucket,
+            policy_base_url,
+            policy_cache_ttl: Duration::from_secs(raw.policy_cache_ttl_secs),
             unsafe_skip_ssrf_check,
         })
     }
@@ -95,7 +133,10 @@ fn parse_bool_env(value: Option<&str>) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_bool_env;
+    use super::{parse_bool_env, Config, RawConfig, DEFAULT_POLICY_BASE_URL};
+    use anyhow::Result;
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
 
     #[test]
     fn parses_bool_env() {
@@ -108,5 +149,41 @@ mod tests {
         assert!(parse_bool_env(Some("YES")).is_err());
         assert!(parse_bool_env(Some("NO")).is_err());
         assert!(parse_bool_env(Some("maybe")).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_policy_cache_ttl() {
+        assert!(Config::try_from(raw_config(|raw| {
+            raw.policy_cache_ttl_secs = 0;
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn trims_policy_base_url_trailing_slash() -> Result<()> {
+        let config = Config::try_from(raw_config(|raw| {
+            raw.policy_base_url = format!("{DEFAULT_POLICY_BASE_URL}/");
+        }))?;
+
+        assert_eq!(config.policy_base_url, DEFAULT_POLICY_BASE_URL);
+        Ok(())
+    }
+
+    fn raw_config(update: impl FnOnce(&mut RawConfig)) -> RawConfig {
+        let mut raw = RawConfig {
+            listen_addr: "0.0.0.0:4443".parse::<SocketAddr>().unwrap(),
+            health_addr: "0.0.0.0:8080".parse::<SocketAddr>().unwrap(),
+            tls_cert: PathBuf::from("tls.crt"),
+            tls_key: PathBuf::from("tls.key"),
+            jwt_secret: "secret".to_string(),
+            allowed_domains: None,
+            policy_bucket: "test-bucket".to_string(),
+            policy_cache_ttl_secs: 60,
+            policy_base_url: DEFAULT_POLICY_BASE_URL.to_string(),
+            environment: "production".to_string(),
+            unsafe_skip_ssrf_check: None,
+        };
+        update(&mut raw);
+        raw
     }
 }

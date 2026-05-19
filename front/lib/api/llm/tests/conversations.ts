@@ -422,7 +422,9 @@ export const runConversation = async (
           totalTokens = event.content.totalTokens ?? null;
           break;
         case "error":
-          throw new Error(`LLM Error: ${event.content.message}`);
+          throw new Error(
+            `LLM Error: ${event.content.message}, from conversation ${JSON.stringify(conversation)}`
+          );
         case "tool_call":
           const metadata = event.metadata.thoughtSignature
             ? { thoughtSignature: event.metadata.thoughtSignature }
@@ -452,7 +454,7 @@ export const runConversation = async (
       }
     }
 
-    expect(fullResponse, "Full response should match deltas").toBe(
+    expect(fullResponse.trim(), "Full response should match deltas").toBe(
       responseFromDeltas.trim()
     );
     if (reasoningFromDeltas.length > 0) {

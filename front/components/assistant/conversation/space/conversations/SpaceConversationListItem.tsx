@@ -1,10 +1,12 @@
 import { useAppRouter } from "@app/lib/platform";
 import { getConversationRoute } from "@app/lib/utils/router";
-import type { LightConversationType } from "@app/types/assistant/conversation";
 import {
+  getConversationDisplayTitle,
   isCompactionMessageType,
   isLightAgentMessageType,
   isUserMessageTypeWithContentFragments,
+  isVisibleMessage,
+  type LightConversationType,
 } from "@app/types/assistant/conversation";
 import { assertNeverAndIgnore } from "@app/types/shared/utils/assert_never";
 import { stripMarkdown } from "@app/types/shared/utils/string_utils";
@@ -20,18 +22,6 @@ import { isMessageUnread } from "../../utils";
 interface SpaceConversationListItemProps {
   conversation: LightConversationType;
   owner: WorkspaceType;
-}
-
-function isVisibleMessage(
-  m: LightConversationType["content"][number]
-): boolean {
-  return (
-    m.visibility !== "deleted" &&
-    !(isUserMessageTypeWithContentFragments(m) && isHiddenMessage(m)) &&
-    // Compaction message will possibly be first messages of a conversation (forking) but they are
-    // not "visible" per se. `firstVisibleMessage` should null until a first user message is posted.
-    !isCompactionMessageType(m)
-  );
 }
 
 export function SpaceConversationListItem({
@@ -93,11 +83,7 @@ export function SpaceConversationListItem({
     return null;
   }
 
-  const conversationLabel =
-    conversation.title ??
-    (moment(conversation.created).isSame(moment(), "day")
-      ? "New Conversation"
-      : `Conversation from ${new Date(conversation.created).toLocaleDateString()}`);
+  const conversationLabel = getConversationDisplayTitle(conversation);
 
   const time = moment(conversation.updated).fromNow();
 
@@ -125,7 +111,8 @@ export function SpaceConversationListItem({
   return (
     <>
       <ConversationListItem
-        key={conversation.id}
+        className="border-t-0 border-b-0"
+        key={conversation.sId}
         conversation={{
           id: conversation.sId,
           title: conversationLabel,

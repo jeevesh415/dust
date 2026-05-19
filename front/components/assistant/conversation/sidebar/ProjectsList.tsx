@@ -4,6 +4,7 @@ import {
 } from "@app/components/assistant/conversation/ProjectMenu";
 import { SidebarContext } from "@app/components/sparkle/SidebarContext";
 import { useConversation } from "@app/hooks/conversations";
+import { useSpaceConversations } from "@app/hooks/conversations/useSpaceConversations";
 import { useActiveConversationId } from "@app/hooks/useActiveConversationId";
 import { useAppRouter } from "@app/lib/platform";
 import { getSpaceIcon } from "@app/lib/spaces";
@@ -19,12 +20,14 @@ import { memo, useCallback, useContext, useRef, useState } from "react";
 const ProjectListItem = memo(
   ({
     space,
+    isStarred,
     unreadCount,
     hasUnread,
     owner,
     moveConversationToProject,
   }: {
     space: SpaceType;
+    isStarred: boolean;
     unreadCount: number;
     hasUnread: boolean;
     owner: WorkspaceType;
@@ -47,6 +50,28 @@ const ProjectListItem = memo(
       conversationId: activeConversationId,
       workspaceId: owner.sId,
     });
+
+    const { mutateConversations: mutateAllConversations } =
+      useSpaceConversations({
+        workspaceId: owner.sId,
+        spaceId: space.sId,
+        filter: "all",
+        options: { disabled: true },
+      });
+    const { mutateConversations: mutateWithMeConversations } =
+      useSpaceConversations({
+        workspaceId: owner.sId,
+        spaceId: space.sId,
+        filter: "with_me",
+        options: { disabled: true },
+      });
+    const { mutateConversations: mutateGroupConversations } =
+      useSpaceConversations({
+        workspaceId: owner.sId,
+        spaceId: space.sId,
+        filter: "group",
+        options: { disabled: true },
+      });
 
     const isSpaceSelected =
       router.asPath.startsWith(spacePath) ||
@@ -88,13 +113,27 @@ const ProjectListItem = memo(
             const conversationObj = JSON.parse(
               conversationData
             ) as ConversationWithoutContentType;
-            await moveConversationToProject(conversationObj, space);
+            const success = await moveConversationToProject(
+              conversationObj,
+              space
+            );
+            if (success) {
+              void mutateAllConversations();
+              void mutateWithMeConversations();
+              void mutateGroupConversations();
+            }
           }
         } catch (error) {
           console.error("Error parsing conversation data:", error);
         }
       },
-      [moveConversationToProject, space]
+      [
+        moveConversationToProject,
+        space,
+        mutateAllConversations,
+        mutateWithMeConversations,
+        mutateGroupConversations,
+      ]
     );
 
     return (
@@ -107,6 +146,8 @@ const ProjectListItem = memo(
         icon={getSpaceIcon(space)}
         selected={isSpaceSelected && !isDragOver}
         label={space.name}
+        href={spacePath}
+        shallow
         hasActivity={hasUnread}
         count={unreadCount > 0 ? unreadCount : undefined}
         onClick={async () => {
@@ -116,15 +157,13 @@ const ProjectListItem = memo(
             // Wait a bit before moving to the new space to avoid the sidebar from flickering.
             await new Promise((resolve) => setTimeout(resolve, 600));
           }
-          await router.push(spacePath, undefined, {
-            shallow: true,
-          });
         }}
         moreMenu={
           <ProjectMenu
             activeSpaceId={space.sId}
             space={space}
             owner={owner}
+            isStarred={isStarred}
             trigger={<NavigationListItemAction />}
             isProjectDisplayed={activeConversationId === space.sId}
             isOpen={isMenuOpen}
@@ -174,6 +213,7 @@ export function renderProjectsList({
       <ProjectListItem
         key={space.sId}
         space={space}
+        isStarred={space.isStarred}
         unreadCount={unreadConversations.length}
         hasUnread={
           unreadConversations.length > 0 ||

@@ -1,9 +1,4 @@
 export const WHITELISTABLE_FEATURES_CONFIG = {
-  skill_builder_instructions_html: {
-    description:
-      "Enable HTML-backed instructions in the skill builder (block IDs, HTML round-trip storage)",
-    stage: "dust_only",
-  },
   advanced_notion_management: {
     description:
       "Advanced features for Notion workspace management shown to admins",
@@ -13,9 +8,9 @@ export const WHITELISTABLE_FEATURES_CONFIG = {
     description: "Fallback to Vertex Anthropic for some Anthropic models",
     stage: "dust_only",
   },
-  ask_user_question_tool: {
+  use_vertex_for_anthropic_models: {
     description:
-      "Enable ask_user_question tool for agents to ask users questions",
+      "Route Claude model LLM calls through Vertex AI instead of the direct Anthropic API",
     stage: "dust_only",
   },
   audit_logs: {
@@ -182,10 +177,6 @@ export const WHITELISTABLE_FEATURES_CONFIG = {
       "Enable splitting agent responses into multiple Slack messages for Slack (instead of truncation)",
     stage: "dust_only",
   },
-  slack_bot_mcp: {
-    description: "Slack bot MCP server for workspace-level Slack integration",
-    stage: "on_demand",
-  },
   legacy_dust_apps: {
     description: "Access to legacy Dust Apps (editor and associated tools)",
     stage: "on_demand",
@@ -209,8 +200,8 @@ export const WHITELISTABLE_FEATURES_CONFIG = {
     stage: "dust_only",
   },
   projects: {
-    description: "Enable use Spaces as Projects",
-    stage: "dust_only",
+    description: "Enable the Projects feature",
+    stage: "on_demand",
   },
   databricks_tool: {
     description: "Databricks MCP tool",
@@ -221,12 +212,23 @@ export const WHITELISTABLE_FEATURES_CONFIG = {
       "Sandbox MCP tool for executing code in isolated Linux containers",
     stage: "dust_only",
   },
-  run_tools_from_prompt: {
-    description: "Enable /run command to directly call tools without LLM",
+  sandbox_dsbx_tools: {
+    description:
+      "Programmatic access to MCP tools from inside the sandbox via the dsbx CLI",
     stage: "dust_only",
   },
-  project_todo: {
-    description: "Enable project todo tab (todos and what's new digest)",
+  sandbox_workspace_admin: {
+    description:
+      "Workspace admin configuration for the sandbox: whitelisted domains, environment variables, and the agent egress request setting/tool",
+    stage: "dust_only",
+  },
+  skills_as_user_messages: {
+    description:
+      "Render skills in assistant conversations as synthetic user messages instead of in the system prompt",
+    stage: "dust_only",
+  },
+  run_tools_from_prompt: {
+    description: "Enable /run command to directly call tools without LLM",
     stage: "dust_only",
   },
   conversations_slack_notifications: {
@@ -239,14 +241,6 @@ export const WHITELISTABLE_FEATURES_CONFIG = {
     // Not really on_demand but we want to be able to enable it for customers
     stage: "on_demand",
   },
-  conversation_branches: {
-    description: "Enable conversation branches",
-    stage: "dust_only",
-  },
-  sessions_branching: {
-    description: "Enable sessions branching",
-    stage: "dust_only",
-  },
   reinforced_agents: {
     description:
       "Enable reinforcement: background analysis of conversations to suggest improvements to skills.",
@@ -255,6 +249,11 @@ export const WHITELISTABLE_FEATURES_CONFIG = {
   reinforcement_ui: {
     description:
       "Enable the reinforcement suggestions UI panel in the Skills Builder.",
+    stage: "dust_only",
+  },
+  self_improving_skills_report_usage: {
+    description:
+      "Report reinforcement LLM costs to Metronome, ES analytics, and programmatic usage tracking.",
     stage: "dust_only",
   },
   collapsible_messages: {
@@ -270,13 +269,19 @@ export const WHITELISTABLE_FEATURES_CONFIG = {
       "Enable Metronome usage event emission (llm_usage, tool_use) for this workspace.",
     stage: "dust_only",
   },
-  gong_tool: {
-    description: "Gong MCP tool for sales conversation analytics",
+  clari_copilot_mcp: {
+    description:
+      "Enable the Clari Copilot MCP server for call transcript and summary access.",
+    stage: "on_demand",
+  },
+  plan_mode: {
+    description:
+      "Enable the Plan Mode skill: agents maintain a live plan.md for non-trivial tasks, with an optional human-approval checkpoint.",
     stage: "dust_only",
   },
-  official_notion_mcp: {
+  allow_old_notion_mcp: {
     description:
-      "Use the official Notion MCP server instead of the internal one",
+      "Allow individual workspaces to keep using the old internal Notion MCP server alongside the official one",
     stage: "dust_only",
   },
   use_dust_keys: {
@@ -289,14 +294,33 @@ export const WHITELISTABLE_FEATURES_CONFIG = {
     description: "Dummy feature flag used for testing feature flag behavior",
     stage: "dust_only",
   },
-  enable_compaction: {
+  browser_extension_mcp_tools: {
     description:
-      "Enable context compaction: summarize older messages to free up context window",
+      "Show the browser extension MCP tools toggle in workspace access settings",
     stage: "dust_only",
   },
-  enable_steering: {
+  sensitivity_labels: {
     description:
-      "Enable steering: pending user messages + graceful stop of running agent loops",
+      "Enable Microsoft sensitivity labels for data classification on connectors and MCP servers",
+    stage: "on_demand",
+  },
+  conversation_search_indexing: {
+    description: "Enable ES indexing of conversations on mutation (write path)",
+    stage: "dust_only",
+  },
+  conversation_search_read: {
+    description:
+      "Enable ES-backed conversation listing in the sidebar (read path)",
+    stage: "dust_only",
+  },
+  new_file_explorer: {
+    description:
+      "Unified GCS-backed file explorer with folder hierarchy, replacing the two-tab files panel.",
+    stage: "dust_only",
+  },
+  metronome_billing_usage_page: {
+    description:
+      "Enable the new Usage admin page with credit pool display and workspace usage management.",
     stage: "dust_only",
   },
 } as const satisfies Record<string, FeatureFlag>;

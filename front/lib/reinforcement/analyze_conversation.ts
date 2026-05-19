@@ -1,8 +1,9 @@
-import { getShrinkWrappedConversation } from "@app/lib/api/assistant/conversation/shrink_wrap";
+import { renderConversationAsTextWithFeedback } from "@app/lib/api/assistant/conversation/render_conversation_with_feedback";
 import type { LLMStreamParameters } from "@app/lib/api/llm/types/options";
 import type { Authenticator } from "@app/lib/auth";
 import { formatSkillContext } from "@app/lib/reinforcement/format_skill_context";
 import { buildReinforcedSkillsLLMParams } from "@app/lib/reinforcement/run_reinforced_analysis";
+import { SKILL_INSTRUCTION_HTML_EDIT_PROMPT } from "@app/lib/reinforcement/skill_instruction_edit_prompt";
 import { SkillResource } from "@app/lib/resources/skill/skill_resource";
 import logger from "@app/logger/logger";
 import type { SkillType } from "@app/types/assistant/skill_configuration";
@@ -13,7 +14,9 @@ const ASSEMBLY_ORDER = [
   "analysis_workflow",
   "conversation_analysis",
   "instructions_guidance",
+  "instruction_editing",
   "tools_guidance",
+  "agent_facing_description_guidance",
 ] as const;
 
 type SectionKey = (typeof ASSEMBLY_ORDER)[number];
@@ -32,10 +35,14 @@ In most conversations, the correct outcome is no configuration change. This mean
 Propose configuration changes only when <analysis_workflow> yields concrete evidence. If you are unsure, do not call edit_skill.
 
 ## Exploration tools (optional — use these if you need more context)
-- get_available_tools: Lists all tools (MCP servers) available in the workspace. Use this to discover tools you could suggest adding or to verify that suggested tools exist.
-- describe_mcp: Returns detailed information about a specific MCP server: its tools, each tool's description, and input parameters. ALWAYS call this before suggesting instruction changes that reference specific tool names or workflows for a given MCP — you need to know the exact tool names and their inputs to write accurate instructions.
+- get_available_tools: Use this to discover tools you could suggest adding or to verify that suggested tools exist.
+- describe_mcp: ALWAYS call this before suggesting instruction changes that reference specific tool names or workflows for a given MCP — you need to know the exact tool names and their inputs to write accurate instructions.
+- search_knowledge: ALWAYS call this before embedding any <knowledge> tag in an instruction edit — the tag requires node attributes (id, space, dsv, hasChildren) that must come from this tool. Use this whenever the conversation shows the agent navigating or retrieving specific data nodes that the skill instructions should directly reference. See <knowledge_nodes> for more details.
 `,
 
+  // TODO(2026-04-29 aubin): switch the 2nd line of `skill_usage_analysis` when ungating the new skill rendering
+  // Proposal: "When enabled, skill instructions may be rendered into the conversation as dedicated <dust_system> user messages.
+  // This means that every subsequent agent action can be influenced by each enabled skill in addition to the agent's system prompt."
   skill_usage_analysis: `In <skill_context>, you have received all custom skills that were enabled in the conversation.
 Skills are injected into the agent's system prompt when enabled. This means that every subsequent agent action is influenced by each enabled skill in addition to the agent's system prompt.
 The only strong signal of skill influence on the agent behavior is when the agent calls a tool that the skill provides.
@@ -63,6 +70,7 @@ ALWAYS ensure that the suggestion is inline with the skill's purpose and instruc
 Consider the following improvements to a skill:
 - Review instructions to determine if the skill is meeting the user intent and properly utilizing the configured tools: <instructions_guidance>.
 - If the skill references or requires external actions or knowledge, then tools may need to be added or removed. See <tools_guidance>.
+- If the conversation reveals that the agent enabled the skill in the wrong situation, or failed to enable it when it should have, the agent-facing description may need to be improved. See <agent_facing_description_guidance>.
 All improvements that should be treated as a single atomic unit should be grouped together in a single suggestion.
 NEVER group things that are not related to each other.
 
@@ -72,14 +80,14 @@ Evaluate if any suggestions could improve the behavior of ALL agents and users u
 
 Step 6: Build a final plan for skill suggestions. You MUST include an "analysis" field explaining why this change would improve the skill.
 This MUST include the signal that was discovered in <conversation_analysis> that led to the suggestion.
-Subsequently, an aggregation workflow will use this analysis to determine which suggestions are most impactful.
+You MUST follow <instruction_editing> when formatting instruction edits.
 
 Step 7: Make suggestions.
 ONLY make suggestions that will affect the skill behavior. NEVER suggest cosmetic-only fixes.
 `,
 
-  conversation_analysis: `ALWAYS inspect the full conversation, which is a chronological timeline of messages. Each message has an index, sId, sender (user or agent name), actions, and content. Here are key signals of areas where the agent behavior could be improved:
-1. Feedback - If the user provided feedback, it will be included with each message in the form of thumbs up/down and comments. This is the MOST important signal as it is directly provided by the user and an explicit signal.
+  conversation_analysis: `ALWAYS inspect the full conversation, which is a chronological timeline of messages. Agent messages may include an Actions section listing tool calls with their inputs and outputs, and a User feedback section with sentiment and comments. Here are key signals of areas where the agent behavior could be improved:
+1. Feedback - If the user provided feedback, it will be included after the agent message in a "User feedback:" section with thumbs up/down ratings and optional comments. This is the MOST important signal as it is directly provided by the user and an explicit signal.
 2. User reaction - Any user indication of confusion, disagreement, or correction is a signal of dissatisfaction. A user follow-up question or request could mean the skill response was useful, but a skill could be improved in terms of proactively providing that information or performing the action without user intervention.
 3. Tool calls - If the tool calls needed to be retried, could a skill's instructions be more clear on how to use that tool?
 4. Sequence - Did the agent call the tools in the correct order?
@@ -95,6 +103,8 @@ ONLY make suggestions that will affect the skill behavior. NEVER suggest cosmeti
 - Extract the INTENT from examples, not the literal pattern.
 - Filter out information only relevant for humans, not the LLM.`,
 
+  instruction_editing: SKILL_INSTRUCTION_HTML_EDIT_PROMPT,
+
   tools_guidance: `Tools provide capabilities to the skill. When evaluating tool changes:
 
 - Discover available tools by calling get_available_tools.
@@ -102,6 +112,19 @@ ONLY make suggestions that will affect the skill behavior. NEVER suggest cosmeti
 - Only suggest removing a tool if there is clear evidence the tool is causing confusion or is unused and cluttering the skill configuration.
 - When suggesting a tool addition, ensure the tool exists in the workspace by checking available tools first.
 - When the conversation involves a tool call that failed or produced unexpected results, call describe_mcp for the relevant MCP to understand the full list of available tools and their correct usage before suggesting instruction changes.`,
+
+  agent_facing_description_guidance: `The agent-facing description (\`<agentFacingDescription>\` in the skill context) is what the agent reads to decide WHEN to enable the skill. It is NOT the skill's behavior — that lives in \`<instructions>\`.
+
+Suggest editing it only when the conversation surfaces clear evidence of a routing problem:
+- The agent enabled the skill in a situation it does not actually cover.
+- The agent failed to enable the skill in a situation that should obviously have triggered it.
+- The current description is misleading, vague, or incomplete in a way that explains the routing mistake.
+
+When suggesting a description edit:
+- Provide the FULL replacement text in \`agentFacingDescriptionEdit.content\` — it overwrites the existing description.
+- Preserve the skill's actual purpose. Sharpen the trigger conditions; do not redefine the skill.
+- Keep it focused on routing signals (when to use, what scenarios). Do not duplicate the instructions.
+- Use the same language as the existing description.`,
 };
 
 export function buildSkillAnalysisSystemPrompt(): string {
@@ -153,9 +176,8 @@ export async function buildSkillConversationAnalysisBatchMap(
   const skillById = new Map(skills.map((s) => [s.sId, s]));
 
   for (const { conversationId, skillIds } of conversationsWithSkills) {
-    const conversationRes = await getShrinkWrappedConversation(auth, {
+    const conversationRes = await renderConversationAsTextWithFeedback(auth, {
       conversationId,
-      includeFeedback: true,
       includeActionDetails: true,
     });
     if (conversationRes.isErr()) {
@@ -184,7 +206,13 @@ export async function buildSkillConversationAnalysisBatchMap(
       conversationRes.value.text,
       skillTypes
     );
-    batchMap.set(conversationId, buildReinforcedSkillsLLMParams(prompt));
+    batchMap.set(
+      conversationId,
+      buildReinforcedSkillsLLMParams(
+        prompt,
+        "reinforcement_analyze_conversation"
+      )
+    );
   }
 
   if (batchMap.size === 0) {

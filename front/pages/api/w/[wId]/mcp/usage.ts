@@ -1,4 +1,5 @@
 /** @ignoreswagger */
+// @migration-status: MIGRATED_TO_HONO
 import type { MCPServersUsageByAgent } from "@app/lib/api/agent_actions";
 import { getToolsUsage } from "@app/lib/api/agent_actions";
 import { withSessionAuthenticationForWorkspace } from "@app/lib/api/auth_wrappers";

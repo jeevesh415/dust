@@ -1,4 +1,5 @@
 import { shouldForceClientReload } from "@app/lib/api/force_client_reload";
+import { queryTracker } from "@app/lib/api/query_tracker";
 import type { BearerTokenError } from "@app/lib/auth";
 import { getSession, getSessionFromBearerToken } from "@app/lib/auth";
 import type { SessionWithUser } from "@app/lib/iam/provider";
@@ -118,7 +119,9 @@ export function withLogging<T>(
 
     // Try bearer token first, then fall back to cookie-based session.
     const sessionResult = await tracer.trace("auth.getSession", async () => {
-      const bearerTokenRes = await getSessionFromBearerToken(req);
+      const bearerTokenRes = await getSessionFromBearerToken(
+        req.headers.authorization
+      );
       if (bearerTokenRes.isErr() || bearerTokenRes.value) {
         return bearerTokenRes;
       }
@@ -175,16 +178,44 @@ export function withLogging<T>(
     const cliVersion =
       req.headers["x-dust-cli-version"] ?? req.query.cliVersion;
 
+    // Key the browser cache by X-Commit-Hash
+    res.setHeader("Vary", "X-Commit-Hash");
+
     if (typeof commitHash === "string" && commitHash.length > 0) {
       if (await shouldForceClientReload(commitHash)) {
+        logger.info(
+          {
+            clientIp,
+            cliVersion,
+            commitHash,
+            method: req.method,
+            route,
+            sessionId,
+            url: req.url,
+            workspaceId,
+            ...req.logContext,
+          },
+          "Force client reload"
+        );
         res.setHeader("X-Reload-Required", "true");
+        // Flagged-commit responses must never be cached: the flag can be
+        // cleared in Redis at any time, but a cached "true" response would
+        // keep the tab in a reload loop until it expires.
+        res.setHeader("Cache-Control", "no-store");
+      } else {
+        // Always emit an explicit "false" so 304 revalidations can heal
+        // poisoned cache entries: per HTTP spec, the browser merges 304
+        // response headers into the stored entry. If we leave the header
+        // off, a cached "true" persists forever across revalidations.
+        res.setHeader("X-Reload-Required", "false");
       }
     }
 
+    const queryTrackerStore = { concurrent: 0, peak: 0 };
     try {
-      await handler(req, res, {
-        session,
-      });
+      await queryTracker.run(queryTrackerStore, () =>
+        handler(req, res, { session })
+      );
     } catch (err) {
       const elapsed = new Date().getTime() - now.getTime();
       const error = normalizeError(err);
@@ -199,6 +230,7 @@ export function withLogging<T>(
           durationMs: elapsed,
           extensionVersion,
           method: req.method,
+          peakConcurrentQueries: queryTrackerStore.peak,
           route,
           sessionId,
           streaming,
@@ -260,6 +292,7 @@ export function withLogging<T>(
         durationMs: elapsed,
         extensionVersion,
         method: req.method,
+        peakConcurrentQueries: queryTrackerStore.peak,
         route,
         sessionId,
         statusCode: res.statusCode,
@@ -339,8 +372,11 @@ export function withGetServerSidePropsLogging<
       }
     }
 
+    const queryTrackerStore = { concurrent: 0, peak: 0 };
     try {
-      const res = await getServerSideProps(context, auth, session);
+      const res = await queryTracker.run(queryTrackerStore, () =>
+        getServerSideProps(context, auth, session)
+      );
 
       const elapsed = new Date().getTime() - now.getTime();
 
@@ -373,6 +409,7 @@ export function withGetServerSidePropsLogging<
           route,
           durationMs: elapsed,
           clientIp,
+          peakConcurrentQueries: queryTrackerStore.peak,
         },
         "Processed getServerSideProps"
       );
@@ -391,6 +428,7 @@ export function withGetServerSidePropsLogging<
           url: context.resolvedUrl,
           route,
           clientIp,
+          peakConcurrentQueries: queryTrackerStore.peak,
           error: {
             name: error.name,
             message: error.message,

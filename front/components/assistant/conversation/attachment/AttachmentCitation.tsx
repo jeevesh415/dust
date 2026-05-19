@@ -6,6 +6,10 @@ import {
 } from "@app/components/assistant/conversation/attachment/utils";
 import { ConversationSidePanelContext } from "@app/components/assistant/conversation/ConversationSidePanelContext";
 import {
+  FilePreviewSheet,
+  type MinimalFileForPreview,
+} from "@app/components/spaces/FilePreviewSheet";
+import {
   getFileFormat,
   isInteractiveContentType,
   isSupportedImageContentType,
@@ -38,6 +42,10 @@ export function AttachmentCitation({
   compact,
 }: AttachmentCitationProps) {
   const [viewerOpen, setViewerOpen] = useState(false);
+  const [previewFile, setPreviewFile] = useState<MinimalFileForPreview | null>(
+    null
+  );
+  const [showPreviewSheet, setShowPreviewSheet] = useState(false);
   const sidePanel = useContext(ConversationSidePanelContext);
 
   const tooltipContent =
@@ -63,18 +71,32 @@ export function AttachmentCitation({
   const isLoading =
     attachmentCitation.type === "file" && attachmentCitation.isUploading;
 
+  const fileResourceId =
+    attachmentCitation.type === "file" && attachmentCitation.fileId
+      ? attachmentCitation.fileId
+      : null;
+
   const canOpenInDialog =
     attachmentCitation.type === "file" &&
+    fileResourceId !== null &&
     getFileFormat(attachmentCitation.contentType)?.isSafeToDisplay &&
     (isTextualContentType(attachmentCitation) ||
       isAudioContentType(attachmentCitation));
 
   const canOpenInteractivePanel =
     attachmentCitation.type === "file" &&
-    Boolean(attachmentCitation.fileId) &&
+    fileResourceId !== null &&
     !attachmentCitation.isUploading &&
     isInteractiveContentType(attachmentCitation.contentType) &&
     sidePanel != null;
+
+  const canOpenInSheet =
+    attachmentCitation.type === "file" &&
+    fileResourceId !== null &&
+    !attachmentCitation.isUploading &&
+    !canOpenInteractivePanel &&
+    !canOpenInDialog &&
+    !isImage;
 
   const dialogOrDownloadProps = canOpenInteractivePanel
     ? {
@@ -82,7 +104,7 @@ export function AttachmentCitation({
           e.preventDefault();
           sidePanel.openPanel({
             type: "interactive_content",
-            fileId: attachmentCitation.fileId as string,
+            fileId: fileResourceId,
           });
         },
       }
@@ -95,9 +117,24 @@ export function AttachmentCitation({
         }
       : isImage
         ? {} // ImagePreview handles click with its own zoom dialog
-        : {
-            href: attachmentCitation.sourceUrl ?? undefined,
-          };
+        : canOpenInSheet
+          ? {
+              onClick: (e: React.MouseEvent<HTMLDivElement>) => {
+                e.preventDefault();
+                if (!fileResourceId) {
+                  return;
+                }
+                setPreviewFile({
+                  sId: fileResourceId,
+                  fileName: attachmentCitation.title,
+                  contentType: attachmentCitation.contentType,
+                });
+                setShowPreviewSheet(true);
+              },
+            }
+          : {
+              href: attachmentCitation.sourceUrl ?? undefined,
+            };
 
   return (
     <>
@@ -158,6 +195,14 @@ export function AttachmentCitation({
           viewerOpen={viewerOpen}
           attachmentCitation={attachmentCitation}
           owner={owner}
+        />
+      )}
+      {canOpenInSheet && (
+        <FilePreviewSheet
+          owner={owner}
+          file={previewFile}
+          isOpen={showPreviewSheet}
+          onOpenChange={setShowPreviewSheet}
         />
       )}
     </>

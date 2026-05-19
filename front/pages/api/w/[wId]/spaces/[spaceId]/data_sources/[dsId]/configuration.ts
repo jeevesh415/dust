@@ -1,4 +1,5 @@
 /** @ignoreswagger */
+// @migration-status: MIGRATED_TO_HONO
 import { withSessionAuthenticationForWorkspace } from "@app/lib/api/auth_wrappers";
 import config from "@app/lib/api/config";
 import { withResourceFetchingFromRoute } from "@app/lib/api/resource_wrappers";
@@ -14,8 +15,8 @@ import {
   UpdateConnectorConfigurationTypeSchema,
 } from "@app/types/connectors/connectors_api";
 import type { WithAPIErrorResponse } from "@app/types/error";
-import { ioTsParsePayload } from "@app/types/shared/utils/iots_utils";
 import type { NextApiRequest, NextApiResponse } from "next";
+import { fromError } from "zod-validation-error";
 
 export type GetDataSourceConfigurationResponseBody = {
   configuration: ConnectorConfiguration;
@@ -96,23 +97,22 @@ async function handler(
         });
       }
 
-      const parseRes = ioTsParsePayload(
-        req.body,
-        UpdateConnectorConfigurationTypeSchema
+      const parseRes = UpdateConnectorConfigurationTypeSchema.safeParse(
+        req.body
       );
-      if (parseRes.isErr()) {
+      if (!parseRes.success) {
         return apiError(req, res, {
           status_code: 400,
           api_error: {
             type: "invalid_request_error",
-            message: `Invalid request body: ${parseRes.error}`,
+            message: `Invalid request body: ${fromError(parseRes.error).toString()}`,
           },
         });
       }
 
       const updateRes = await connectorsAPI.updateConfiguration({
         connectorId: dataSource.connectorId.toString(),
-        configuration: { configuration: parseRes.value.configuration },
+        configuration: { configuration: parseRes.data.configuration },
       });
       if (updateRes.isErr()) {
         return apiError(

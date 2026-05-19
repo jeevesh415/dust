@@ -1,7 +1,9 @@
 /** @ignoreswagger */
+// @migration-status: MIGRATED_TO_HONO
 import { withSessionAuthenticationForWorkspace } from "@app/lib/api/auth_wrappers";
 import type { Authenticator } from "@app/lib/auth";
-import { hasReinforcementEnabled } from "@app/lib/reinforced_agent/workspace_check";
+import { postSkillSuggestionStatusUpdate } from "@app/lib/reinforcement/aggregate_suggestions";
+import { hasReinforcementEnabled } from "@app/lib/reinforcement/workspace_check";
 import { SkillResource } from "@app/lib/resources/skill/skill_resource";
 import { SkillSuggestionResource } from "@app/lib/resources/skill_suggestion_resource";
 import { apiError } from "@app/logger/withlogging";
@@ -146,7 +148,8 @@ async function handler(
           status_code: 400,
           api_error: {
             type: "invalid_request_error",
-            message: "Reinforcement is not enabled for this workspace.",
+            message:
+              "Self-improving skills are not enabled for this workspace.",
           },
         });
       }
@@ -195,6 +198,10 @@ async function handler(
       }
 
       await SkillSuggestionResource.bulkUpdateState(auth, suggestions, state);
+
+      if (state === "approved" || state === "rejected") {
+        await postSkillSuggestionStatusUpdate(auth, suggestions, state);
+      }
 
       // Bulk update doesn't mutate the resources, so we need to refetch here.
       const updatedSuggestions = await SkillSuggestionResource.fetchByIds(

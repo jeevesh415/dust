@@ -2,6 +2,7 @@ import { VisualizationActionIframe } from "@app/components/assistant/conversatio
 import { useConversationSidePanelContext } from "@app/components/assistant/conversation/ConversationSidePanelContext";
 import { DEFAULT_RIGHT_PANEL_SIZE } from "@app/components/assistant/conversation/constant";
 import { CenteredState } from "@app/components/assistant/conversation/interactive_content/CenteredState";
+import { ExportContentDropdown } from "@app/components/assistant/conversation/interactive_content/ExportContentDropdown";
 import { ShareFrameSheet } from "@app/components/assistant/conversation/interactive_content/frame/ShareFrameSheet";
 import { InteractiveContentHeader } from "@app/components/assistant/conversation/interactive_content/InteractiveContentHeader";
 import { ConfirmContext } from "@app/components/Confirm";
@@ -9,7 +10,6 @@ import { useDesktopNavigation } from "@app/components/navigation/DesktopNavigati
 import { useVisualizationRevert } from "@app/hooks/conversations";
 import { useHashParam } from "@app/hooks/useHashParams";
 import { useSendNotification } from "@app/hooks/useNotification";
-import config from "@app/lib/api/config";
 import { useAuth } from "@app/lib/auth/AuthContext";
 import { useClientType } from "@app/lib/context/clientType";
 import { clientFetch } from "@app/lib/egress/client";
@@ -19,23 +19,14 @@ import { getErrorFromResponse } from "@app/lib/swr/swr";
 import type { ConversationWithoutContentType } from "@app/types/assistant/conversation";
 import { FULL_SCREEN_HASH_PARAM } from "@app/types/conversation_side_panel";
 import type { LightWorkspaceType } from "@app/types/user";
-import { datadogLogs } from "@datadog/browser-logs";
 import {
   ArrowCircleIcon,
-  ArrowDownOnSquareIcon,
   ArrowGoBackIcon,
   Button,
   CheckCircleIcon,
   CloudArrowUpIcon,
   CodeBlock,
   CommandLineIcon,
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSub,
-  DropdownMenuSubContent,
-  DropdownMenuSubTrigger,
-  DropdownMenuTrigger,
   EyeIcon,
   FullscreenExitIcon,
   FullscreenIcon,
@@ -50,145 +41,6 @@ import React, {
   useRef,
   useState,
 } from "react";
-
-interface ExportContentDropdownProps {
-  iframeRef: React.RefObject<HTMLIFrameElement>;
-  owner: LightWorkspaceType;
-  fileId: string;
-  fileContent: string | null;
-  fileName?: string;
-}
-
-function ExportContentDropdown({
-  iframeRef,
-  owner,
-  fileId,
-  fileContent,
-  fileName,
-}: ExportContentDropdownProps) {
-  const sendNotification = useSendNotification();
-  const [isExportingPdf, setIsExportingPdf] = useState(false);
-
-  const exportAsPng = () => {
-    if (fileContent) {
-      const imgRegex = /<img[^>]+src=["'](https?:\/\/[^"']+)["']/gi;
-      if (imgRegex.test(fileContent)) {
-        sendNotification({
-          type: "error",
-          title: "Cannot export as PNG",
-          description:
-            "Content contains images with external URLs, which are blocked for " +
-            "security purposes. Please use images uploaded to the conversation instead.",
-        });
-        return;
-      }
-    }
-
-    if (iframeRef.current?.contentWindow) {
-      iframeRef.current.contentWindow.postMessage({ type: `EXPORT_PNG` }, "*");
-    } else {
-      datadogLogs.logger.info(
-        "Failed to export content as PNG: No iframe content window found"
-      );
-    }
-  };
-
-  const exportAsPdf = async (orientation: "portrait" | "landscape") => {
-    if (isExportingPdf) {
-      return;
-    }
-
-    setIsExportingPdf(true);
-    try {
-      // Use direct fetch instead of fetcher to avoid JSON parsing of binary PDF data.
-      const response = await clientFetch(
-        `/api/w/${owner.sId}/files/${fileId}/export/pdf`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ orientation }),
-        }
-      );
-
-      if (!response.ok) {
-        throw new Error("Failed to generate PDF");
-      }
-
-      // Get the PDF blob and trigger download.
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-
-      link.download = fileName?.replace(/\.[^.]+$/, ".pdf") ?? "frame.pdf";
-
-      link.click();
-      URL.revokeObjectURL(url);
-
-      sendNotification({
-        title: "PDF exported",
-        type: "success",
-        description: "Your PDF has been downloaded.",
-      });
-    } catch (error) {
-      console.error("PDF export failed:", error);
-      sendNotification({
-        title: "PDF Export Failed",
-        type: "error",
-        description: "An error occurred while generating the PDF.",
-      });
-    } finally {
-      setIsExportingPdf(false);
-    }
-  };
-
-  const downloadAsCode = () => {
-    try {
-      const downloadUrl = `${config.getApiBaseUrl()}/api/w/${owner.sId}/files/${fileId}?action=download`;
-      // Open the download URL in a new tab/window. Otherwise we get a CORS error due to the redirection
-      // to cloud storage.
-      window.open(downloadUrl, "_blank");
-    } catch (error) {
-      console.error("Download failed:", error);
-      sendNotification({
-        title: "Download Failed",
-        type: "error",
-        description: "An error occurred while opening the download link.",
-      });
-    }
-  };
-
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button
-          icon={ArrowDownOnSquareIcon}
-          isSelect
-          label={isExportingPdf ? "Exporting..." : "Export"}
-          variant="ghost"
-          disabled={isExportingPdf}
-        />
-      </DropdownMenuTrigger>
-      <DropdownMenuContent>
-        <DropdownMenuSub>
-          <DropdownMenuSubTrigger disabled={isExportingPdf} label="PDF" />
-          <DropdownMenuSubContent>
-            <DropdownMenuItem onClick={() => exportAsPdf("portrait")}>
-              Portrait
-            </DropdownMenuItem>
-            <DropdownMenuItem onClick={() => exportAsPdf("landscape")}>
-              Landscape
-            </DropdownMenuItem>
-          </DropdownMenuSubContent>
-        </DropdownMenuSub>
-        <DropdownMenuItem onClick={exportAsPng}>PNG</DropdownMenuItem>
-        <DropdownMenuItem onClick={downloadAsCode}>Template</DropdownMenuItem>
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
-}
 
 interface FrameRendererProps {
   conversation?: ConversationWithoutContentType;
@@ -359,14 +211,14 @@ export function FrameRenderer({
     const confirmed = await confirm({
       title: (
         <>
-          Save to <strong>{projectInfo?.name ?? "project"}</strong>?
+          Save to <strong>{projectInfo?.name ?? "Pod"}</strong>?
         </>
       ),
       message: (
         <>
           <div>
-            The Frame will be part of the project knowledge, and be able to be
-            edited by any project member.
+            The Frame will be part of the Pod knowledge, and be able to be
+            edited by any Pod member.
           </div>
           <div>This action cannot be undone.</div>
         </>
@@ -391,22 +243,22 @@ export function FrameRenderer({
         const errorData = await getErrorFromResponse(res);
         sendNotification({
           type: "error",
-          title: "Failed to save to project",
+          title: "Failed to save to Pod",
           description: errorData.message,
         });
         return;
       }
       sendNotification({
         type: "success",
-        title: "Saved to project",
-        description: `Frame saved to "${projectInfo?.name ?? "project"}".`,
+        title: "Saved to Pod",
+        description: `Frame saved to "${projectInfo?.name ?? "Pod"}".`,
       });
       // Invalidate file metadata so parent and this component get updated projectId.
       await mutateFileMetadata();
     } catch (e) {
       sendNotification({
         type: "error",
-        title: "Failed to save to project",
+        title: "Failed to save to Pod",
         description: e instanceof Error ? e.message : "An error occurred",
       });
     } finally {
@@ -425,11 +277,11 @@ export function FrameRenderer({
   if (error) {
     return (
       <div className="flex h-full flex-col">
-        <InteractiveContentHeader
-          onClose={conversation ? onClosePanel : undefined}
-        />
+        <InteractiveContentHeader onClose={onClosePanel} />
         <CenteredState>
-          <p className="text-warning-500">Error loading file: {error}</p>
+          <p className="text-warning-500">
+            Error loading file: {error.message}
+          </p>
         </CenteredState>
       </div>
     );
@@ -437,9 +289,7 @@ export function FrameRenderer({
 
   return (
     <div className="flex h-full flex-col">
-      <InteractiveContentHeader
-        onClose={conversation ? onClosePanel : undefined}
-      >
+      <InteractiveContentHeader onClose={onClosePanel}>
         <div className="flex w-full items-center justify-between">
           <Button
             icon={showCode ? EyeIcon : CommandLineIcon}
@@ -462,7 +312,7 @@ export function FrameRenderer({
                 variant="ghost"
                 disabled={true}
                 label="Saved"
-                tooltip={`Saved in "${projectInfo?.name ?? "unknown project"}"`}
+                tooltip={`Saved in "${projectInfo?.name ?? "unknown Pod"}"`}
               />
             )}
             {projectSaveState === "supported" && (
@@ -471,7 +321,7 @@ export function FrameRenderer({
                 variant="ghost"
                 label={isSavingToProject ? "Saving…" : "Save"}
                 isLoading={isSavingToProject}
-                tooltip={`Save to "${projectInfo?.name ?? "unknown project"}"`}
+                tooltip={`Save to "${projectInfo?.name ?? "unknown Pod"}"`}
                 onClick={handleSaveToProject}
               />
             )}

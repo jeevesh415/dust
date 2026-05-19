@@ -13,8 +13,8 @@ interface LLMTraceContextBase {
   /** Type of operation that triggered the LLM call */
   operationType:
     | "agent_builder_description_suggestion"
-    | "project_todo_analyze_conversation"
-    | "project_todo_deduplicate_candidates"
+    | "project_task_analyze_document"
+    | "project_task_deduplicate_candidates"
     | "agent_builder_emoji_suggestion"
     | "agent_builder_name_suggestion"
     | "agent_builder_tags_suggestion"
@@ -24,8 +24,6 @@ interface LLMTraceContextBase {
     | "agent_suggestion"
     | "conversation_title_suggestion"
     | "conversation_unread_summary"
-    | "reinforced_agent_aggregate_suggestions"
-    | "reinforced_agent_analyze_conversation"
     | "reinforcement_aggregate_suggestions"
     | "reinforcement_analyze_conversation"
     | "sidekick_template_suggestion"

@@ -1,11 +1,15 @@
 import { MCPActionDetails } from "@app/components/actions/mcp/details/MCPActionDetails";
 import { PendingToolCallDetails } from "@app/components/assistant/conversation/actions/PendingToolCallDetails";
 import {
+  type ActionProgressState,
   getPendingToolCallKey,
   type PendingToolCall,
 } from "@app/components/assistant/conversation/types";
 import type { AgentMCPActionWithOutputType } from "@app/types/actions";
-import type { ParsedContentItem } from "@app/types/assistant/conversation";
+import type {
+  AgentMessageStatus,
+  ParsedContentItem,
+} from "@app/types/assistant/conversation";
 import type { LightWorkspaceType } from "@app/types/user";
 import { ContentMessage, Markdown } from "@dust-tt/sparkle";
 
@@ -16,15 +20,9 @@ interface AgentStepProps {
   isStreaming?: boolean;
   pendingToolCalls?: PendingToolCall[];
   streamingActions?: AgentMCPActionWithOutputType[];
-  streamActionProgress: Map<number, any>;
+  streamActionProgress: ActionProgressState;
   owner: LightWorkspaceType;
-  messageStatus:
-    | "created"
-    | "succeeded"
-    | "failed"
-    | "cancelled"
-    | "gracefully_stopped";
-  showSeparator?: boolean;
+  messageStatus: AgentMessageStatus;
 }
 
 export function PanelAgentStep({
@@ -45,7 +43,6 @@ export function PanelAgentStep({
           <ContentMessage variant="primary" size="lg">
             <Markdown
               content={reasoningContent}
-              isStreaming={isStreaming}
               streamingState={isStreaming ? "streaming" : "none"}
               enableAnimation
               animationDurationSeconds={0.3}
@@ -66,7 +63,6 @@ export function PanelAgentStep({
               <ContentMessage variant="primary" size="lg">
                 <Markdown
                   content={entry.content}
-                  isStreaming={false}
                   forcedTextSize="text-sm"
                   textColor="text-muted-foreground dark:text-muted-foreground-night"
                   isLastMessage={false}
@@ -87,7 +83,7 @@ export function PanelAgentStep({
         return (
           <div key={`action-${entry.action.id}`}>
             <MCPActionDetails
-              displayContext="sidebar-all-actions"
+              displayContext="sidebar-single-action"
               action={entry.action}
               lastNotification={streamProgress ?? null}
               owner={owner}
@@ -109,7 +105,7 @@ export function PanelAgentStep({
             return (
               <div key={`streaming-action-${action.id}`} className="mb-4">
                 <MCPActionDetails
-                  displayContext="sidebar-all-actions"
+                  displayContext="sidebar-single-action"
                   action={action}
                   lastNotification={lastNotification}
                   owner={owner}
@@ -124,7 +120,7 @@ export function PanelAgentStep({
       {pendingToolCalls.map((pendingToolCall, index) => (
         <div key={getPendingToolCallKey(pendingToolCall, index)}>
           <PendingToolCallDetails
-            displayContext="sidebar-all-actions"
+            displayContext="sidebar-single-action"
             functionCallName={pendingToolCall.toolName}
           />
         </div>

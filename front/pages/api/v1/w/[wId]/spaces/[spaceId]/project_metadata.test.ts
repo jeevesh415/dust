@@ -121,7 +121,7 @@ describe("GET /api/v1/w/[wId]/spaces/[spaceId]/project_metadata", () => {
     expect(res._getJSONData()).toEqual({
       error: {
         type: "invalid_request_error",
-        message: "Project metadata is only available for project spaces.",
+        message: "Pod metadata is only available for Pod spaces.",
       },
     });
   });
@@ -191,8 +191,10 @@ describe("GET /api/v1/w/[wId]/spaces/[spaceId]/project_metadata", () => {
       archivedAt: null,
       createdAt: expect.anything(),
       description: "Test project description",
+      lastTodoAnalysisAt: null,
       sId: expect.anything(),
       spaceId: space.sId,
+      todoGenerationEnabled: false,
       updatedAt: expect.anything(),
       members: [],
     });
@@ -245,8 +247,10 @@ describe("GET /api/v1/w/[wId]/spaces/[spaceId]/project_metadata", () => {
       archivedAt: null,
       createdAt: expect.anything(),
       description: "Test project with members",
+      lastTodoAnalysisAt: null,
       sId: expect.anything(),
       spaceId: space.sId,
+      todoGenerationEnabled: false,
       updatedAt: expect.anything(),
       members: expect.arrayContaining([
         expect.stringContaining(member1.sId),

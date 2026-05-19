@@ -92,10 +92,6 @@
  *                         type: array
  *                         items:
  *                           type: string
- *                       selectedSkillIds:
- *                         type: array
- *                         items:
- *                           type: string
  *               contentFragments:
  *                 type: array
  *                 items:
@@ -135,28 +131,27 @@ import { apiErrorForConversation } from "@app/lib/api/assistant/conversation/hel
 import { withSessionAuthenticationForWorkspace } from "@app/lib/api/auth_wrappers";
 import { getPaginationParams } from "@app/lib/api/pagination";
 import type { Authenticator } from "@app/lib/auth";
-import { getFeatureFlags } from "@app/lib/auth";
 import { ConversationResource } from "@app/lib/resources/conversation_resource";
 import { MCPServerViewResource } from "@app/lib/resources/mcp_server_view_resource";
 import { SkillResource } from "@app/lib/resources/skill/skill_resource";
 import { SpaceResource } from "@app/lib/resources/space_resource";
+import { extractUniqueSkillIds } from "@app/lib/skills/format";
 import { concurrentExecutor } from "@app/lib/utils/async_utils";
 import { apiError } from "@app/logger/withlogging";
 import { InternalPostConversationsRequestBodySchema } from "@app/types/api/internal/assistant";
 import type {
+  ConversationListItemType,
   ConversationType,
-  ConversationWithoutContentType,
   UserMessageType,
 } from "@app/types/assistant/conversation";
 import { ConversationError } from "@app/types/assistant/conversation";
 import type { ContentFragmentType } from "@app/types/content_fragment";
 import type { WithAPIErrorResponse } from "@app/types/error";
-import { isLeft } from "fp-ts/lib/Either";
-import * as reporter from "io-ts-reporters";
 import type { NextApiRequest, NextApiResponse } from "next";
+import { fromError } from "zod-validation-error";
 
 export type GetConversationsResponseBody = {
-  conversations: ConversationWithoutContentType[];
+  conversations: ConversationListItemType[];
   hasMore: boolean;
   lastValue: string | null;
 };
@@ -165,6 +160,12 @@ export type PostConversationsResponseBody = {
   message?: UserMessageType;
   contentFragments: ContentFragmentType[];
 };
+
+function isConversationNotFoundError(err: unknown): err is ConversationError {
+  return (
+    err instanceof ConversationError && err.type === "conversation_not_found"
+  );
+}
 
 async function handler(
   req: NextApiRequest,
@@ -179,7 +180,7 @@ async function handler(
 
   switch (req.method) {
     case "GET":
-      const paginationRes = getPaginationParams(req, {
+      const paginationRes = getPaginationParams(req.query, {
         defaultLimit: 100,
         defaultOrderColumn: "updatedAt",
         defaultOrderDirection: "desc",
@@ -199,7 +200,7 @@ async function handler(
       const pagination = paginationRes.value;
 
       const result =
-        await ConversationResource.listPrivateConversationsForUserPaginated(
+        await ConversationResource.listPrivateConversationsForUserPaginatedFromES(
           auth,
           {
             limit: pagination.limit,
@@ -209,7 +210,7 @@ async function handler(
         );
 
       res.status(200).json({
-        conversations: result.conversations.map((c) => c.toJSON()),
+        conversations: result.conversations,
         hasMore: result.hasMore,
         lastValue: result.lastValue,
       });
@@ -222,12 +223,11 @@ async function handler(
         req.body.spaceId = null;
       }
 
-      const bodyValidation = InternalPostConversationsRequestBodySchema.decode(
-        req.body
-      );
+      const bodyValidation =
+        InternalPostConversationsRequestBodySchema.safeParse(req.body);
 
-      if (isLeft(bodyValidation)) {
-        const pathError = reporter.formatValidationErrors(bodyValidation.left);
+      if (!bodyValidation.success) {
+        const pathError = fromError(bodyValidation.error).toString();
 
         return apiError(req, res, {
           status_code: 400,
@@ -246,7 +246,7 @@ async function handler(
         contentFragments,
         metadata,
         skipToolsValidation,
-      } = bodyValidation.right;
+      } = bodyValidation.data;
 
       if (message?.context.clientSideMCPServerIds) {
         const hasServerAccess = await concurrentExecutor(
@@ -293,6 +293,14 @@ async function handler(
         metadata,
       });
 
+      if (conversation.depth === 0) {
+        await ConversationResource.upsertParticipation(auth, {
+          conversation,
+          action: "subscribed",
+          user: user.toJSON(),
+        });
+      }
+
       const newContentFragments: ContentFragmentType[] = [];
       let newMessage: UserMessageType | null = null;
 
@@ -303,53 +311,37 @@ async function handler(
       };
 
       if (contentFragments.length > 0) {
-        const newContentFragmentsRes = await Promise.all(
-          contentFragments.map((contentFragment) => {
-            return postNewContentFragment(auth, conversation, contentFragment, {
+        const newContentFragmentsRes = await concurrentExecutor(
+          contentFragments,
+          async (contentFragment) =>
+            postNewContentFragment(auth, conversation, contentFragment, {
               ...baseContext,
               profilePictureUrl: contentFragment.context.profilePictureUrl,
-            });
-          })
+            }),
+          { concurrency: 4 }
         );
 
         for (const r of newContentFragmentsRes) {
           if (r.isErr()) {
-            if (r.isErr()) {
-              return apiError(req, res, {
-                status_code: 400,
-                api_error: {
-                  type: "invalid_request_error",
-                  message: r.error.message,
-                },
-              });
-            }
+            return apiError(req, res, {
+              status_code: 400,
+              api_error: {
+                type: "invalid_request_error",
+                message: r.error.message,
+              },
+            });
           }
 
           newContentFragments.push(r.value);
         }
 
-        const updatedConversationRes = await getConversation(
-          auth,
-          conversation.sId
-        );
-
-        if (updatedConversationRes.isErr()) {
-          // Preserving former code in which if the conversation was not found here, we do not error
-          if (
-            !(
-              updatedConversationRes.error instanceof ConversationError &&
-              updatedConversationRes.error.type === "conversation_not_found"
-            )
-          ) {
-            return apiErrorForConversation(
-              req,
-              res,
-              updatedConversationRes.error
-            );
-          }
-        } else {
-          conversation = updatedConversationRes.value;
-        }
+        conversation = {
+          ...conversation,
+          content: [
+            ...conversation.content,
+            ...newContentFragments.map((contentFragment) => [contentFragment]),
+          ],
+        };
       }
 
       if (message) {
@@ -378,12 +370,15 @@ async function handler(
           }
         }
 
-        // If JIT skills are selected, add them to the conversation before posting the message.
-        if (message.context.selectedSkillIds) {
-          const skills = await SkillResource.fetchByIds(
-            auth,
-            message.context.selectedSkillIds
-          );
+        const inlineSelectedSkillIds = extractUniqueSkillIds(message.content);
+        // TODO(2026-05-04 aubin): Remove this fallback once all clients submit
+        // inline <skill ... /> tags instead of the legacy selectedSkillIds field.
+        const selectedSkillIds =
+          inlineSelectedSkillIds.length > 0
+            ? inlineSelectedSkillIds
+            : (message.context.selectedSkillIds ?? []);
+        if (selectedSkillIds.length > 0) {
+          const skills = await SkillResource.fetchByIds(auth, selectedSkillIds);
 
           const r = await SkillResource.upsertConversationSkills(auth, {
             conversationId: conversation.id,
@@ -402,21 +397,15 @@ async function handler(
           }
         }
 
-        const featureFlags = await getFeatureFlags(auth);
-        const steeringEnabled = featureFlags.includes("enable_steering");
-
-        if (message.content.length === 0) {
-          if (!steeringEnabled || message.mentions.length === 0) {
-            return apiError(req, res, {
-              status_code: 400,
-              api_error: {
-                type: "invalid_request_error",
-                message: steeringEnabled
-                  ? "Message content cannot be empty unless at least one mention is provided."
-                  : "Message content cannot be empty.",
-              },
-            });
-          }
+        if (message.content.length === 0 && message.mentions.length === 0) {
+          return apiError(req, res, {
+            status_code: 400,
+            api_error: {
+              type: "invalid_request_error",
+              message:
+                "Message content cannot be empty unless at least one mention is provided.",
+            },
+          });
         }
 
         // If a message was provided we do await for the message to be created before returning the
@@ -436,7 +425,6 @@ async function handler(
               message.context.clientSideMCPServerIds ?? [],
           },
           skipToolsValidation: skipToolsValidation ?? false,
-          steeringEnabled,
         });
         if (messageRes.isErr()) {
           return apiError(req, res, messageRes.error);
@@ -453,11 +441,11 @@ async function handler(
         // streaming events from these agent messages directly.
         const updatedRes = await getConversation(auth, conversation.sId);
 
-        if (updatedRes.isErr()) {
+        if (updatedRes.isOk()) {
+          conversation = updatedRes.value;
+        } else if (!isConversationNotFoundError(updatedRes.error)) {
           return apiErrorForConversation(req, res, updatedRes.error);
         }
-
-        conversation = updatedRes.value;
       }
 
       res.status(200).json({

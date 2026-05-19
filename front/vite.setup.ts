@@ -124,6 +124,7 @@ vi.mock("@app/lib/api/redis", () => ({
   runOnRedis: vi.fn().mockImplementation(mockRunOnRedisImpl),
   runOnRedisCache: vi.fn().mockImplementation(mockRunOnRedisCacheImpl),
   closeRedisClients: vi.fn().mockResolvedValue(undefined),
+  REDIS_CACHE_CONCURRENCY: 32,
 }));
 
 vi.mock("@app/lib/utils/cache", () => ({
@@ -139,6 +140,9 @@ vi.mock("@app/lib/utils/cache", () => ({
         };
       }
     ),
+  warmCacheWithRedis: vi.fn().mockImplementation(() => {
+    return async () => {};
+  }),
   invalidateCacheWithRedis: vi.fn().mockImplementation(() => {
     return async () => {};
   }),
@@ -175,6 +179,12 @@ vi.mock("@app/lib/api/sandbox", () => ({
   getSandboxProvider: vi.fn().mockReturnValue(undefined),
 }));
 
+// Mock internal fetch (undici-based) so tests can intercept CoreAPI/OAuthAPI calls
+// without needing real network access. Tests override with vi.mocked(internalFetch).mockImplementation(...).
+vi.mock("@app/lib/api/internal_fetch", () => ({
+  internalFetch: vi.fn(),
+}));
+
 // Mock Temporal - must be at module level
 vi.mock("@app/lib/temporal", () => ({
   getTemporalClientForAgentNamespace: vi.fn().mockResolvedValue({
@@ -197,6 +207,10 @@ vi.mock("@app/temporal/es_indexation/client", async (importOriginal) => {
   return {
     ...mod,
     launchIndexUserSearchWorkflow: vi.fn(async () => {
+      const { Ok } = await import("@app/types/shared/result");
+      return new Ok(undefined);
+    }),
+    launchIndexConversationEsWorkflow: vi.fn(async () => {
       const { Ok } = await import("@app/types/shared/result");
       return new Ok(undefined);
     }),

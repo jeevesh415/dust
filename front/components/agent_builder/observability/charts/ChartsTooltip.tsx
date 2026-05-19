@@ -16,6 +16,7 @@ export interface ToolUsageTooltipProps
   extends TooltipContentProps<number, string> {
   topTools: string[];
   hoveredTool?: string | null;
+  selectedKey?: string;
   showLabel?: boolean;
 }
 
@@ -24,18 +25,20 @@ export function ChartsTooltip({
   payload,
   topTools,
   hoveredTool,
+  selectedKey,
   showLabel,
 }: ToolUsageTooltipProps) {
   if (!active || !payload || payload.length === 0) {
     return null;
   }
 
-  if (!hoveredTool) {
+  const focusedTool = selectedKey ?? hoveredTool;
+  if (!focusedTool) {
     return null;
   }
 
   const typed = payload.filter(isToolChartUsagePayload);
-  const filtered = typed.filter((p) => p.name === hoveredTool);
+  const filtered = typed.filter((p) => p.name === focusedTool);
   if (filtered.length === 0) {
     return null;
   }
@@ -182,9 +185,12 @@ function isFeedbackDistributionData(
 }
 
 export function FeedbackDistributionTooltip(
-  props: TooltipContentProps<number, string>
+  props: TooltipContentProps<number, string> & {
+    activeKey?: string;
+    selectedKey?: string;
+  }
 ) {
-  const { active, payload } = props;
+  const { active, payload, activeKey, selectedKey } = props;
   if (!active || !payload || payload.length === 0) {
     return null;
   }
@@ -198,10 +204,13 @@ export function FeedbackDistributionTooltip(
     <ChartTooltipCard
       title={row.date}
       rows={FEEDBACK_DISTRIBUTION_LEGEND.map(({ key, label: itemLabel }) => ({
+        key,
         label: itemLabel,
         value: row[key],
         colorClassName: FEEDBACK_DISTRIBUTION_PALETTE[key],
       }))}
+      activeKey={activeKey}
+      selectedKey={selectedKey}
     />
   );
 }

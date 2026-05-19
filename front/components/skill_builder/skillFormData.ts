@@ -22,6 +22,8 @@ export function transformSkillTypeToFormData(
     icon: skill.icon ?? null,
     extendedSkillId: skill.extendedSkillId,
     isDefault: skill.isDefault,
+    reinforcement: skill.reinforcement,
+    additionalSpaces: [],
   };
 }
 
@@ -47,5 +49,7 @@ export function getDefaultSkillFormData({
     icon: null,
     extendedSkillId,
     isDefault: false,
+    reinforcement: "on",
+    additionalSpaces: [],
   };
 }

@@ -1,7 +1,9 @@
+import {
+  buildAuditLogTarget,
+  emitAuditLogEvent,
+} from "@app/lib/api/audit/workos_audit";
 import { Authenticator } from "@app/lib/auth";
-import { DustError } from "@app/lib/error";
 import { AgentConfigurationModel } from "@app/lib/models/agent/agent";
-import { TriggerSubscriberModel } from "@app/lib/models/agent/triggers/trigger_subscriber";
 import { TriggerModel } from "@app/lib/models/agent/triggers/triggers";
 import { WebhookRequestModel } from "@app/lib/models/agent/triggers/webhook_request";
 import { WebhookRequestTriggerModel } from "@app/lib/models/agent/triggers/webhook_request_trigger";
@@ -16,7 +18,7 @@ import logger from "@app/logger/logger";
 import {
   createOrUpdateAgentSchedule,
   deleteTriggerSchedule,
-} from "@app/temporal/triggers/schedule/client";
+} from "@app/temporal/triggers/schedule_client";
 import type {
   ScheduleConfig,
   TriggerExecutionMode,
@@ -28,10 +30,7 @@ import type { ModelId } from "@app/types/shared/model_id";
 import type { Result } from "@app/types/shared/result";
 import { Err, Ok } from "@app/types/shared/result";
 import { assertNever } from "@app/types/shared/utils/assert_never";
-import {
-  errorToString,
-  normalizeError,
-} from "@app/types/shared/utils/error_utils";
+import { normalizeError } from "@app/types/shared/utils/error_utils";
 import type { UserType } from "@app/types/user";
 import assert from "assert";
 import type {
@@ -75,6 +74,22 @@ export class TriggerResource extends BaseResource<TriggerModel> {
         return r;
       }
     }
+
+    void emitAuditLogEvent({
+      auth,
+      action: "trigger.created",
+      targets: [
+        buildAuditLogTarget("workspace", auth.getNonNullableWorkspace()),
+        buildAuditLogTarget("trigger", {
+          sId: resource.sId,
+          name: resource.name,
+        }),
+      ],
+      metadata: {
+        trigger_type: resource.kind,
+        agent_id: resource.agentConfigurationId,
+      },
+    });
 
     return new Ok(resource);
   }
@@ -135,6 +150,21 @@ export class TriggerResource extends BaseResource<TriggerModel> {
     });
   }
 
+  static async listByAgentConfigurationIds(
+    auth: Authenticator,
+    agentConfigurationIds: string[]
+  ): Promise<TriggerResource[]> {
+    if (agentConfigurationIds.length === 0) {
+      return [];
+    }
+
+    return this.baseFetch(auth, {
+      where: {
+        agentConfigurationId: agentConfigurationIds,
+      },
+    });
+  }
+
   static async listByAgentConfigurationIdAndEditors(
     auth: Authenticator,
     {
@@ -187,39 +217,6 @@ export class TriggerResource extends BaseResource<TriggerModel> {
         editor: user.id,
       },
     });
-  }
-
-  static async listByUserSubscriber(
-    auth: Authenticator,
-    user: UserResource | UserType
-  ) {
-    assert(
-      auth.isAdmin() || auth.user()?.id === user.id,
-      "Triggers can only be listed by admins or by the subscribed user."
-    );
-
-    const workspace = auth.getNonNullableWorkspace();
-
-    const res = await this.model.findAll({
-      where: {
-        workspaceId: workspace.id,
-        // Exclude triggers where user is also editor to avoid duplicates
-        editor: { [Op.ne]: user.id },
-      },
-      include: [
-        {
-          model: TriggerSubscriberModel,
-          as: "trigger_subscribers",
-          required: true,
-          attributes: [],
-          where: {
-            userId: user.id,
-          },
-        },
-      ],
-    });
-
-    return res.map((c) => new this(this.model, c.get()));
   }
 
   /**
@@ -318,6 +315,23 @@ export class TriggerResource extends BaseResource<TriggerModel> {
         },
         `Trigger status changed: ${blob.status}`
       );
+
+      void emitAuditLogEvent({
+        auth,
+        action:
+          blob.status === "enabled" ? "trigger.enabled" : "trigger.disabled",
+        targets: [
+          buildAuditLogTarget("workspace", auth.getNonNullableWorkspace()),
+          buildAuditLogTarget("trigger", {
+            sId: trigger.sId,
+            name: trigger.name,
+          }),
+        ],
+        metadata: {
+          trigger_type: trigger.kind,
+          agent_id: trigger.agentConfigurationId,
+        },
+      });
     }
 
     let r = null;
@@ -380,12 +394,6 @@ export class TriggerResource extends BaseResource<TriggerModel> {
         });
       }
 
-      await TriggerSubscriberModel.destroy({
-        where: {
-          workspaceId: auth.getNonNullableWorkspace().id,
-          triggerId: this.id,
-        },
-      });
       await TriggerModel.destroy({
         where: {
           id: this.id,
@@ -393,6 +401,23 @@ export class TriggerResource extends BaseResource<TriggerModel> {
         },
         transaction,
       });
+
+      void emitAuditLogEvent({
+        auth,
+        action: "trigger.deleted",
+        targets: [
+          buildAuditLogTarget("workspace", auth.getNonNullableWorkspace()),
+          buildAuditLogTarget("trigger", {
+            sId: this.sId,
+            name: this.name,
+          }),
+        ],
+        metadata: {
+          trigger_type: this.kind,
+          agent_id: this.agentConfigurationId,
+        },
+      });
+
       return new Ok(undefined);
     } catch (error) {
       return new Err(normalizeError(error));
@@ -649,6 +674,22 @@ export class TriggerResource extends BaseResource<TriggerModel> {
       "Trigger status changed: enabled"
     );
 
+    void emitAuditLogEvent({
+      auth,
+      action: "trigger.enabled",
+      targets: [
+        buildAuditLogTarget("workspace", auth.getNonNullableWorkspace()),
+        buildAuditLogTarget("trigger", {
+          sId: this.sId,
+          name: this.name,
+        }),
+      ],
+      metadata: {
+        trigger_type: this.kind,
+        agent_id: this.agentConfigurationId,
+      },
+    });
+
     const editor = await UserResource.fetchByModelId(this.editor);
     if (!editor) {
       return new Err(new Error("Trigger editor user not found"));
@@ -697,10 +738,66 @@ export class TriggerResource extends BaseResource<TriggerModel> {
       `Trigger status changed: ${targetStatus}`
     );
 
+    void emitAuditLogEvent({
+      auth,
+      action: "trigger.disabled",
+      targets: [
+        buildAuditLogTarget("workspace", auth.getNonNullableWorkspace()),
+        buildAuditLogTarget("trigger", {
+          sId: this.sId,
+          name: this.name,
+        }),
+      ],
+      metadata: {
+        trigger_type: this.kind,
+        agent_id: this.agentConfigurationId,
+      },
+    });
+
     // Remove the temporal workflow
     const r = await this.removeTemporalWorkflow(auth);
     if (r.isErr()) {
       return r;
+    }
+
+    return new Ok(undefined);
+  }
+
+  static async disableMany(
+    auth: Authenticator,
+    triggers: TriggerResource[],
+    targetStatus: Exclude<TriggerStatus, "enabled"> = "disabled"
+  ): Promise<Result<undefined, Error>> {
+    const workspace = auth.getNonNullableWorkspace();
+
+    const toUpdate = triggers.filter((t) => t.status !== targetStatus);
+    if (toUpdate.length === 0) {
+      return new Ok(undefined);
+    }
+
+    await this.model.update(
+      { status: targetStatus },
+      {
+        where: {
+          id: { [Op.in]: toUpdate.map((t) => t.id) },
+          workspaceId: workspace.id,
+        },
+      }
+    );
+
+    for (const trigger of toUpdate) {
+      const r = await trigger.removeTemporalWorkflow(auth);
+      if (r.isErr()) {
+        logger.error(
+          {
+            triggerId: trigger.sId,
+            workspaceId: workspace.sId,
+            agentConfigurationId: trigger.agentConfigurationId,
+            error: r.error,
+          },
+          "Failed to remove Temporal workflow while disabling trigger"
+        );
+      }
     }
 
     return new Ok(undefined);
@@ -730,125 +827,6 @@ export class TriggerResource extends BaseResource<TriggerModel> {
     } catch (error) {
       return new Err(normalizeError(error));
     }
-  }
-
-  async addToSubscribers(
-    auth: Authenticator
-  ): Promise<Result<undefined, DustError<"unauthorized" | "internal_error">>> {
-    if (auth.getNonNullableWorkspace().id !== this.workspaceId) {
-      return new Err(
-        new DustError(
-          "unauthorized",
-          "User does not have access to this trigger"
-        )
-      );
-    }
-
-    if (auth.getNonNullableUser().id === this.editor) {
-      return new Err(
-        new DustError("internal_error", "User is the editor of the trigger")
-      );
-    }
-
-    const existing = await TriggerSubscriberModel.findOne({
-      where: {
-        workspaceId: auth.getNonNullableWorkspace().id,
-        triggerId: this.id,
-        userId: auth.getNonNullableUser().id,
-      },
-    });
-    if (existing) {
-      return new Err(
-        new DustError("internal_error", "User is already a subscriber")
-      );
-    }
-
-    await TriggerSubscriberModel.create({
-      workspaceId: auth.getNonNullableWorkspace().id,
-      triggerId: this.id,
-      userId: auth.getNonNullableUser().id,
-    });
-
-    return new Ok(undefined);
-  }
-
-  async removeFromSubscribers(
-    auth: Authenticator
-  ): Promise<Result<undefined, DustError<"unauthorized" | "internal_error">>> {
-    if (auth.getNonNullableWorkspace().id !== this.workspaceId) {
-      return new Err(
-        new DustError(
-          "unauthorized",
-          "User does not have access to this trigger"
-        )
-      );
-    }
-
-    try {
-      await TriggerSubscriberModel.destroy({
-        where: {
-          workspaceId: auth.getNonNullableWorkspace().id,
-          triggerId: this.id,
-          userId: auth.getNonNullableUser().id,
-        },
-      });
-
-      return new Ok(undefined);
-    } catch (error) {
-      return new Err(new DustError("internal_error", errorToString(error)));
-    }
-  }
-
-  async getSubscribers(
-    auth: Authenticator
-  ): Promise<
-    Result<UserResource[], DustError<"unauthorized" | "internal_error">>
-  > {
-    if (auth.getNonNullableWorkspace().id !== this.workspaceId) {
-      return new Err(
-        new DustError(
-          "unauthorized",
-          "User does not have access to this trigger"
-        )
-      );
-    }
-
-    try {
-      const subscribers = await TriggerSubscriberModel.findAll({
-        where: {
-          workspaceId: auth.getNonNullableWorkspace().id,
-          triggerId: this.id,
-        },
-      });
-
-      const userResources = await UserResource.fetchByModelIds(
-        subscribers.map((subscriber) => subscriber.userId)
-      );
-
-      return new Ok(userResources);
-    } catch (error) {
-      return new Err(new DustError("internal_error", errorToString(error)));
-    }
-  }
-
-  async isSubscriber(auth: Authenticator): Promise<boolean> {
-    if (auth.getNonNullableWorkspace().id !== this.workspaceId) {
-      return false;
-    }
-
-    if (auth.getNonNullableUser().id === this.editor) {
-      return false;
-    }
-
-    const nbSubscribers = await TriggerSubscriberModel.count({
-      where: {
-        workspaceId: auth.getNonNullableWorkspace().id,
-        triggerId: this.id,
-        userId: auth.getNonNullableUser().id,
-      },
-    });
-
-    return nbSubscribers > 0;
   }
 
   static modelIdToSId({

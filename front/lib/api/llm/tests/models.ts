@@ -3,6 +3,7 @@ import type { FireworksWhitelistedModelId } from "@app/lib/api/llm/clients/firew
 import type { GoogleAIStudioWhitelistedModelId } from "@app/lib/api/llm/clients/google/types";
 import type { MistralWhitelistedModelId } from "@app/lib/api/llm/clients/mistral/types";
 import type { OpenAIWhitelistedModelId } from "@app/lib/api/llm/clients/openai/types";
+import type { XaiWhitelistedModelId } from "@app/lib/api/llm/clients/xai/types";
 import {
   CLAUDE_3_5_HAIKU_20241022_MODEL_ID,
   CLAUDE_3_OPUS_2024029_MODEL_ID,
@@ -12,11 +13,13 @@ import {
   CLAUDE_4_OPUS_20250514_MODEL_ID,
   CLAUDE_4_SONNET_20250514_MODEL_ID,
   CLAUDE_OPUS_4_6_MODEL_ID,
+  CLAUDE_OPUS_4_7_MODEL_ID,
   CLAUDE_SONNET_4_6_MODEL_ID,
 } from "@app/types/assistant/models/anthropic";
 import type { CUSTOM_MODEL_IDS } from "@app/types/assistant/models/custom_models.generated";
 import {
   FIREWORKS_DEEPSEEK_V3P2_MODEL_ID,
+  FIREWORKS_DEEPSEEK_V4_PRO_MODEL_ID,
   FIREWORKS_GLM_5_MODEL_ID,
   FIREWORKS_KIMI_K2_INSTRUCT_MODEL_ID,
   FIREWORKS_KIMI_K2P5_MODEL_ID,
@@ -34,6 +37,7 @@ import {
 import {
   MISTRAL_CODESTRAL_MODEL_ID,
   MISTRAL_LARGE_MODEL_ID,
+  MISTRAL_MEDIUM_3_5_MODEL_ID,
   MISTRAL_MEDIUM_MODEL_ID,
   MISTRAL_SMALL_MODEL_ID,
 } from "@app/types/assistant/models/mistral";
@@ -48,6 +52,7 @@ import {
   GPT_5_1_MODEL_ID,
   GPT_5_2_MODEL_ID,
   GPT_5_4_MODEL_ID,
+  GPT_5_5_MODEL_ID,
   GPT_5_MINI_MODEL_ID,
   GPT_5_MODEL_ID,
   GPT_5_NANO_MODEL_ID,
@@ -57,6 +62,7 @@ import {
   O4_MINI_MODEL_ID,
 } from "@app/types/assistant/models/openai";
 import type { ModelProviderIdType } from "@app/types/assistant/models/types";
+import { GROK_4_MODEL_ID } from "@app/types/assistant/models/xai";
 
 type CustomModelId = (typeof CUSTOM_MODEL_IDS)[number];
 
@@ -65,7 +71,8 @@ export const MODELS: Record<
   | Exclude<AnthropicWhitelistedModelId, CustomModelId>
   | GoogleAIStudioWhitelistedModelId
   | MistralWhitelistedModelId
-  | FireworksWhitelistedModelId,
+  | FireworksWhitelistedModelId
+  | XaiWhitelistedModelId,
   { runTest: boolean; providerId: ModelProviderIdType }
 > = {
   // Anthropic models
@@ -98,6 +105,10 @@ export const MODELS: Record<
     runTest: false,
     providerId: "anthropic",
   },
+  [CLAUDE_OPUS_4_7_MODEL_ID]: {
+    runTest: false,
+    providerId: "anthropic",
+  },
   [CLAUDE_SONNET_4_6_MODEL_ID]: {
     runTest: false,
     providerId: "anthropic",
@@ -123,6 +134,7 @@ export const MODELS: Record<
   [MISTRAL_CODESTRAL_MODEL_ID]: { runTest: false, providerId: "mistral" },
   [MISTRAL_LARGE_MODEL_ID]: { runTest: false, providerId: "mistral" },
   [MISTRAL_MEDIUM_MODEL_ID]: { runTest: false, providerId: "mistral" },
+  [MISTRAL_MEDIUM_3_5_MODEL_ID]: { runTest: false, providerId: "mistral" },
   [MISTRAL_SMALL_MODEL_ID]: { runTest: false, providerId: "mistral" },
   // OpenAI models
   [GPT_3_5_TURBO_MODEL_ID]: { runTest: false, providerId: "openai" },
@@ -135,6 +147,7 @@ export const MODELS: Record<
   [GPT_5_1_MODEL_ID]: { runTest: false, providerId: "openai" },
   [GPT_5_2_MODEL_ID]: { runTest: false, providerId: "openai" },
   [GPT_5_4_MODEL_ID]: { runTest: false, providerId: "openai" },
+  [GPT_5_5_MODEL_ID]: { runTest: false, providerId: "openai" },
   [GPT_5_MINI_MODEL_ID]: { runTest: false, providerId: "openai" },
   [GPT_5_MODEL_ID]: { runTest: false, providerId: "openai" },
   [GPT_5_NANO_MODEL_ID]: { runTest: false, providerId: "openai" },
@@ -144,6 +157,10 @@ export const MODELS: Record<
   [O4_MINI_MODEL_ID]: { runTest: false, providerId: "openai" },
   // Fireworks models
   [FIREWORKS_DEEPSEEK_V3P2_MODEL_ID]: {
+    runTest: false,
+    providerId: "fireworks",
+  },
+  [FIREWORKS_DEEPSEEK_V4_PRO_MODEL_ID]: {
     runTest: false,
     providerId: "fireworks",
   },
@@ -162,5 +179,10 @@ export const MODELS: Record<
   [FIREWORKS_GLM_5_MODEL_ID]: {
     runTest: false,
     providerId: "fireworks",
+  },
+  // xAI
+  [GROK_4_MODEL_ID]: {
+    runTest: false,
+    providerId: "xai",
   },
 };

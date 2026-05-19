@@ -7,12 +7,37 @@ import {
   isFullKnowledgeItem,
   KnowledgeNodeView,
 } from "@app/components/editor/extensions/skill_builder/KnowledgeNodeView";
-import { mergeAttributes, Node } from "@tiptap/core";
-import { ReactNodeViewRenderer } from "@tiptap/react";
+import { Node } from "@tiptap/core";
+import type { NodeViewProps } from "@tiptap/react";
+import { NodeViewWrapper, ReactNodeViewRenderer } from "@tiptap/react";
+import type React from "react";
 
 export interface KnowledgeNodeAttributes {
   selectedItems: KnowledgeItem[];
 }
+
+const KNOWLEDGE_CHIP_CLASS =
+  "inline-flex items-center gap-0.5 border border-current/40 rounded px-0.5 text-xs leading-tight";
+// We use this instead of Sparkle's DocumentIcon because renderHTML returns a plain DOMOutputSpec which cannot
+// contain React components, and ProseMirror's renderSpec doesn't support SVG
+// namespace elements. Using the emoji in both paths keeps additions and deletions
+// visually consistent in the suggestion diff view.
+const DOCUMENT_ICON = "📄";
+
+const KnowledgeNodeReadOnlyView: React.FC<NodeViewProps> = ({ node }) => {
+  const { selectedItems } = node.attrs;
+  const item = selectedItems[0] as KnowledgeItem | undefined;
+  if (!item) {
+    return null;
+  }
+  // No background or explicit color so diff decorations act on the content directly
+  return (
+    <NodeViewWrapper as="span" className={KNOWLEDGE_CHIP_CLASS}>
+      <span>{DOCUMENT_ICON}</span>
+      <span>{` ${item.label}`}</span>
+    </NodeViewWrapper>
+  );
+};
 
 declare module "@tiptap/core" {
   interface Commands<ReturnType> {
@@ -24,15 +49,19 @@ declare module "@tiptap/core" {
 
 export const KNOWLEDGE_NODE_TYPE = "knowledgeNode";
 
-// The markdown tag name used for serialization: <knowledge id="..." title="..." />.
-// This format is intentionally HTML-like for LLM readability.
-const KNOWLEDGE_MARKDOWN_TAG = "knowledge";
-
-const KNOWLEDGE_MARKDOWN_REGEX = new RegExp(
-  `^<${KNOWLEDGE_MARKDOWN_TAG}\\s+([^>]+)\\s*/>`
+const KNOWLEDGE_TAG = "knowledge";
+export const KNOWLEDGE_TAG_REGEX = new RegExp(
+  `^<${KNOWLEDGE_TAG}\\s+([^>]+)\\s*/>`
 );
 
-export const KnowledgeNode = Node.create<{}>({
+export interface KnowledgeNodeOptions {
+  readOnly: boolean;
+}
+
+export const KnowledgeNode = Node.create<KnowledgeNodeOptions>({
+  addOptions() {
+    return { readOnly: false };
+  },
   name: KNOWLEDGE_NODE_TYPE,
 
   group: "inline",
@@ -44,10 +73,10 @@ export const KnowledgeNode = Node.create<{}>({
     name: "knowledgeNode",
     level: "inline",
     start: (src) => {
-      return src.indexOf(`<${KNOWLEDGE_MARKDOWN_TAG}`);
+      return src.indexOf(`<${KNOWLEDGE_TAG}`);
     },
     tokenize: (src) => {
-      const match = KNOWLEDGE_MARKDOWN_REGEX.exec(src);
+      const match = KNOWLEDGE_TAG_REGEX.exec(src);
       if (!match) {
         return undefined;
       }
@@ -82,20 +111,7 @@ export const KnowledgeNode = Node.create<{}>({
       selectedItems: {
         default: [],
         parseHTML: (element) => {
-          // Primary path: deserialization from renderHTML (span with JSON data).
-          const data = element.getAttribute("data-selected-items");
-          if (data) {
-            return JSON.parse(decodeURIComponent(data));
-          }
-
-          // Fallback path: deserialization from a <knowledge> HTML element.
-          //
-          // This handles a markdown round-trip edge case: when a knowledge node
-          // is alone on its own line, marked.js treats the <knowledge .../> tag
-          // as block-level HTML (instead of routing it through our inline
-          // markdownTokenizer). The tag then goes through TipTap's parseHTML
-          // pipeline, so we need to extract the attributes here.
-          if (element.tagName.toLowerCase() === KNOWLEDGE_MARKDOWN_TAG) {
+          if (element.tagName.toLowerCase() === KNOWLEDGE_TAG) {
             const id = element.getAttribute("id");
             const title = element.getAttribute("title");
             if (id && title) {
@@ -110,13 +126,35 @@ export const KnowledgeNode = Node.create<{}>({
             }
           }
 
+          // Maintaing for backwards compatibility with old serialized data.
+          // Previously, the renderHTML output was a span with data-selected-items.
+          // But now we use the <knowledge> tag for all serialization.
+          const data = element.getAttribute("data-selected-items");
+          if (data) {
+            return JSON.parse(decodeURIComponent(data));
+          }
+
           return [];
         },
-        renderHTML: (attributes) => ({
-          "data-selected-items": encodeURIComponent(
-            JSON.stringify(attributes.selectedItems)
-          ),
-        }),
+        renderHTML: (attributes) => {
+          // TipTap passes attribute values loosely typed.
+          // We only serialize one <knowledge> element, so map the first selected item to
+          // DOM attrs.
+          const item = (attributes.selectedItems as KnowledgeItem[])[0];
+          if (!item) {
+            return {};
+          }
+          const hasChildren = isFullKnowledgeItem(item)
+            ? computeHasChildren(item.node)
+            : item.hasChildren;
+          return {
+            id: item.nodeId,
+            title: item.label,
+            space: item.spaceId,
+            dsv: item.dataSourceViewId,
+            hasChildren: String(hasChildren),
+          };
+        },
       },
     };
   },
@@ -125,13 +163,14 @@ export const KnowledgeNode = Node.create<{}>({
 
   parseHTML() {
     return [
+      // Maintaining for backwards compatibility with old serialized data.
+      // Previously, renderHTML output was a span with data-type="knowledge-node".
+      // But now we use the <knowledge> tag for all serialization.
       {
         tag: 'span[data-type="knowledge-node"]',
       },
-      // Fallback: match <knowledge> tags that marked.js parsed as block HTML.
-      // See the comment in addAttributes().parseHTML for details.
       {
-        tag: KNOWLEDGE_MARKDOWN_TAG,
+        tag: KNOWLEDGE_TAG,
       },
     ];
   },
@@ -140,34 +179,21 @@ export const KnowledgeNode = Node.create<{}>({
     const { selectedItems } = node.attrs;
 
     if (selectedItems.length > 0) {
-      // Render selected knowledge as semantic HTML with full data preservation
+      const label = selectedItems[0].label;
       return [
-        "span",
-        mergeAttributes(
-          {
-            "data-type": "knowledge-node",
-            "data-knowledge-id": selectedItems[0].id,
-            "data-knowledge-label": selectedItems[0].label,
-            "data-knowledge-description": selectedItems[0].description ?? "",
-          },
-          HTMLAttributes
-        ),
-        selectedItems[0].label,
+        "knowledge",
+        HTMLAttributes,
+        [
+          "span",
+          { class: KNOWLEDGE_CHIP_CLASS },
+          ["span", {}, DOCUMENT_ICON],
+          ["span", {}, ` ${label}`],
+        ],
       ];
     }
 
-    // For search state, render as empty placeholder (shouldn't normally be serialized)
-    return [
-      "span",
-      mergeAttributes(
-        {
-          "data-type": "knowledge-node",
-          "data-is-searching": "true",
-        },
-        HTMLAttributes
-      ),
-      "[Knowledge search]",
-    ];
+    // Search state is transient UI — nothing to serialize.
+    return ["span", {}];
   },
 
   // Markdown serialization and deserialization.
@@ -195,7 +221,7 @@ export const KnowledgeNode = Node.create<{}>({
 
       // Serialize essential data for model understanding and API fetching.
       // Format kept aligned with renderNode() output for consistency.
-      return `<${KNOWLEDGE_MARKDOWN_TAG} id="${item.nodeId}" title="${item.label}" space="${item.spaceId}" dsv="${item.dataSourceViewId}" hasChildren="${hasChildren}" />`;
+      return `<${KNOWLEDGE_TAG} id="${item.nodeId}" title="${item.label}" space="${item.spaceId}" dsv="${item.dataSourceViewId}" hasChildren="${hasChildren}" />`;
     }
 
     // Don't serialize search state, empty nodes shouldn't be saved.
@@ -220,7 +246,9 @@ export const KnowledgeNode = Node.create<{}>({
   },
 
   addNodeView() {
-    return ReactNodeViewRenderer(KnowledgeNodeView);
+    return ReactNodeViewRenderer(
+      this.options.readOnly ? KnowledgeNodeReadOnlyView : KnowledgeNodeView
+    );
   },
 
   addCommands() {

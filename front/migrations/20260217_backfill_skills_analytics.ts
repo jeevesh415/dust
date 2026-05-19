@@ -10,11 +10,9 @@ import {
 } from "@app/lib/models/agent/conversation";
 import { SkillConfigurationModel } from "@app/lib/models/skill";
 import { AgentMessageSkillModel } from "@app/lib/models/skill/conversation_skill";
-import type {
-  GlobalSkillDefinition,
-  GlobalSkillId,
-} from "@app/lib/resources/skill/global/registry";
-import { GlobalSkillsRegistry } from "@app/lib/resources/skill/global/registry";
+import type { SkillDefinition } from "@app/lib/resources/skill/code_defined/shared";
+import { GlobalSkillsRegistry } from "@app/lib/resources/skill/code_defined/global_registry";
+import { SystemSkillsRegistry } from "@app/lib/resources/skill/code_defined/system_registry";
 import { makeSId } from "@app/lib/resources/string_ids";
 import { WorkspaceResource } from "@app/lib/resources/workspace_resource";
 import { renderLightWorkspaceType } from "@app/lib/workspace";
@@ -29,7 +27,7 @@ const BATCH_SIZE = 500;
 function buildSkillUsedEntry(
   record: AgentMessageSkillModel,
   workspace: LightWorkspaceType,
-  globalSkillsMap: Map<string, GlobalSkillDefinition>
+  globalSkillsMap: Map<string, SkillDefinition>
 ): AgentMessageAnalyticsSkillUsed | null {
   if (record.customSkillId && record.customSkill) {
     return {
@@ -136,18 +134,23 @@ async function backfillSkillsAnalyticsForWorkspace(
     }
 
     // Fetch global skill definitions for referenced global skills.
-    const globalSkillIds: GlobalSkillId[] = [
+    const globalSkillIds: string[] = [
       ...new Set(
-        skillRecords.map((r) => r.globalSkillId).filter((id) => id !== null)
+        skillRecords
+          .map((r) => r.globalSkillId)
+          .filter((id): id is string => id !== null)
       ),
     ];
 
-    const globalSkillsMap = new Map<string, GlobalSkillDefinition>();
+    const globalSkillsMap = new Map<string, SkillDefinition>();
     if (globalSkillIds.length > 0) {
       const globalSkills = await GlobalSkillsRegistry.findAll(auth, {
         sId: globalSkillIds,
       });
-      for (const skill of globalSkills) {
+      const systemSkills = await SystemSkillsRegistry.findAll(auth, {
+        sId: globalSkillIds,
+      });
+      for (const skill of [...globalSkills, ...systemSkills]) {
         globalSkillsMap.set(skill.sId, skill);
       }
     }

@@ -85,18 +85,34 @@ The target design uses the compaction flow from the parallel compaction proposal
 - the child remains blocked for posting while the initial compaction is in the
   `created` state
 
-Until compaction ships, the fork flow can use an artificial compaction
-placeholder internally. That placeholder reuses the rendered
-conversation-for-model view at the resolved source message of the parent
-conversation and stores it as the initial message in the child, explicitly
-stating that it is a forked starting point.
+Repurposing compaction for branching adds one important constraint around
+attachments. The source conversation rendered for compaction contains the
+source conversation attachment ids. That is correct for normal in-conversation
+compaction, but wrong for a branched child because the child receives copied
+attachments with different ids. Branch creation therefore needs to compute a
+source-to-child attachment id map and apply it before the child compaction
+message is saved, so the persisted summary points at resources the child can
+actually access.
+
+This now lands in 4 steps:
+
+1. refactor compaction so the existing workflow can keep the compaction message
+   and SSE on a target conversation while summarizing a separate source
+   conversation snapshot
+2. add source-backed compaction support for rewriting exact standalone
+   attachment ids from a caller-provided source-to-target replacement map
+3. switch fork creation from the placeholder message to a real child-side
+   compaction that targets the parent conversation at the resolved source rank,
+   computes that map from carried-over child attachments, and launches
+   compaction only after those child attachments have been posted
+4. refine model selection so fork compaction uses the source agent message
+   model instead of the default fallback
 
 Compaction happens after the fork is created. We never compact the
 parent conversation as part of the fork action.
 
-This placeholder path exists only to unblock internal development and
-integration work while compaction is still in flight. Before release, fork
-initialization switches to the shipped compaction flow.
+Until step 2 lands, the fork flow continues to use the temporary placeholder
+message that states the conversation was forked.
 
 #### 3. Filesystem and File Seeding
 
@@ -168,6 +184,8 @@ In the target design, step 7 uses the real compaction shape:
 - the child starts with a `CompactionMessage`
 - that message is the history boundary for the child
 - the compaction payload explicitly states that the child is a fork
+- any attachment ids preserved in the compaction summary are rewritten to the
+  child conversation ids before the compaction message is saved
 - the child remains blocked for posting until the compaction status leaves
   `created`
 
@@ -279,20 +297,32 @@ Scope:
 - add the lightweight "XXX branched this conversation: " UI in the parent conversation
 - wire the UI to the backend endpoint
 
-#### 5: Switch Fork Initialization to Shipped Compaction
+#### 5: Replace the Placeholder with Child-Side Compaction
 
 Scope:
 
-- switch the fork initialization seam from the artificial placeholder to the
-  shipped compaction flow
-- keep the same fork API and lineage model
+- PR 1: refactor `compactConversation` so the existing workflow can summarize
+  a source conversation snapshot into a compaction message owned by another
+  target conversation
+- PR 2: allow source-backed compaction to rewrite exact standalone attachment
+  ids using a source-to-target replacement map
+- PR 3: create that compaction message in the child during fork creation,
+  summarize the parent conversation up to the resolved source message rank,
+  and pass the attachment id replacement map built from the copied child
+  attachments
+- PR 4: refine model selection so fork compaction uses the source agent
+  message model instead of the current default
 
 Why separate:
 
-- compaction is already being developed independently
-- this keeps the forking work moving internally without blocking on compaction
-  shipping
-- this is the release gate for broad exposure of the feature
+- the compaction refactor is independently useful and lower risk than changing
+  fork creation at the same time
+- the attachment id rewrite is specific to branching, but still fits cleanly as
+  compaction-side plumbing before the fork flow starts depending on it
+- the fork integration stays small once the workflow already supports separate
+  source and target conversations and attachment-id rewrite support
+- model selection is not product-critical for the first internal rollout and
+  can follow after the functional child-side compaction path exists
 
 ### Non-Goals for the First Version
 

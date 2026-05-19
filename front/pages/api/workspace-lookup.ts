@@ -1,3 +1,5 @@
+// @migration-status: MIGRATED_TO_HONO
+
 /** @ignoreswagger */
 import { withSessionAuthentication } from "@app/lib/api/auth_wrappers";
 import { fetchRevokedWorkspace } from "@app/lib/api/user";

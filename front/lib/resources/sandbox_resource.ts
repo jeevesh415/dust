@@ -1,6 +1,7 @@
 import config from "@app/lib/api/config";
 import { getSandboxProvider } from "@app/lib/api/sandbox";
 import { revokeAllExecTokensForSandbox } from "@app/lib/api/sandbox/access_tokens";
+import { deleteSandboxPolicy } from "@app/lib/api/sandbox/egress_policy";
 import { getSandboxImage } from "@app/lib/api/sandbox/image";
 import {
   recordLifecycleOperation,
@@ -13,6 +14,7 @@ import type {
   SandboxProvider,
 } from "@app/lib/api/sandbox/provider";
 import { SandboxNotFoundError } from "@app/lib/api/sandbox/provider";
+import { SANDBOX_TRUST_ENV_VARS } from "@app/lib/api/sandbox/trust_env";
 import type { Authenticator } from "@app/lib/auth";
 import { executeWithLock } from "@app/lib/lock";
 import { ConversationModel } from "@app/lib/models/agent/conversation";
@@ -24,6 +26,7 @@ import type { ReadonlyAttributesType } from "@app/lib/resources/storage/types";
 import type { ModelStaticWorkspaceAware } from "@app/lib/resources/storage/wrappers/workspace_models";
 import { makeSId } from "@app/lib/resources/string_ids";
 import type { ResourceFindOptions } from "@app/lib/resources/types";
+import { WorkspaceSandboxEnvVarResource } from "@app/lib/resources/workspace_sandbox_env_var_resource";
 import logger from "@app/logger/logger";
 import type { ConversationType } from "@app/types/assistant/conversation";
 import type { ModelId } from "@app/types/shared/model_id";
@@ -47,6 +50,33 @@ export interface SandboxResource extends ReadonlyAttributesType<SandboxModel> {}
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
 export class SandboxResource extends BaseResource<SandboxModel> {
   static model: ModelStaticWorkspaceAware<SandboxModel> = SandboxModel;
+
+  private static deleteEgressPolicyAfterDestroy(
+    sandbox: SandboxResource
+  ): void {
+    void deleteSandboxPolicy(sandbox.providerId).catch((err) =>
+      logger.warn(
+        {
+          err,
+          sandboxId: sandbox.sId,
+          sandboxProviderId: sandbox.providerId,
+        },
+        "Failed to delete sandbox egress policy"
+      )
+    );
+  }
+
+  private static async finalizeDestroyed(
+    sandbox: SandboxResource,
+    ctx: { workspaceId: string },
+    opts: { recordLifecycle: boolean }
+  ): Promise<void> {
+    await sandbox.updateStatus("deleted", { ctx });
+    SandboxResource.deleteEgressPolicyAfterDestroy(sandbox);
+    if (opts.recordLifecycle) {
+      recordLifecycleOperation("destroy", ctx);
+    }
+  }
 
   constructor(
     _model: ModelStatic<SandboxModel>,
@@ -78,6 +108,8 @@ export class SandboxResource extends BaseResource<SandboxModel> {
       conversationId: number;
       providerId: string;
       status: SandboxStatus;
+      baseImage: string;
+      version: string;
     },
     { transaction }: { transaction?: Transaction } = {}
   ) {
@@ -274,6 +306,8 @@ export class SandboxResource extends BaseResource<SandboxModel> {
             { sandbox: sandbox.toLogJSON(), error: result.error.message },
             "Failed to destroy sandbox at provider — proceeding with DB cleanup."
           );
+        } else {
+          SandboxResource.deleteEgressPolicyAfterDestroy(sandbox);
         }
       }
 
@@ -306,6 +340,46 @@ export class SandboxResource extends BaseResource<SandboxModel> {
     );
   }
 
+  // Compose the env vars passed to provider.create. Precedence (lowest →
+  // highest): workspace env vars → image runEnv → system vars. The image and
+  // system layers always win, so even if a row slips past suffix validation it
+  // cannot shadow a system var like CONVERSATION_ID.
+  private static async buildSandboxEnvVars(
+    auth: Authenticator,
+    conversation: ConversationType,
+    imageEnvVars: Record<string, string> | undefined
+  ): Promise<Result<Record<string, string>, Error>> {
+    const workspaceEnvResult =
+      await WorkspaceSandboxEnvVarResource.loadEnv(auth);
+    if (workspaceEnvResult.isErr()) {
+      return workspaceEnvResult;
+    }
+    const httpsSecretEnvResult =
+      await WorkspaceSandboxEnvVarResource.loadHttpsSecretPlaceholderEnv(auth);
+    if (httpsSecretEnvResult.isErr()) {
+      return httpsSecretEnvResult;
+    }
+
+    // Trust defaults for mainstream HTTPS stacks. Replace-style clients point
+    // at the image-seeded bundle; installMitmTrustBundle later rebuilds it as
+    // system roots + dsbx CA. Append-style clients point at dsbx's single CA.
+    // These are also baked into the image via /etc/environment and
+    // /etc/profile.d, but provider env injection covers early non-login
+    // processes started directly from the sandbox runtime. The key set is
+    // canonical in trust_env.ts so dsbx's `env -u` strip list can't drift.
+
+    return new Ok({
+      ...workspaceEnvResult.value,
+      ...httpsSecretEnvResult.value,
+      ...imageEnvVars,
+      ...SANDBOX_TRUST_ENV_VARS,
+      DD_API_KEY: config.getDatadogApiKey() ?? "",
+      DD_HOST: "http-intake.logs.datadoghq.eu",
+      CONVERSATION_ID: conversation.sId,
+      WORKSPACE_ID: auth.getNonNullableWorkspace().sId,
+    });
+  }
+
   /**
    * Ensure a running sandbox exists for the given conversation.
    *
@@ -335,17 +409,19 @@ export class SandboxResource extends BaseResource<SandboxModel> {
         }
 
         const createConfig = imageResult.value.toCreateConfig();
+        const envVarsResult = await this.buildSandboxEnvVars(
+          auth,
+          conversation,
+          createConfig.envVars
+        );
+        if (envVarsResult.isErr()) {
+          return new Err(envVarsResult.error);
+        }
 
         const createResult = await provider.create(
           {
             ...createConfig,
-            envVars: {
-              ...createConfig.envVars,
-              DD_API_KEY: config.getDatadogApiKey() ?? "",
-              DD_HOST: "http-intake.logs.datadoghq.eu",
-              CONVERSATION_ID: conversation.sId,
-              WORKSPACE_ID: auth.getNonNullableWorkspace().sId,
-            },
+            envVars: envVarsResult.value,
           },
           tracingOpts
         );
@@ -357,6 +433,8 @@ export class SandboxResource extends BaseResource<SandboxModel> {
           conversationId: conversation.id,
           providerId: createResult.value.providerId,
           status: "running",
+          baseImage: createConfig.imageId.imageName,
+          version: createConfig.imageId.tag,
         });
 
         const startTelemetry = await provider.exec(
@@ -380,11 +458,42 @@ export class SandboxResource extends BaseResource<SandboxModel> {
         return new Ok({ sandbox, freshlyCreated: true, wokeFromSleep: false });
       }
 
-      const { status } = existing;
+      let effectiveStatus: SandboxStatus = existing.status;
       let freshlyCreated = false;
       let wokeFromSleep = false;
 
-      switch (status) {
+      // If a kill was requested, destroy the existing sandbox at the provider
+      // (best-effort) and fall through to recreation. This races with the
+      // reaper's killRequested phase; the lifecycle lock keeps it serialised.
+      if (existing.killRequestedAt && existing.status !== "deleted") {
+        logger.info(
+          { sandbox: existing.toLogJSON() },
+          "Sandbox has killRequestedAt — destroying and recreating."
+        );
+        const destroyResult = await provider.destroy(
+          existing.providerId,
+          tracingOpts
+        );
+        if (destroyResult.isErr()) {
+          // We swallow SandboxNotFoundError because it just means the sandbox was removed by the provider
+          // And we only log if failed to destroy because the sandbox will be eventually removed
+          // The most critical part is making sure we go through the "deleted" path
+          if (!(destroyResult.error instanceof SandboxNotFoundError)) {
+            logger.error(
+              {
+                sandbox: existing.toLogJSON(),
+                error: destroyResult.error.message,
+              },
+              "Failed to destroy kill-requested sandbox at provider — proceeding with recreation."
+            );
+          }
+        } else {
+          SandboxResource.deleteEgressPolicyAfterDestroy(existing);
+        }
+        effectiveStatus = "deleted";
+      }
+
+      switch (effectiveStatus) {
         case "running":
           break;
 
@@ -438,24 +547,31 @@ export class SandboxResource extends BaseResource<SandboxModel> {
           }
 
           const createConfig = imageResult.value.toCreateConfig();
+          const envVarsResult = await this.buildSandboxEnvVars(
+            auth,
+            conversation,
+            createConfig.envVars
+          );
+          if (envVarsResult.isErr()) {
+            return new Err(envVarsResult.error);
+          }
 
           const createResult = await provider.create(
             {
               ...createConfig,
-              envVars: {
-                ...createConfig.envVars,
-                DD_API_KEY: config.getDatadogApiKey() ?? "",
-                DD_HOST: "http-intake.logs.datadoghq.eu",
-                CONVERSATION_ID: conversation.sId,
-                WORKSPACE_ID: auth.getNonNullableWorkspace().sId,
-              },
+              envVars: envVarsResult.value,
             },
             tracingOpts
           );
           if (createResult.isErr()) {
             return createResult;
           }
-          await existing.update({ providerId: createResult.value.providerId });
+          await existing.update({
+            providerId: createResult.value.providerId,
+            baseImage: createConfig.imageId.imageName,
+            version: createConfig.imageId.tag,
+            killRequestedAt: null,
+          });
           freshlyCreated = true;
 
           const startTelemetry = await provider.exec(
@@ -482,7 +598,7 @@ export class SandboxResource extends BaseResource<SandboxModel> {
         }
 
         default:
-          assertNever(status);
+          assertNever(effectiveStatus);
       }
 
       await existing.updateStatus("running", { ctx });
@@ -630,14 +746,17 @@ export class SandboxResource extends BaseResource<SandboxModel> {
             { sandbox: sandbox.toLogJSON() },
             "Sandbox not found at provider during destroy — marking deleted."
           );
-          await sandbox.updateStatus("deleted", { ctx });
+          await SandboxResource.finalizeDestroyed(sandbox, ctx, {
+            recordLifecycle: false,
+          });
           return new Ok(undefined);
         }
         return result;
       }
 
-      await sandbox.updateStatus("deleted", { ctx });
-      recordLifecycleOperation("destroy", ctx);
+      await SandboxResource.finalizeDestroyed(sandbox, ctx, {
+        recordLifecycle: true,
+      });
 
       void revokeAllExecTokensForSandbox(sandbox.sId).catch((err) =>
         logger.error(
@@ -647,6 +766,153 @@ export class SandboxResource extends BaseResource<SandboxModel> {
       );
 
       logger.info({ sandbox: sandbox.toLogJSON() }, "Sandbox destroyed.");
+      return new Ok(undefined);
+    });
+  }
+
+  /**
+   * Mark up to `limit` non-deleted sandboxes for the given `baseImage` (and,
+   * when `version` is set, any version different from it) with
+   * `killRequestedAt = now()`. Rows already marked are skipped. Returns the
+   * count of rows updated.
+   *
+   * WORKSPACE_ISOLATION_BYPASS: image rollouts span all workspaces.
+   */
+  static async dangerouslyRequestKillForBaseImage(opts: {
+    baseImage: string;
+    version?: string;
+    limit: number;
+  }): Promise<number> {
+    const versionClause =
+      opts.version !== undefined
+        ? {
+            [Op.or]: [
+              { version: { [Op.is]: null } },
+              { version: { [Op.ne]: opts.version } },
+            ],
+          }
+        : {};
+
+    const candidates = await this.model.findAll({
+      // biome-ignore lint/plugin/noUnverifiedWorkspaceBypass: WORKSPACE_ISOLATION_BYPASS verified
+      dangerouslyBypassWorkspaceIsolationSecurity: true,
+      attributes: ["id"],
+      where: {
+        baseImage: opts.baseImage,
+        status: { [Op.ne]: "deleted" },
+        killRequestedAt: { [Op.is]: null },
+        ...versionClause,
+      },
+      limit: opts.limit,
+    });
+
+    if (candidates.length === 0) {
+      return 0;
+    }
+
+    const ids = candidates.map((c) => c.id);
+    const [affectedCount] = await this.model.update(
+      { killRequestedAt: new Date() },
+      {
+        where: {
+          id: { [Op.in]: ids },
+          killRequestedAt: { [Op.is]: null },
+        },
+      }
+    );
+    return affectedCount;
+  }
+
+  /**
+   * Return conversation sIds for sandboxes with `killRequestedAt` set and not
+   * yet deleted. The kill-requester workflow marks rows; the reaper (and the
+   * bash path) is responsible for actually destroying them.
+   *
+   * WORKSPACE_ISOLATION_BYPASS: The reaper operates across all workspaces.
+   */
+  static async dangerouslyGetKillRequestedConversationIds(opts: {
+    limit: number;
+  }): Promise<Array<{ conversationId: string; workspaceModelId: ModelId }>> {
+    const rows = await this.model.findAll({
+      // biome-ignore lint/plugin/noUnverifiedWorkspaceBypass: WORKSPACE_ISOLATION_BYPASS verified
+      dangerouslyBypassWorkspaceIsolationSecurity: true,
+      where: {
+        killRequestedAt: { [Op.ne]: null },
+        status: { [Op.ne]: "deleted" },
+      },
+      include: [
+        {
+          model: ConversationModel,
+          attributes: ["sId", "workspaceId"],
+          required: true,
+        },
+      ],
+      order: [["killRequestedAt", "ASC"]],
+      limit: opts.limit,
+    });
+
+    return rows.map((r) => ({
+      conversationId: r.conversation.sId,
+      workspaceModelId: r.conversation.workspaceId,
+    }));
+  }
+
+  /**
+   * Destroy a sandbox that has a kill request set, regardless of its current
+   * status. Acquires the lifecycle lock, re-fetches the sandbox, and only
+   * destroys if it is non-deleted and still has `killRequestedAt`. Treats
+   * `SandboxNotFoundError` as success.
+   *
+   * WORKSPACE_ISOLATION_BYPASS: The reaper operates across all workspaces.
+   */
+  static async dangerouslyDestroyIfKillRequested(
+    auth: Authenticator,
+    conversationId: string
+  ): Promise<Result<void, Error>> {
+    return this.withLifecycleLock(conversationId, async (provider) => {
+      const sandbox =
+        await SandboxResource.dangerouslyFetchByConversationId(conversationId);
+      if (
+        !sandbox ||
+        sandbox.status === "deleted" ||
+        !sandbox.killRequestedAt
+      ) {
+        return new Ok(undefined);
+      }
+
+      const ctx = { workspaceId: auth.getNonNullableWorkspace().sId };
+      const tracingOpts = { workspaceId: auth.getNonNullableWorkspace().sId };
+
+      const result = await provider.destroy(sandbox.providerId, tracingOpts);
+      if (result.isErr()) {
+        if (result.error instanceof SandboxNotFoundError) {
+          logger.info(
+            { sandbox: sandbox.toLogJSON() },
+            "Kill-requested sandbox not found at provider — marking deleted."
+          );
+          await SandboxResource.finalizeDestroyed(sandbox, ctx, {
+            recordLifecycle: false,
+          });
+          return new Ok(undefined);
+        }
+        return result;
+      }
+
+      await SandboxResource.finalizeDestroyed(sandbox, ctx, {
+        recordLifecycle: true,
+      });
+
+      void revokeAllExecTokensForSandbox(sandbox.sId).catch((err) =>
+        logger.error(
+          { error: err },
+          "Failed to revoke exec tokens on kill-requested sandbox destroy"
+        )
+      );
+
+      logger.info(
+        { sandbox: sandbox.toLogJSON() },
+        "Kill-requested sandbox destroyed."
+      );
       return new Ok(undefined);
     });
   }
@@ -720,7 +986,7 @@ export class SandboxResource extends BaseResource<SandboxModel> {
   /**
    * Write a file to the sandbox filesystem.
    */
-  private async writeFile(
+  async writeFile(
     auth: Authenticator,
     path: string,
     data: ArrayBuffer
@@ -789,6 +1055,9 @@ export class SandboxResource extends BaseResource<SandboxModel> {
       providerId: this.providerId,
       status: this.status,
       lastActivityAt: this.lastActivityAt.toISOString(),
+      baseImage: this.baseImage,
+      version: this.version,
+      killRequestedAt: this.killRequestedAt?.toISOString() ?? null,
     };
   }
 }

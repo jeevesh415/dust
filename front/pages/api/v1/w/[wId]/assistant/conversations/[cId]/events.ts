@@ -108,8 +108,10 @@ async function handler(
       const controller = new AbortController();
       const { signal } = controller;
 
-      // Handle client disconnection
-      req.on("close", () => {
+      // Use res.on("close") rather than req.on("close"): Next.js fully reads and
+      // closes the request body before the handler runs, so req never emits "close"
+      // on client disconnect. The response stream is still live and fires reliably.
+      res.on("close", () => {
         controller.abort();
       });
 
@@ -124,9 +126,9 @@ async function handler(
       for await (const event of eventStream) {
         // Internal events are not exposed via the public API.
         if (
-          event.data.type === "user_message_promoted" ||
           event.data.type === "compaction_message_new" ||
-          event.data.type === "compaction_message_done"
+          event.data.type === "compaction_message_done" ||
+          event.data.type === "plan_updated"
         ) {
           continue;
         }

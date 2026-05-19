@@ -151,9 +151,9 @@ describe("SpaceResource", () => {
         );
         expect(updatedSpace).not.toBeNull();
         const members = await regularGroup.getAllMembers(adminAuth);
-        const memberSIds = members.map((m) => m.sId);
-        expect(memberSIds).toContain(user1.sId);
-        expect(memberSIds).toContain(user2.sId);
+        const memberIds = members.map((m) => m.sId);
+        expect(memberIds).toContain(user1.sId);
+        expect(memberIds).toContain(user2.sId);
       });
 
       it("should update managementMode to manual when switching from group mode", async () => {
@@ -784,14 +784,14 @@ describe("SpaceResource", () => {
 
           // Verify members were added
           const members = await projectMemberGroup.getActiveMembers(adminAuth);
-          const memberSIds = members.map((m) => m.sId);
-          expect(memberSIds).toContain(user1.sId);
-          expect(memberSIds).toContain(user2.sId);
+          const memberIds = members.map((m) => m.sId);
+          expect(memberIds).toContain(user1.sId);
+          expect(memberIds).toContain(user2.sId);
 
           // Verify editor is still in the editor group
           const editors = await projectEditorGroup.getActiveMembers(adminAuth);
-          const editorSIds = editors.map((m) => m.sId);
-          expect(editorSIds).toContain(editorUser.sId);
+          const editorIds = editors.map((m) => m.sId);
+          expect(editorIds).toContain(editorUser.sId);
         });
       });
 
@@ -834,7 +834,7 @@ describe("SpaceResource", () => {
           // Add user as a simple member to the provisioned group
           await provisionedMemberGroup.dangerouslyAddMember(adminAuth, {
             user: memberUser.toJSON(),
-            allowProvisionnedGroups: true,
+            allowProvisionedGroups: true,
           });
 
           // Create an authenticator for the member user
@@ -897,7 +897,7 @@ describe("SpaceResource", () => {
           // Add editor to the provisioned editor group
           await provisionedEditorGroup.dangerouslyAddMember(adminAuth, {
             user: editorUser.toJSON(),
-            allowProvisionnedGroups: true,
+            allowProvisionedGroups: true,
           });
 
           // Create another provisioned group for the new members
@@ -910,7 +910,7 @@ describe("SpaceResource", () => {
           // Add members to the new provisioned group
           await newProvisionedMemberGroup.dangerouslyAddMembers(adminAuth, {
             users: [user1.toJSON(), user2.toJSON(), editorUser.toJSON()],
-            allowProvisionnedGroups: true,
+            allowProvisionedGroups: true,
           });
 
           // Create an authenticator for the editor user
@@ -1600,6 +1600,7 @@ const KNOWN_SPACE_RELATED_MODELS = [
   "takeaways",
   "takeaways_version",
   "webhook_sources_view",
+  "user_project_preferences",
 ];
 
 describe("SpaceResource cleanup on delete", () => {

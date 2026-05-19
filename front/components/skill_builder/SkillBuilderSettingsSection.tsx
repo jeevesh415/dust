@@ -1,16 +1,27 @@
+import { SkillBuilderEnableSuggestionsSection } from "@app/components/skill_builder/SkillBuilderEnableSuggestionsSection";
 import { SkillBuilderIconSection } from "@app/components/skill_builder/SkillBuilderIconSection";
 import { SkillBuilderIsDefaultSection } from "@app/components/skill_builder/SkillBuilderIsDefaultSection";
 import { SkillBuilderNameSection } from "@app/components/skill_builder/SkillBuilderNameSection";
 import { SkillBuilderUserFacingDescriptionSection } from "@app/components/skill_builder/SkillBuilderUserFacingDescriptionSection";
 import { SkillEditorsSheet } from "@app/components/skill_builder/SkillEditorsSheet";
+import type { SkillType } from "@app/types/assistant/skill_configuration";
 import {
+  Chip,
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
   Label,
 } from "@dust-tt/sparkle";
 
-export function SkillBuilderSettingsSection() {
+interface SkillBuilderSettingsSectionProps {
+  skill?: SkillType;
+  hasSelfImprovingSkills: boolean;
+}
+
+export function SkillBuilderSettingsSection({
+  skill,
+  hasSelfImprovingSkills,
+}: SkillBuilderSettingsSectionProps) {
   return (
     <div className="space-y-5">
       <h2 className="heading-lg text-foreground dark:text-foreground-night">
@@ -31,14 +42,33 @@ export function SkillBuilderSettingsSection() {
           <SkillEditorsSheet />
         </div>
       </div>
-      <Collapsible defaultOpen>
-        <CollapsibleTrigger variant="secondary">Advanced</CollapsibleTrigger>
-        <CollapsibleContent>
-          <div className="pt-3">
-            <SkillBuilderIsDefaultSection />
-          </div>
-        </CollapsibleContent>
-      </Collapsible>
+      {skill && (
+        <>
+          {hasSelfImprovingSkills && (
+            <div className="space-y-3">
+              <div className="flex items-center gap-2">
+                <Label className="text-base font-semibold text-foreground dark:text-foreground-night">
+                  Self Improvement
+                </Label>
+                <Chip size="xs" color="golden" label="Beta" />
+              </div>
+              <SkillBuilderEnableSuggestionsSection
+                selfImprovementLock={skill.selfImprovementLock}
+              />
+            </div>
+          )}
+          <Collapsible defaultOpen>
+            <CollapsibleTrigger variant="secondary">
+              Advanced
+            </CollapsibleTrigger>
+            <CollapsibleContent>
+              <div className="space-y-3 pt-3">
+                <SkillBuilderIsDefaultSection />
+              </div>
+            </CollapsibleContent>
+          </Collapsible>
+        </>
+      )}
     </div>
   );
 }

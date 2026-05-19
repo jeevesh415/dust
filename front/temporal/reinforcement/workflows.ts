@@ -13,7 +13,7 @@ import {
   proxyActivities,
   sleep,
 } from "@temporalio/workflow";
-import { concurrentExecutor } from "../utils";
+import { concurrentExecutor } from "../workflow_utils";
 
 // Export an interceptors variable to add OpenTelemetry interceptors to the workflow.
 export const interceptors: WorkflowInterceptorsFactory = () => ({
@@ -22,10 +22,11 @@ export const interceptors: WorkflowInterceptorsFactory = () => ({
   internals: [new OpenTelemetryInternalsInterceptor()],
 });
 
-const { ensureReinforcementWorkspaceCronsActivity } = proxyActivities<
-  typeof activities
->({
-  startToCloseTimeout: "10 minutes",
+const {
+  ensureReinforcementWorkspaceSchedulesActivity:
+    ensureReinforcementWorkspaceSchedulesActivity,
+} = proxyActivities<typeof activities>({
+  startToCloseTimeout: "30 minutes",
 });
 
 const { getReinforcementSettingsActivity } = proxyActivities<typeof activities>(
@@ -62,6 +63,12 @@ const { finalizeSkillAggregationActivity } = proxyActivities<typeof activities>(
   }
 );
 
+const { recordSelfImprovingSkillsUsageActivity } = proxyActivities<
+  typeof activities
+>({
+  startToCloseTimeout: "10 minutes",
+});
+
 const { checkBatchStatusActivity } = proxyActivities<typeof activities>({
   startToCloseTimeout: "5 minutes",
 });
@@ -69,15 +76,13 @@ const { checkBatchStatusActivity } = proxyActivities<typeof activities>({
 const {
   startSkillConversationAnalysisBatchActivity,
   startSkillAggregationBatchActivity,
-} = proxyActivities<typeof activities>({
-  startToCloseTimeout: "30 minutes",
-});
-
-const {
   processSkillConversationAnalysisBatchResultActivity,
   processSkillAggregationBatchResultActivity,
 } = proxyActivities<typeof activities>({
   startToCloseTimeout: "30 minutes",
+  retry: {
+    maximumAttempts: 5,
+  },
 });
 
 // runToolActivity is re-exported from the agent loop so the reinforced skills
@@ -98,21 +103,6 @@ const SKILL_AGGREGATION_CONCURRENCY = 8;
 const BATCH_POLL_INTERVAL_MIN_MS = 30_000; // 30 seconds (exponential backoff start).
 const BATCH_POLL_INTERVAL_MAX_MS = 30 * 60_000; // 30 minutes (exponential backoff cap).
 const BATCH_TIMEOUT_MS = 24 * 60 * 60_000 + 5 * 60_000; // 24 hours + 5 minutes (to guarantee we wait longer than Anthropic's batch limit).
-
-const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
-
-/**
- * Compute a deterministic delay (0 to 2 hours) from a workspace ID string.
- * This spreads cron-triggered executions across the midnight-2am window
- * without using non-deterministic APIs (safe for Temporal replay).
- */
-function computeWorkspaceDelayMs(workspaceId: string): number {
-  let hash = 0;
-  for (const ch of workspaceId) {
-    hash = ((hash << 5) - hash + ch.charCodeAt(0)) | 0;
-  }
-  return Math.abs(hash) % TWO_HOURS_MS;
-}
 
 /**
  * Wait for a batch to complete.
@@ -157,6 +147,7 @@ interface ReinforcedToolActionInfo {
 interface ReinforcedStepResult {
   isTerminal: boolean;
   suggestionsCreated: number;
+  approvedSourceSuggestionIds: string[];
   reinforcementConversationId?: string;
   toolActionInfo?: ReinforcedToolActionInfo;
 }
@@ -197,15 +188,21 @@ async function runMultiStepStreamingLoop(
   stepFn: (
     reinforcementConversationId: string | undefined
   ) => Promise<ReinforcedStepResult>
-): Promise<{ suggestionsCreated: number }> {
+): Promise<{
+  suggestionsCreated: number;
+  approvedSourceSuggestionIds: string[];
+  reinforcementConversationId?: string;
+}> {
   let reinforcementConversationId: string | undefined;
   let totalSuggestionsCreated = 0;
+  const allApprovedSourceSuggestionIds: string[] = [];
 
   for (let step = 0; step < MAX_REINFORCED_ANALYSIS_STEPS; step++) {
     const result = await stepFn(reinforcementConversationId);
 
     reinforcementConversationId = result.reinforcementConversationId;
     totalSuggestionsCreated += result.suggestionsCreated;
+    allApprovedSourceSuggestionIds.push(...result.approvedSourceSuggestionIds);
 
     if (result.isTerminal) {
       break;
@@ -216,7 +213,11 @@ async function runMultiStepStreamingLoop(
     }
   }
 
-  return { suggestionsCreated: totalSuggestionsCreated };
+  return {
+    suggestionsCreated: totalSuggestionsCreated,
+    approvedSourceSuggestionIds: allApprovedSourceSuggestionIds,
+    reinforcementConversationId,
+  };
 }
 
 /**
@@ -230,9 +231,11 @@ async function aggregateSkillWithMultiStepBatch({
   workspaceId: string;
   skillId: string;
   disableNotifications: boolean;
-}): Promise<void> {
+}): Promise<string[]> {
   let reinforcementConversationId: string | undefined;
+  const reinforcementConversationIds: string[] = [];
   let totalSuggestionsCreated = 0;
+  const allApprovedSourceSuggestionIds: string[] = [];
 
   for (let step = 0; step < MAX_REINFORCED_ANALYSIS_STEPS; step++) {
     const batchResult = await startSkillAggregationBatchActivity({
@@ -245,6 +248,10 @@ async function aggregateSkillWithMultiStepBatch({
       break;
     }
 
+    reinforcementConversationIds.push(
+      ...batchResult.reinforcementConversationIds
+    );
+
     await waitForBatch({ workspaceId, batchId: batchResult.batchId });
 
     const result = await processSkillAggregationBatchResultActivity({
@@ -255,6 +262,7 @@ async function aggregateSkillWithMultiStepBatch({
     });
 
     totalSuggestionsCreated += result.suggestionsCreated;
+    allApprovedSourceSuggestionIds.push(...result.approvedSourceSuggestionIds);
 
     if (!result.needsContinuation) {
       break;
@@ -271,76 +279,81 @@ async function aggregateSkillWithMultiStepBatch({
     workspaceId,
     skillId,
     suggestionsCreated: totalSuggestionsCreated,
+    approvedSourceSuggestionIds: allApprovedSourceSuggestionIds,
     disableNotifications,
   });
+
+  return [...new Set(reinforcementConversationIds)];
 }
 
 /**
  * Cron workflow that ensures all flagged workspaces have a running
- * reinforcement cron and stops crons for workspaces that lost the flag.
+ * reinforcement schedule and stops schedules for workspaces that lost the flag.
  */
-export async function ensureReinforcementWorkspaceCronsWorkflow(): Promise<void> {
-  await ensureReinforcementWorkspaceCronsActivity();
+export async function ensureReinforcementWorkspaceSchedulesWorkflow(): Promise<void> {
+  await ensureReinforcementWorkspaceSchedulesActivity();
 }
 
 /**
- * Workspace-level workflow (one per workspace, cron-scheduled).
- * When `skipDelay` is false (cron runs), sleeps a deterministic delay derived
- * from the workspace ID to spread load across the midnight-2am window.
- * When `skipDelay` is true (manual runs), starts immediately.
+ * Workspace-level workflow (one per workspace, schedule-triggered).
+ * The Temporal schedule applies a 2-hour jitter to spread load.
  *
  * Flow:
  * 1. Check allowed
- * 2. Optional delay (cron spreading)
- * 3. Discover conversations with skills
- * 4. Analyze conversations concurrently via multi-step loop
- * 5. Find skills with synthetic suggestions
- * 6. Aggregate per-skill concurrently via multi-step loop
- * 7. Finalize per skill
+ * 2. Discover conversations with skills
+ * 3. Analyze conversations concurrently via multi-step loop
+ * 4. Find skills with synthetic suggestions
+ * 5. Aggregate per-skill concurrently via multi-step loop
+ * 6. Finalize per skill
  */
 export async function reinforcementWorkspaceWorkflow({
   workspaceId,
   useBatchMode,
-  skipDelay = false,
   skillId,
   conversationLookbackDays,
   disableNotifications = false,
 }: {
   workspaceId: string;
   useBatchMode: boolean;
-  skipDelay?: boolean;
   skillId?: string;
   conversationLookbackDays?: number;
   disableNotifications?: boolean;
 }): Promise<void> {
-  const { reinforcementEnabled, batchModeAllowed } =
-    await getReinforcementSettingsActivity({ workspaceId });
-  if (!reinforcementEnabled) {
+  const settings = await getReinforcementSettingsActivity({ workspaceId });
+  if (!settings.reinforcementEnabled) {
+    return;
+  }
+  if (settings.globalConsumptionMicroUsd >= settings.globalCapMicroUsd) {
+    // Cap reached: activity already logged the details. Stop immediately.
+    return;
+  }
+  if (settings.programmaticUsageLimitReached) {
+    // Programmatic usage limit reached: stop to avoid consuming credits the
+    // workspace no longer has.
     return;
   }
 
   // Resolve effective batch mode: the caller may request batch mode, but the
   // workspace setting can override it to streaming.
-  const effectiveBatchMode = useBatchMode && batchModeAllowed;
-
-  if (!skipDelay) {
-    const delayMs = computeWorkspaceDelayMs(workspaceId);
-    if (delayMs > 0) {
-      await sleep(delayMs);
-    }
-  }
+  const effectiveBatchMode = useBatchMode && settings.batchModeAllowed;
 
   // Phase 1: Discover conversations with skills.
+  // Limit the number of conversations based on the remaining reinforcement
+  // budget (estimated $0.10 per conversation).
+  const maxConversations = settings.maxConversationsForBudget;
   const conversationsWithSkills =
     await getRecentConversationsWithSkillsActivity({
       workspaceId,
       lookbackDays: conversationLookbackDays,
       skillId,
+      maxConversations,
     });
 
   if (conversationsWithSkills.length === 0) {
     return;
   }
+
+  const usageConversationIds: string[] = [];
 
   if (effectiveBatchMode) {
     // Phase 2: Batch-analyze conversations with multi-step loop.
@@ -365,12 +378,16 @@ export async function reinforcementWorkspaceWorkflow({
       await waitForBatch({ workspaceId, batchId: batchResult.batchId });
 
       reinforcementConversationMap = batchResult.reinforcementConversationMap;
+      usageConversationIds.push(...Object.values(reinforcementConversationMap));
 
       const continuations =
         await processSkillConversationAnalysisBatchResultActivity({
           workspaceId,
           batchId: batchResult.batchId,
           reinforcementConversationMap,
+          conversationSkillMap: Object.fromEntries(
+            pendingConversations.map((c) => [c.conversationId, c.skillIds])
+          ),
         });
 
       if (continuations.length === 0) {
@@ -402,11 +419,15 @@ export async function reinforcementWorkspaceWorkflow({
       });
 
     if (skillIdsWithSuggestions.length === 0) {
+      await recordSelfImprovingSkillsUsageActivity({
+        workspaceId,
+        conversationIds: [...new Set(usageConversationIds)],
+      });
       return;
     }
 
     // Phase 4-5: Per-skill batch aggregation + finalize.
-    await concurrentExecutor(
+    const aggregationConversationIds = await concurrentExecutor(
       skillIdsWithSuggestions,
       (currentSkillId) =>
         aggregateSkillWithMultiStepBatch({
@@ -416,9 +437,10 @@ export async function reinforcementWorkspaceWorkflow({
         }),
       { concurrency: SKILL_AGGREGATION_CONCURRENCY }
     );
+    usageConversationIds.push(...aggregationConversationIds.flat());
   } else {
     // Phase 2: Analyze conversations concurrently via streaming multi-step.
-    await concurrentExecutor(
+    const analysisResults = await concurrentExecutor(
       conversationsWithSkills,
       ({ conversationId, skillIds }) =>
         runMultiStepStreamingLoop((reinforcementConversationId) =>
@@ -431,6 +453,13 @@ export async function reinforcementWorkspaceWorkflow({
         ),
       { concurrency: CONVERSATION_ANALYSIS_CONCURRENCY }
     );
+    usageConversationIds.push(
+      ...analysisResults.flatMap((result) =>
+        result.reinforcementConversationId
+          ? [result.reinforcementConversationId]
+          : []
+      )
+    );
 
     // Phase 3: Find skills with synthetic suggestions.
     const skillIdsWithSuggestions =
@@ -440,6 +469,10 @@ export async function reinforcementWorkspaceWorkflow({
       });
 
     if (skillIdsWithSuggestions.length === 0) {
+      await recordSelfImprovingSkillsUsageActivity({
+        workspaceId,
+        conversationIds: [...new Set(usageConversationIds)],
+      });
       return;
     }
 
@@ -447,30 +480,52 @@ export async function reinforcementWorkspaceWorkflow({
     const aggregationResults = await concurrentExecutor(
       skillIdsWithSuggestions,
       async (currentSkillId) => {
-        const { suggestionsCreated } = await runMultiStepStreamingLoop(
-          (reinforcementConversationId) =>
-            aggregateSuggestionsForSkillStepActivity({
-              workspaceId,
-              skillId: currentSkillId,
-              reinforcementConversationId,
-            })
+        const {
+          suggestionsCreated,
+          approvedSourceSuggestionIds,
+          reinforcementConversationId,
+        } = await runMultiStepStreamingLoop((reinforcementConversationId) =>
+          aggregateSuggestionsForSkillStepActivity({
+            workspaceId,
+            skillId: currentSkillId,
+            reinforcementConversationId,
+          })
         );
-        return { skillId: currentSkillId, suggestionsCreated };
+        return {
+          skillId: currentSkillId,
+          suggestionsCreated,
+          approvedSourceSuggestionIds,
+          reinforcementConversationId,
+        };
       },
       { concurrency: SKILL_AGGREGATION_CONCURRENCY }
+    );
+    usageConversationIds.push(
+      ...aggregationResults.flatMap((result) =>
+        result.reinforcementConversationId
+          ? [result.reinforcementConversationId]
+          : []
+      )
     );
 
     // Phase 5: Finalize per skill.
     for (const {
       skillId: currentSkillId,
       suggestionsCreated,
+      approvedSourceSuggestionIds,
     } of aggregationResults) {
       await finalizeSkillAggregationActivity({
         workspaceId,
         skillId: currentSkillId,
         suggestionsCreated,
+        approvedSourceSuggestionIds,
         disableNotifications,
       });
     }
   }
+
+  await recordSelfImprovingSkillsUsageActivity({
+    workspaceId,
+    conversationIds: [...new Set(usageConversationIds)],
+  });
 }

@@ -1,3 +1,4 @@
+import { AgentStepContentToolExecutionModel } from "@app/lib/models/agent/actions/agent_step_content_tool_execution";
 import { ConversationMCPServerViewModel } from "@app/lib/models/agent/actions/conversation_mcp_server_view";
 import { AgentDataSourceConfigurationModel } from "@app/lib/models/agent/actions/data_sources";
 import { InternalMCPServerCredentialModel } from "@app/lib/models/agent/actions/internal_mcp_server_credentials";
@@ -38,7 +39,6 @@ import { ConversationBranchModel } from "@app/lib/models/agent/conversation_bran
 import { ConversationForkModel } from "@app/lib/models/agent/conversation_fork";
 import { GroupAgentModel } from "@app/lib/models/agent/group_agent";
 import { TagAgentModel } from "@app/lib/models/agent/tag_agent";
-import { TriggerSubscriberModel } from "@app/lib/models/agent/triggers/trigger_subscriber";
 import { TriggerModel } from "@app/lib/models/agent/triggers/triggers";
 import { WebhookRequestModel } from "@app/lib/models/agent/triggers/webhook_request";
 import { WebhookRequestTriggerModel } from "@app/lib/models/agent/triggers/webhook_request_trigger";
@@ -63,8 +63,10 @@ import {
   ConversationSkillModel,
 } from "@app/lib/models/skill/conversation_skill";
 import { GroupSkillModel } from "@app/lib/models/skill/group_skill";
+import { SelfImprovingSkillsUsageModel } from "@app/lib/models/skill/self_improving_skills_usage";
 import { SkillSuggestionModel } from "@app/lib/models/skill/skill_suggestion";
 import { TagModel } from "@app/lib/models/tags";
+import { WorkspaceSensitivityLabelConfigModel } from "@app/lib/models/workspace_sensitivity_label_config";
 import { AcademyChapterVisitModel } from "@app/lib/resources/storage/models/academy_chapter_visit";
 import { AcademyQuizAttemptModel } from "@app/lib/resources/storage/models/academy_quiz_attempt";
 import { AgentMemoryModel } from "@app/lib/resources/storage/models/agent_memories";
@@ -75,6 +77,8 @@ import {
   ProviderModel,
 } from "@app/lib/resources/storage/models/apps";
 import { ContentFragmentModel } from "@app/lib/resources/storage/models/content_fragment";
+import { CouponRedemptionModel } from "@app/lib/resources/storage/models/coupon_redemptions";
+import { CouponModel } from "@app/lib/resources/storage/models/coupons";
 import { CreditModel } from "@app/lib/resources/storage/models/credits";
 import { DataSourceModel } from "@app/lib/resources/storage/models/data_source";
 import { DataSourceViewModel } from "@app/lib/resources/storage/models/data_source_view";
@@ -100,13 +104,12 @@ import { PluginRunModel } from "@app/lib/resources/storage/models/plugin_runs";
 import { ProgrammaticUsageConfigurationModel } from "@app/lib/resources/storage/models/programmatic_usage_configurations";
 import { ProjectMetadataModel } from "@app/lib/resources/storage/models/project_metadata";
 import {
-  ProjectTodoConversationModel,
-  ProjectTodoModel,
-  ProjectTodoSourceModel,
-  ProjectTodoVersionModel,
-} from "@app/lib/resources/storage/models/project_todo";
-import { ProjectTodoStateModel } from "@app/lib/resources/storage/models/project_todo_state";
-import { ProjectTodoTakeawaySourcesModel } from "@app/lib/resources/storage/models/project_todo_takeaway_sources";
+  ProjectTaskConversationModel,
+  ProjectTaskModel,
+  ProjectTaskSourceModel,
+  ProjectTaskVersionModel,
+} from "@app/lib/resources/storage/models/project_task";
+import { ProjectTaskStateModel } from "@app/lib/resources/storage/models/project_task_state";
 import {
   RunModel,
   RunUsageModel,
@@ -124,8 +127,11 @@ import {
   UserModel,
   UserToolApprovalModel,
 } from "@app/lib/resources/storage/models/user";
+import { UserProjectPreferencesModel } from "@app/lib/resources/storage/models/user_project_preferences";
+import { WakeUpModel } from "@app/lib/resources/storage/models/wakeup";
 import { WorkspaceModel } from "@app/lib/resources/storage/models/workspace";
 import { WorkspaceHasDomainModel } from "@app/lib/resources/storage/models/workspace_has_domain";
+import { WorkspaceSandboxEnvVarModel } from "@app/lib/resources/storage/models/workspace_sandbox_env_var";
 import { WorkspaceVerificationAttemptModel } from "@app/lib/resources/storage/models/workspace_verification_attempt";
 import logger from "@app/logger/logger";
 import { sendInitDbMessage } from "@app/types/shared/deployment";
@@ -161,12 +167,12 @@ export function loadAllModels() {
     WebhookSourceModel,
     WebhookSourcesViewModel,
     TriggerModel,
-    TriggerSubscriberModel,
     WebhookRequestModel,
     WebhookRequestTriggerModel,
     ConversationModel,
     ConversationParticipantModel,
     UserConversationReadsModel,
+    WakeUpModel,
     DataSourceModel,
     DataSourceViewModel,
     RunModel,
@@ -177,6 +183,8 @@ export function loadAllModels() {
     ProviderCredentialModel,
     TemplateModel,
     CreditModel,
+    CouponModel,
+    CouponRedemptionModel,
     ProgrammaticUsageConfigurationModel,
     AgentConfigurationModel,
     AgentUserRelationModel,
@@ -205,6 +213,7 @@ export function loadAllModels() {
     AgentStepContentModel,
     AgentMCPActionModel,
     AgentMCPActionOutputItemModel,
+    AgentStepContentToolExecutionModel,
     AgentChildAgentConfigurationModel,
     FeatureFlagModel,
     GlobalFeatureFlagModel,
@@ -225,6 +234,7 @@ export function loadAllModels() {
     SkillMCPServerConfigurationModel,
     SkillFileAttachmentModel,
     SkillSuggestionModel,
+    SelfImprovingSkillsUsageModel,
     WorkspaceVerificationAttemptModel,
     AgentSuggestionModel,
     AcademyQuizAttemptModel,
@@ -232,15 +242,17 @@ export function loadAllModels() {
     SandboxModel,
     ConversationBranchModel,
     ConversationForkModel,
-    ProjectTodoModel,
-    ProjectTodoConversationModel,
-    ProjectTodoSourceModel,
-    ProjectTodoStateModel,
-    ProjectTodoVersionModel,
+    ProjectTaskModel,
+    ProjectTaskConversationModel,
+    ProjectTaskSourceModel,
+    ProjectTaskStateModel,
+    ProjectTaskVersionModel,
     TakeawaysModel,
     TakeawaySourcesModel,
     TakeawaysVersionModel,
-    ProjectTodoTakeawaySourcesModel,
+    UserProjectPreferencesModel,
+    WorkspaceSensitivityLabelConfigModel,
+    WorkspaceSandboxEnvVarModel,
   ];
 }
 

@@ -4,6 +4,14 @@ import {
 } from "@app/components/resources/resources_icon_names";
 import { MCP_TOOL_STAKE_LEVELS } from "@app/lib/actions/constants";
 import { UserQuestionSchema } from "@app/lib/actions/types";
+import type {
+  ClariCall,
+  ClariCallDetails,
+} from "@app/lib/api/actions/servers/clari_copilot/types";
+import {
+  ClariCallDetailsSchema,
+  ClariCallSchema,
+} from "@app/lib/api/actions/servers/clari_copilot/types";
 import { CONNECTOR_PROVIDERS } from "@app/types/data_source";
 import type { AllSupportedFileContentType } from "@app/types/files";
 import { ALL_FILE_FORMATS } from "@app/types/files";
@@ -69,6 +77,59 @@ export function isToolGeneratedFile(
     !!outputBlock &&
     outputBlock.type === "resource" &&
     ToolGeneratedFileSchema.safeParse(outputBlock.resource).success
+  );
+}
+
+// File path only, no FileResource in DB.
+
+const ToolGeneratedFilePathSchema = z.object({
+  text: z.string(),
+  uri: z.string(),
+  mimeType: z.literal(INTERNAL_MIME_TYPES.TOOL_OUTPUT.FILE_PATH),
+  path: z.string(),
+  title: z.string(),
+  contentType: z.enum(
+    Object.keys(ALL_FILE_FORMATS) as [
+      AllSupportedFileContentType,
+      ...AllSupportedFileContentType[],
+    ]
+  ),
+});
+
+export type ToolGeneratedFilePathType = z.infer<
+  typeof ToolGeneratedFilePathSchema
+>;
+
+export function isToolGeneratedFilePath(
+  outputBlock: CallToolResult["content"][number] | null
+): outputBlock is { type: "resource"; resource: ToolGeneratedFilePathType } {
+  return (
+    !!outputBlock &&
+    outputBlock.type === "resource" &&
+    ToolGeneratedFilePathSchema.safeParse(outputBlock.resource).success
+  );
+}
+
+// GCS mount image returned by the `files__cat` tool for vision-capable models.
+// Carries a GCS path so the rendering layer can generate a fresh signed URL at render time.
+
+const ModelVisionImageSchema = z.object({
+  uri: z.string(),
+  mimeType: z.literal(INTERNAL_MIME_TYPES.TOOL_OUTPUT.MODEL_VISION_IMAGE),
+  text: z.literal(""),
+  gcsPath: z.string(),
+  imageContentType: z.string(),
+});
+
+export type ModelVisionImageType = z.infer<typeof ModelVisionImageSchema>;
+
+export function isModelVisionImage(
+  outputBlock: CallToolResult["content"][number] | null
+): outputBlock is { type: "resource"; resource: ModelVisionImageType } {
+  return (
+    !!outputBlock &&
+    outputBlock.type === "resource" &&
+    ModelVisionImageSchema.safeParse(outputBlock.resource).success
   );
 }
 
@@ -352,6 +413,7 @@ export const IncludeResultResourceSchema = z.object({
   ref: z.string(),
   chunks: z.array(z.string()),
   source: z.object({
+    mimeType: z.string().optional(),
     name: z.string(),
     provider: z.string().optional(),
   }),
@@ -1103,5 +1165,56 @@ export const isAgentPauseOutputResourceType = (
   return (
     outputBlock.type === "resource" &&
     AgentPauseOutputResourceSchema.safeParse(outputBlock.resource).success
+  );
+};
+
+// Clari Copilot tool outputs.
+
+export const CLARI_CALL_LIST_MIME_TYPE =
+  "application/vnd.dust.tool-output.clari-call-list" as const;
+
+export const ClariCallListResourceSchema = z.object({
+  mimeType: z.literal(CLARI_CALL_LIST_MIME_TYPE),
+  uri: z.literal(""),
+  text: z.string(),
+  calls: z.array(ClariCallSchema),
+});
+
+export type ClariCallListResourceType = z.infer<
+  typeof ClariCallListResourceSchema
+> & { calls: ClariCall[] };
+
+export const isClariCallListResource = (
+  outputBlock: CallToolResult["content"][number]
+): outputBlock is { type: "resource"; resource: ClariCallListResourceType } => {
+  return (
+    outputBlock.type === "resource" &&
+    ClariCallListResourceSchema.safeParse(outputBlock.resource).success
+  );
+};
+
+export const CLARI_CALL_DETAILS_MIME_TYPE =
+  "application/vnd.dust.tool-output.clari-call-details" as const;
+
+export const ClariCallDetailsResourceSchema = z.object({
+  mimeType: z.literal(CLARI_CALL_DETAILS_MIME_TYPE),
+  uri: z.string(),
+  text: z.string(),
+  call: ClariCallDetailsSchema,
+});
+
+export type ClariCallDetailsResourceType = z.infer<
+  typeof ClariCallDetailsResourceSchema
+> & { call: ClariCallDetails };
+
+export const isClariCallDetailsResource = (
+  outputBlock: CallToolResult["content"][number]
+): outputBlock is {
+  type: "resource";
+  resource: ClariCallDetailsResourceType;
+} => {
+  return (
+    outputBlock.type === "resource" &&
+    ClariCallDetailsResourceSchema.safeParse(outputBlock.resource).success
   );
 };

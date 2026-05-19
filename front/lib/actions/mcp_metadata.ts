@@ -10,6 +10,7 @@ import {
   getConnectionForMCPServer,
   getMCPServerAdminAuthenticationReason,
   MCPServerPersonalAuthenticationRequiredError,
+  MCPServerRateLimitedError,
   MCPServerRequiresAdminAuthenticationError,
 } from "@app/lib/actions/mcp_authentication";
 import {
@@ -618,6 +619,21 @@ export async function connectToMCPServer(
               );
             }
 
+            const isRateLimited =
+              e instanceof Error &&
+              "code" in e &&
+              (e as Error & { code: unknown }).code === 429;
+            if (isRateLimited) {
+              logger.warn(
+                {
+                  mcpServerId: params.mcpServerId,
+                  workspaceId: auth.getNonNullableWorkspace().sId,
+                },
+                "Remote MCP server rate limited"
+              );
+              return new Err(new MCPServerRateLimitedError(params.mcpServerId));
+            }
+
             logger.error(
               {
                 mcpServerId: params.mcpServerId,
@@ -775,6 +791,7 @@ export type DustToolMeta = {
   stake?: MCPToolStakeLevelType;
   displayLabels?: ToolDisplayLabels;
   argumentsRequiringApproval?: string[];
+  timeoutMs?: number;
 };
 
 function isValidStake(value: unknown): value is MCPToolStakeLevelType {
@@ -799,6 +816,10 @@ function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((v) => typeof v === "string");
 }
 
+function isValidTimeout(value: unknown): value is number {
+  return typeof value === "number" && value > 0;
+}
+
 export function getDustToolMeta(
   _meta: Record<string, unknown> | undefined
 ): DustToolMeta | undefined {
@@ -817,6 +838,9 @@ export function getDustToolMeta(
   }
   if (isStringArray(dust.argumentsRequiringApproval)) {
     result.argumentsRequiringApproval = dust.argumentsRequiringApproval;
+  }
+  if (isValidTimeout(dust.timeoutMs)) {
+    result.timeoutMs = dust.timeoutMs;
   }
 
   return Object.keys(result).length > 0 ? result : undefined;

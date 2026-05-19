@@ -19,8 +19,11 @@
 import {
   ceilToHourISO,
   epochSecondsToFloorHourISO,
+  floorToHourISO,
   getMetronomeClient,
+  getMetronomeContractById,
 } from "@app/lib/metronome/client";
+import { getProductWorkspaceSeatId } from "@app/lib/metronome/constants";
 import {
   applyEnterpriseOverrides,
   buildEnterpriseOverrides,
@@ -29,7 +32,6 @@ import {
   extractEnterprisePricing,
 } from "@app/lib/metronome/contracts";
 import { syncMauCount } from "@app/lib/metronome/mau_sync";
-import { syncSeatCount } from "@app/lib/metronome/seats";
 import {
   LEGACY_BUSINESS_PACKAGE_ALIAS,
   LEGACY_ENTERPRISE_EUR_PACKAGE_ALIAS,
@@ -40,16 +42,18 @@ import {
 import { resolvePackageAliasForCurrency } from "@app/lib/plans/billing_currency";
 import {
   isEntreprisePlanPrefix,
-  PRO_PLAN_SEAT_29_CODE,
+  isProPlanPrefix,
   PRO_PLAN_SEAT_39_CODE,
 } from "@app/lib/plans/plan_codes";
 import { getStripeSubscription } from "@app/lib/plans/stripe";
+import { MembershipModel } from "@app/lib/resources/storage/models/membership";
 import { SubscriptionResource } from "@app/lib/resources/subscription_resource";
 import { WorkspaceResource } from "@app/lib/resources/workspace_resource";
 import { renderLightWorkspaceType } from "@app/lib/workspace";
 import type { Logger } from "@app/logger/logger";
 import { isSupportedCurrency } from "@app/types/currency";
 import type { LightWorkspaceType } from "@app/types/user";
+import { Op } from "sequelize";
 import { makeScript } from "./helpers";
 import { runOnAllWorkspaces } from "./workspace_helpers";
 
@@ -208,8 +212,9 @@ async function getSubscriptionInfo(
   }
 
   // Determine alias from plan code + billing interval + currency.
-  const isPro = planCode === PRO_PLAN_SEAT_29_CODE;
   const isBusiness = planCode === PRO_PLAN_SEAT_39_CODE;
+  const isPro = !isBusiness && isProPlanPrefix(planCode);
+
   let baseAlias: string;
   if (isBusiness) {
     baseAlias = LEGACY_BUSINESS_PACKAGE_ALIAS;
@@ -233,15 +238,58 @@ async function getSubscriptionInfo(
   };
 }
 
+/**
+ * Enable Stripe billing provider on a Metronome contract.
+ * This makes Metronome push invoices to Stripe for real payment collection.
+ * Without this, invoices stay in Metronome only (shadow mode).
+ */
+async function enableStripeBilling({
+  metronomeCustomerId,
+  contractId,
+  logger,
+  workspaceId,
+}: {
+  metronomeCustomerId: string;
+  contractId: string;
+  logger: Logger;
+  workspaceId: string;
+}): Promise<void> {
+  const client = getMetronomeClient();
+
+  logger.info(
+    { workspaceId, contractId },
+    "Enabling Stripe billing provider on contract"
+  );
+
+  await client.v2.contracts.edit({
+    customer_id: metronomeCustomerId,
+    contract_id: contractId,
+    add_billing_provider_configuration_update: {
+      billing_provider_configuration: {
+        billing_provider: "stripe",
+        delivery_method: "direct_to_billing_provider",
+      },
+      schedule: {
+        effective_at: "START_OF_CURRENT_PERIOD",
+      },
+    },
+  });
+
+  logger.info({ workspaceId, contractId }, "Stripe billing provider enabled");
+}
+
 async function migrateWorkspace(
   workspace: LightWorkspaceType,
   execute: boolean,
+  force: boolean,
   logger: Logger,
   packageInfo: {
     aliasToPackageId: Record<string, string>;
     packageIdToAlias: Record<string, string>;
   },
-  packageAliasFilter?: string
+  packageAliasFilter?: string,
+  forcePackageAlias?: string,
+  enableBilling?: boolean
 ): Promise<void> {
   const client = getMetronomeClient();
   const workspaceResource = await WorkspaceResource.fetchById(workspace.sId);
@@ -261,9 +309,26 @@ async function migrateWorkspace(
     return;
   }
 
-  // Apply package alias filter if set.
+  // Apply package alias filter (matched against the *derived* target alias)
+  // before any override, so callers can scope a forced migration to e.g.
+  // "all monthly Pro contracts → some custom package".
   if (packageAliasFilter && subInfo.packageAlias !== packageAliasFilter) {
     return;
+  }
+
+  // Force-override the target alias when the operator passes one.
+  if (forcePackageAlias) {
+    if (subInfo.packageAlias !== forcePackageAlias) {
+      logger.info(
+        {
+          workspaceId: workspace.sId,
+          derivedAlias: subInfo.packageAlias,
+          forcedAlias: forcePackageAlias,
+        },
+        "Forcing target package alias (overriding derived value)"
+      );
+      subInfo.packageAlias = forcePackageAlias;
+    }
   }
 
   const targetPackageId = packageInfo.aliasToPackageId[subInfo.packageAlias];
@@ -300,6 +365,18 @@ async function migrateWorkspace(
         "Contract has no package_id — skipping (manually created?)"
       );
       continue;
+    }
+    // Already on the latest package version — nothing to migrate unless forced.
+    if (contractPackageId === targetPackageId && !force) {
+      logger.info(
+        {
+          workspaceId: workspace.sId,
+          contractId: contract.id,
+          targetAlias,
+        },
+        "Contract already on latest package version — skipping (use --force to re-create)"
+      );
+      return;
     }
     oldAlias = packageInfo.packageIdToAlias[contractPackageId];
     oldContractId = contract.id;
@@ -390,6 +467,32 @@ async function migrateWorkspace(
     });
   }
 
+  // Update metronomeContractId on the subscription first so that the contract
+  // cache is invalidated before syncing subscriptions (syncMauCount /
+  // syncSeatCount call getActiveContract which reads from Redis cache).
+  await SubscriptionResource.updateMetronomeContractId(
+    subInfo.subscriptionModelId,
+    newContractId
+  );
+  logger.info(
+    {
+      workspaceId: workspace.sId,
+      subscriptionId: subInfo.subscriptionModelId,
+      newContractId,
+    },
+    "Updated metronomeContractId on subscription"
+  );
+
+  // Enable Stripe billing if requested.
+  if (enableBilling) {
+    await enableStripeBilling({
+      metronomeCustomerId,
+      contractId: newContractId,
+      logger,
+      workspaceId: workspace.sId,
+    });
+  }
+
   // Sync subscriptions: seats for pro/business, MAU for enterprise.
   if (isEnterprise) {
     const mauResult = await syncMauCount({
@@ -409,37 +512,132 @@ async function migrateWorkspace(
       );
     }
   } else {
-    const seatResult = await syncSeatCount({
-      metronomeCustomerId,
-      contractId: newContractId,
-      workspace,
-      startingAt: subInfo.startDate,
+    // Backfill seat counts across the current billing period: start with the
+    // member count at periodStart, then push every change since then.
+    const periodStart = new Date(subInfo.startDate);
+    const now = new Date();
+
+    const initialCount = await MembershipModel.count({
+      where: {
+        workspaceId: workspace.id,
+        startAt: { [Op.lte]: periodStart },
+        [Op.or]: [{ endAt: null }, { endAt: { [Op.gt]: periodStart } }],
+      },
     });
-    if (seatResult.isErr()) {
+
+    const memberships = await MembershipModel.findAll({
+      attributes: ["startAt", "endAt"],
+      where: {
+        workspaceId: workspace.id,
+        [Op.or]: [
+          { startAt: { [Op.gt]: periodStart, [Op.lte]: now } },
+          { endAt: { [Op.gt]: periodStart, [Op.lte]: now } },
+        ],
+      },
+    });
+
+    const events: Array<{ at: Date; delta: number }> = [];
+    for (const m of memberships) {
+      if (m.startAt > periodStart && m.startAt <= now) {
+        events.push({ at: m.startAt, delta: 1 });
+      }
+      if (m.endAt && m.endAt > periodStart && m.endAt <= now) {
+        events.push({ at: m.endAt, delta: -1 });
+      }
+    }
+    events.sort((a, b) => a.at.getTime() - b.at.getTime());
+
+    const timeline: Array<{ startingAt: string; quantity: number }> = [
+      {
+        startingAt: floorToHourISO(periodStart),
+        quantity: initialCount,
+      },
+    ];
+    let runningCount = initialCount;
+    let lastEmittedQuantity = timeline[0].quantity;
+    let pendingHour: string | null = null;
+    for (const ev of events) {
+      const hourIso = floorToHourISO(ev.at);
+      if (pendingHour !== null && hourIso !== pendingHour) {
+        if (runningCount !== lastEmittedQuantity) {
+          timeline.push({ startingAt: pendingHour, quantity: runningCount });
+          lastEmittedQuantity = runningCount;
+        }
+        pendingHour = null;
+      }
+      runningCount += ev.delta;
+      pendingHour = hourIso;
+    }
+    if (pendingHour !== null && runningCount !== lastEmittedQuantity) {
+      timeline.push({ startingAt: pendingHour, quantity: runningCount });
+    }
+
+    // Find the seat subscription id on the freshly-created contract.
+    const contractResult = await getMetronomeContractById({
+      metronomeCustomerId,
+      metronomeContractId: newContractId,
+    });
+    if (contractResult.isErr()) {
       logger.error(
         {
           workspaceId: workspace.sId,
           contractId: newContractId,
-          error: seatResult.error.message,
+          error: contractResult.error.message,
         },
-        "Failed to provision seats on new contract"
+        "Failed to fetch new contract for seat backfill"
+      );
+      return;
+    }
+    const seatProductId = getProductWorkspaceSeatId();
+    const seatSubscription = contractResult.value.subscriptions?.find(
+      (s) => s.subscription_rate.product.id === seatProductId
+    );
+    if (!seatSubscription?.id) {
+      logger.error(
+        { workspaceId: workspace.sId, contractId: newContractId },
+        "No Workspace Seat subscription on new contract — cannot backfill seats"
+      );
+      return;
+    }
+
+    logger.info(
+      {
+        workspaceId: workspace.sId,
+        contractId: newContractId,
+        subscriptionId: seatSubscription.id,
+        periodStart: periodStart.toISOString(),
+        changes: timeline.length,
+        first: timeline[0],
+        last: timeline[timeline.length - 1],
+      },
+      `Applying ${timeline.length} seat quantity update(s) to new contract`
+    );
+
+    try {
+      await client.v2.contracts.edit({
+        customer_id: metronomeCustomerId,
+        contract_id: newContractId,
+        update_subscriptions: [
+          {
+            subscription_id: seatSubscription.id,
+            quantity_updates: timeline.map((e) => ({
+              starting_at: e.startingAt,
+              quantity: e.quantity,
+            })),
+          },
+        ],
+      });
+    } catch (err) {
+      logger.error(
+        {
+          workspaceId: workspace.sId,
+          contractId: newContractId,
+          error: err instanceof Error ? err.message : String(err),
+        },
+        "Failed to apply seat quantity updates on new contract"
       );
     }
   }
-
-  // Update metronomeContractId on the subscription.
-  await SubscriptionResource.updateMetronomeContractId(
-    subInfo.subscriptionModelId,
-    newContractId
-  );
-  logger.info(
-    {
-      workspaceId: workspace.sId,
-      subscriptionId: subInfo.subscriptionModelId,
-      newContractId,
-    },
-    "Updated metronomeContractId on subscription"
-  );
 }
 
 makeScript(
@@ -456,14 +654,45 @@ makeScript(
         "Only migrate contracts targeting this package alias (e.g., 'legacy-pro-29'). Omit to migrate all.",
       type: "string" as const,
     },
+    forcePackageAlias: {
+      alias: "P",
+      describe:
+        "Override the derived target package alias and use this one instead. Useful for one-off migrations to a custom package; combine with --packageAlias to scope the override.",
+      type: "string" as const,
+    },
+    force: {
+      alias: "f",
+      describe:
+        "Force re-creation of contracts even if already on the latest package version (useful to update overrides).",
+      type: "boolean" as const,
+      default: false,
+    },
+    enableBilling: {
+      alias: "b",
+      describe:
+        "Enable Stripe billing provider on created contracts. Without this flag, contracts stay in shadow mode (invoices in Metronome only).",
+      type: "boolean" as const,
+      default: false,
+    },
   },
   async (args, logger) => {
     const packageAliasFilter = args.packageAlias;
+    const forcePackageAlias = args.forcePackageAlias;
+    const enableBilling = args.enableBilling;
     if (packageAliasFilter) {
       logger.info(
         { packageAlias: packageAliasFilter },
         "Filtering to contracts targeting this package alias"
       );
+    }
+    if (forcePackageAlias) {
+      logger.info(
+        { forcePackageAlias },
+        "Forcing the target package alias for all migrated contracts"
+      );
+    }
+    if (enableBilling) {
+      logger.info("Stripe billing will be enabled on created contracts");
     }
 
     logger.info("Fetching latest package versions from Metronome...");
@@ -482,9 +711,12 @@ makeScript(
       await migrateWorkspace(
         renderLightWorkspaceType({ workspace }),
         args.execute,
+        args.force,
         logger,
         packageInfo,
-        packageAliasFilter
+        packageAliasFilter,
+        forcePackageAlias,
+        enableBilling
       );
     } else {
       await runOnAllWorkspaces(
@@ -492,9 +724,12 @@ makeScript(
           migrateWorkspace(
             workspace,
             args.execute,
+            args.force,
             logger,
             packageInfo,
-            packageAliasFilter
+            packageAliasFilter,
+            forcePackageAlias,
+            enableBilling
           ),
         { concurrency: 4 }
       );
